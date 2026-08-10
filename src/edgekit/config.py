@@ -113,6 +113,24 @@ class CloudflareConfig(_Section):
         return value
 
 
+class TLSConfig(_Section):
+    """An operator-supplied origin certificate.
+
+    Held here so that `edgekit provision` can reinstall it into a rebuilt Nginx Proxy
+    Manager without asking again. The certificate is public; only the key is a secret.
+    """
+
+    SECRET_FIELDS: ClassVar[tuple[str, ...]] = ("certificate_key",)
+
+    certificate: str = ""
+    certificate_key: str = ""
+    name: str = ""
+
+    @property
+    def present(self) -> bool:
+        return bool(self.certificate and self.certificate_key)
+
+
 class PanelConfig(_Section):
     SECRET_FIELDS: ClassVar[tuple[str, ...]] = ("session_secret",)
 
@@ -135,6 +153,9 @@ class Config(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     wireguard: WireGuardConfig = Field(default_factory=WireGuardConfig)
     npm: NPMConfig = Field(default_factory=NPMConfig)
+    tls: TLSConfig = Field(default_factory=TLSConfig)
+    #: Off by default. DNS records, SSL mode and the origin certificate are one-time
+    #: dashboard actions; the API is available for anyone who wants them automated.
     cloudflare: CloudflareConfig = Field(default_factory=CloudflareConfig)
     panel: PanelConfig = Field(default_factory=PanelConfig)
 

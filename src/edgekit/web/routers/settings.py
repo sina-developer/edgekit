@@ -175,18 +175,40 @@ async def upload_certificate(
     db: Session = Depends(get_db),
     config: Config = Depends(get_config),
 ):
+    certificate_pem = certificate_pem.strip() + "\n"
+    key_pem = key_pem.strip() + "\n"
+
+    # Validate before touching NPM: a mismatched pair installs cleanly and then fails as a
+    # Cloudflare 525, which is a far harder problem to trace back to this form.
+    try:
+        certificates.validate_key_matches(certificate_pem, key_pem)
+        info = certificates.inspect_certificate(certificate_pem)
+    except certificates.CertificateError as exc:
+        return _redirect(error=str(exc)[:400])
+    if info.expired:
+        return _redirect(error=f"That+certificate+expired+on+{info.not_after.date()}")
+
+    label = name.strip() or certificates.certificate_name(
+        config.cloudflare.zone_name or config.server.hostname
+    )
     try:
         outcome = await certificates.install_manual_certificate(
-            db,
-            config,
-            certificate_pem.strip(),
-            key_pem.strip(),
-            name=name.strip() or None,
-            actor=user.username,
+            db, config, certificate_pem, key_pem, name=label, actor=user.username
         )
     except Exception as exc:  # noqa: BLE001
         return _redirect(error=str(exc)[:400])
-    return _redirect(message=f"Certificate+installed+as+NPM+id+{outcome['certificate_id']}")
+
+    # Remember it so `edgekit provision` can repopulate a rebuilt NPM.
+    config.tls.certificate = certificate_pem
+    config.tls.certificate_key = key_pem
+    config.tls.name = label
+    config.save()
+    reload_config()
+
+    return _redirect(
+        message=f"Installed+{'+'.join(info.hostnames)}+(NPM+id+{outcome['certificate_id']}),"
+                f"+expires+{info.not_after.date()}"
+    )
 
 
 @router.post("/reprovision", dependencies=[Depends(verify_csrf)])

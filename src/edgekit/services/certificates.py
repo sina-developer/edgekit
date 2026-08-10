@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from dataclasses import dataclass
 
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.x509.oid import NameOID
 from sqlalchemy.orm import Session
 
 from ..config import Config
@@ -20,6 +24,98 @@ from .hosts import (
 from .npm import NPMClient
 
 log = logging.getLogger("edgekit.certificates")
+
+
+class CertificateError(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class CertificateInfo:
+    """What a certificate actually covers, so the operator can confirm before installing."""
+
+    subject: str
+    issuer: str
+    hostnames: list[str]
+    not_before: dt.datetime
+    not_after: dt.datetime
+
+    @property
+    def expired(self) -> bool:
+        return self.not_after < dt.datetime.now(dt.timezone.utc)
+
+    @property
+    def days_remaining(self) -> int:
+        return (self.not_after - dt.datetime.now(dt.timezone.utc)).days
+
+    def covers(self, hostname: str) -> bool:
+        """Match a hostname against the certificate's names, honouring one wildcard level."""
+        hostname = hostname.lower().rstrip(".")
+        for pattern in (h.lower() for h in self.hostnames):
+            if pattern == hostname:
+                return True
+            if pattern.startswith("*.") and "." in hostname:
+                if hostname.split(".", 1)[1] == pattern[2:]:
+                    return True
+        return False
+
+
+def inspect_certificate(certificate_pem: str) -> CertificateInfo:
+    """Parse a PEM certificate, raising a readable error when it is not one."""
+    try:
+        cert = x509.load_pem_x509_certificate(certificate_pem.encode())
+    except ValueError as exc:
+        raise CertificateError(
+            "That does not look like a PEM certificate. It should begin with "
+            "'-----BEGIN CERTIFICATE-----'. If you saved the Cloudflare page, make sure you "
+            "took the Origin Certificate box and not the Private Key box."
+        ) from exc
+
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        hostnames = san.value.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        hostnames = []
+    if not hostnames:
+        hostnames = [
+            attribute.value
+            for attribute in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        ]
+
+    return CertificateInfo(
+        subject=cert.subject.rfc4514_string(),
+        issuer=cert.issuer.rfc4514_string(),
+        hostnames=[str(h) for h in hostnames],
+        not_before=cert.not_valid_before_utc,
+        not_after=cert.not_valid_after_utc,
+    )
+
+
+def validate_key_matches(certificate_pem: str, key_pem: str) -> None:
+    """Confirm the private key belongs to the certificate.
+
+    Mismatched pairs are a common copy/paste slip and produce a Cloudflare 525 at the worst
+    possible moment — much better to reject them at the point of entry.
+    """
+    try:
+        key = serialization.load_pem_private_key(key_pem.encode(), password=None)
+    except (ValueError, TypeError) as exc:
+        raise CertificateError(
+            "That does not look like a PEM private key. It should begin with "
+            "'-----BEGIN PRIVATE KEY-----' or '-----BEGIN RSA PRIVATE KEY-----'."
+        ) from exc
+
+    try:
+        cert = x509.load_pem_x509_certificate(certificate_pem.encode())
+    except ValueError as exc:
+        raise CertificateError("The certificate could not be parsed.") from exc
+
+    if cert.public_key().public_numbers() != key.public_key().public_numbers():
+        raise CertificateError(
+            "This private key does not match this certificate. Cloudflare shows both on the "
+            "same page when you create an origin certificate — make sure both came from the "
+            "same one."
+        )
 
 
 def certificate_hostnames(zone_name: str) -> list[str]:

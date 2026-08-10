@@ -230,6 +230,25 @@ def _print_setup_summary(config: Config, result, ok: bool) -> None:
         f"UDP {config.wireguard.listen_port}, TCP {config.npm.http_port} and "
         f"TCP {config.npm.https_port}."
     )
+
+    outstanding = []
+    zone = config.cloudflare.zone_name
+    if zone:
+        outstanding.append(
+            f"DNS: A records for [bold]{zone}[/bold] and [bold]*.{zone}[/bold] -> "
+            f"{config.server.public_ip}, proxied"
+        )
+        outstanding.append("SSL/TLS mode set to [bold]Full (strict)[/bold]")
+    if not config.tls.present:
+        outstanding.append(
+            "Origin certificate not installed — "
+            "[bold]edgekit cert install --cert FILE --key FILE[/bold]"
+        )
+    if outstanding:
+        console.print("\n[bold]Still to do in the Cloudflare dashboard:[/bold]")
+        for item in outstanding:
+            console.print(f"  • {item}")
+
     if not ok:
         console.print("\n[yellow]Run `edgekit doctor` to see what still needs attention.[/yellow]")
 
@@ -550,6 +569,28 @@ def host_list() -> None:
     console.print(table if hosts else "[dim]No proxy hosts published.[/dim]")
 
 
+@host_app.command("resync")
+def host_resync() -> None:
+    """Re-push every proxy host to NPM, e.g. after installing a new certificate."""
+    require_root()
+    config = require_configured()
+
+    async def run() -> dict[str, str]:
+        with session_scope() as session:
+            return await HostService(session, config).resync_all()
+
+    outcomes = asyncio.run(run())
+    if not outcomes:
+        console.print("[dim]No proxy hosts to resync.[/dim]")
+        return
+
+    for domain, status_text in outcomes.items():
+        marker = "[green]✓[/green]" if status_text == "ok" else "[red]✗[/red]"
+        console.print(f"{marker} {domain}" + ("" if status_text == "ok" else f" — {status_text}"))
+    if any(s != "ok" for s in outcomes.values()):
+        raise typer.Exit(1)
+
+
 @host_app.command("remove")
 def host_remove(
     domain: str,
@@ -600,6 +641,71 @@ def cert_issue(
     console.print(
         f"[green]✓[/green] certificate {outcome['status']} "
         f"(NPM id {outcome['certificate_id']}, expires {outcome.get('expires', '')[:10]})"
+    )
+
+
+@cert_app.command("install")
+def cert_install(
+    cert: str = typer.Option(..., "--cert", help="Path to the origin certificate (PEM)."),
+    key: str = typer.Option(..., "--key", help="Path to its private key (PEM)."),
+    name: str = typer.Option("", "--name", help="Label to show in NPM."),
+) -> None:
+    """Install an origin certificate into Nginx Proxy Manager.
+
+    Get one from Cloudflare: SSL/TLS -> Origin Server -> Create Certificate, covering
+    `*.yourdomain` and `yourdomain`. It is valid for 15 years and serves every subdomain.
+    """
+    require_root()
+    config = require_configured()
+
+    from pathlib import Path
+
+    from .services.certificates import (
+        CertificateError,
+        certificate_name,
+        inspect_certificate,
+        install_manual_certificate,
+        validate_key_matches,
+    )
+
+    try:
+        certificate_pem = Path(cert).expanduser().read_text().strip() + "\n"
+        key_pem = Path(key).expanduser().read_text().strip() + "\n"
+        validate_key_matches(certificate_pem, key_pem)
+        info = inspect_certificate(certificate_pem)
+    except (OSError, CertificateError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    if info.expired:
+        console.print(f"[red]That certificate expired on {info.not_after.date()}.[/red]")
+        raise typer.Exit(1)
+
+    label = name or certificate_name(config.cloudflare.zone_name or config.server.hostname)
+
+    async def run() -> dict:
+        with session_scope() as session:
+            return await install_manual_certificate(
+                session, config, certificate_pem, key_pem, name=label, actor="cli"
+            )
+
+    try:
+        outcome = asyncio.run(run())
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    # Remember it so a rebuilt NPM can be repopulated by `edgekit provision`.
+    config.tls.certificate = certificate_pem
+    config.tls.certificate_key = key_pem
+    config.tls.name = label
+    config.save()
+
+    console.print(
+        f"[green]✓[/green] installed as NPM id {outcome['certificate_id']}\n"
+        f"  covers:  {', '.join(info.hostnames)}\n"
+        f"  expires: {info.not_after.date()} ({info.days_remaining} days)\n"
+        "  Existing proxy hosts: run [bold]edgekit host resync[/bold] to attach it."
     )
 
 

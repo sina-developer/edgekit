@@ -6,8 +6,9 @@ command, and leaves behind a web panel for managing peers and published services
 It is the [blockey-wireguard-nginx-proxy-manager-guide](blockey-wireguard-nginx-proxy-manager-guide.md)
 turned into software: every manual step in that guide — installing WireGuard, writing
 `wg0.conf`, enabling IP forwarding, the Docker-to-WireGuard `iptables` rules, deploying NPM,
-the Cloudflare DNS records, Full (strict) SSL, the origin certificate, the proxy hosts — is a
-step the installer performs and the panel keeps managing.
+the origin certificate, the proxy hosts — is a step the installer performs and the panel keeps
+managing. The three Cloudflare dashboard actions it cannot do for you are printed as a
+checklist with your real values filled in.
 
 ```
 Internet → Cloudflare (Full strict) → this server ─┬─ Nginx Proxy Manager :80 :443
@@ -32,7 +33,7 @@ virtualenv at `/opt/edgekit`, then hands over to an interview:
 - public IP (auto-detected, you confirm)
 - tunnel subnet and WireGuard UDP port
 - Nginx Proxy Manager ports and admin account
-- Cloudflare zone, API token, SSL mode
+- your domain, then the origin certificate to install
 - panel port and admin account
 
 Then it provisions everything and prints your panel credentials. Re-running it is safe.
@@ -45,8 +46,9 @@ interaction at all:
 ```bash
 sudo EDGEKIT_PUBLIC_IP=52.56.216.78 \
      EDGEKIT_WG_SUBNET=10.50.0.0/24 \
-     EDGEKIT_CF_ZONE=blockey.ir \
-     EDGEKIT_CF_TOKEN=cf_xxx \
+     EDGEKIT_ZONE=blockey.ir \
+     EDGEKIT_CERT_PATH=/root/origin.pem \
+     EDGEKIT_KEY_PATH=/root/origin.key \
      EDGEKIT_PANEL_PASSWORD='a-long-password' \
      ./install.sh --non-interactive
 ```
@@ -57,9 +59,8 @@ sudo EDGEKIT_PUBLIC_IP=52.56.216.78 \
 | `EDGEKIT_WG_SUBNET` / `EDGEKIT_WG_PORT` | Tunnel subnet, WireGuard UDP port |
 | `EDGEKIT_NPM_EMAIL` / `EDGEKIT_NPM_PASSWORD` | Nginx Proxy Manager admin account |
 | `EDGEKIT_NPM_HTTP_PORT` / `EDGEKIT_NPM_HTTPS_PORT` / `EDGEKIT_NPM_ADMIN_PORT` | Proxy ports |
-| `EDGEKIT_CF_ENABLED` / `EDGEKIT_CF_ZONE` / `EDGEKIT_CF_TOKEN` | Cloudflare integration |
-| `EDGEKIT_CF_ORIGIN_CA_KEY` | Needed for origin certificates unless the token is a *user* token |
-| `EDGEKIT_CF_PROXIED` | Orange-cloud the DNS records (default yes) |
+| `EDGEKIT_ZONE` | Your root domain, e.g. `example.com` |
+| `EDGEKIT_CERT_PATH` / `EDGEKIT_KEY_PATH` | Origin certificate and key to install |
 | `EDGEKIT_PANEL_USER` / `EDGEKIT_PANEL_PASSWORD` / `EDGEKIT_PANEL_PORT` | Panel account |
 
 Installing from somewhere other than a local checkout:
@@ -69,26 +70,58 @@ sudo EDGEKIT_REPO=https://github.com/you/edgekit.git ./install.sh
 sudo EDGEKIT_ARCHIVE=https://example.com/edgekit.tar.gz ./install.sh
 ```
 
-### Cloudflare tokens: the two kinds
+### Cloudflare: three one-time clicks
 
-Cloudflare issues **user tokens** (My Profile → API Tokens) and **account-owned tokens** (an
-account's own API Tokens page, `dash.cloudflare.com/<account-id>/api-tokens`). Both manage DNS
-and zone settings fine, and edgekit accepts either.
+edgekit does not need Cloudflare API credentials. These are one-time dashboard actions, and
+setup prints this checklist with your real IP filled in.
 
-They differ in one place: **Origin CA certificate issuance is user-scoped**, so an
-account-owned token cannot issue the origin certificate no matter what permissions it carries.
-If you use an account-owned token, also supply the Origin CA Key:
+**1. DNS** (DNS → Records) — two proxied A records:
 
-```
-Cloudflare dashboard → My Profile → API Tokens → Origin CA Key → View
-```
+| Type | Name | Content | Proxy |
+|---|---|---|---|
+| A | `@` | your server IP | Proxied |
+| A | `*` | your server IP | Proxied |
+
+The wildcard covers every subdomain you will ever add.
+
+**2. SSL/TLS** (SSL/TLS → Overview) — set the mode to **Full (strict)**. Not Flexible:
+Flexible leaves the Cloudflare-to-server hop unencrypted.
+
+**3. Origin certificate** (SSL/TLS → Origin Server → Create Certificate) — accept the
+defaults, set the hostnames to `*.yourdomain` and `yourdomain`. Cloudflare shows an **Origin
+Certificate** and a **Private Key**; the key is shown once only. Save both to the server and
+point setup at them, or install them later:
 
 ```bash
-sudo edgekit cloudflare token --zone example.com --origin-ca-key v1.0-...
+sudo edgekit cert install --cert /root/origin.pem --key /root/origin.key
 ```
 
-Token permissions required either way: **Zone:Read**, **DNS:Edit**, **Zone Settings:Edit**,
-and — for a user token — **SSL and Certificates:Edit**, with Zone Resources including the zone.
+One certificate serves every subdomain for 15 years. edgekit checks that the key matches the
+certificate and that it has not expired before installing — a mismatched pair otherwise shows
+up much later as a Cloudflare 525.
+
+After that, adding a service needs no Cloudflare work at all: the wildcard DNS record and the
+wildcard certificate already cover it.
+
+<details>
+<summary>Optional: automating DNS through the Cloudflare API</summary>
+
+If you would rather have edgekit create a DNS record per proxy host, enable the API under
+Settings → Cloudflare API, or:
+
+```bash
+sudo edgekit cloudflare token --zone example.com
+```
+
+The token needs **Zone:Read**, **DNS:Edit** and **Zone Settings:Edit**, with Zone Resources
+including the zone. `edgekit cloudflare verify` prints a per-permission tick list.
+
+Note that Cloudflare's Origin CA endpoint is **user-scoped**: an account-owned token (created
+from `dash.cloudflare.com/<account-id>/api-tokens`) can manage DNS but cannot issue
+certificates. Pass `--origin-ca-key` if you want that automated too. This is exactly the
+complexity the manual path avoids.
+
+</details>
 
 ### The one thing edgekit cannot do for you
 
@@ -127,14 +160,15 @@ Enable/disable, rotate keys, route extra networks behind a peer. Every change re
 `wg0.conf` and hot-applies it with `wg syncconf`, so adding a peer never drops the tunnels
 already up.
 
-**Proxy hosts** — publish a service in one form: creates the Cloudflare A record, then the NPM
-proxy host pointed at the peer's tunnel address with the origin certificate attached.
+**Proxy hosts** — publish a service in one form: creates the NPM proxy host pointed at the
+peer's tunnel address, with the origin certificate attached. The wildcard DNS record already
+covers the hostname, so there is nothing to do in Cloudflare.
 
 **Diagnostics** — the guide's §21 troubleshooting and §23 verification matrix as live checks,
 each failure paired with the command that fixes it.
 
-**Settings** — Cloudflare credentials, WireGuard port and MTU, certificate issue/reissue,
-manual certificate upload, and a button to re-run the whole provisioner.
+**Settings** — the origin certificate, WireGuard port and MTU, NPM credentials, optional
+Cloudflare API access, and a button to re-run the whole provisioner.
 
 **Audit** — append-only log of every state change, from the panel or the CLI.
 
@@ -160,12 +194,13 @@ edgekit host add retro.blockey.ir 3001 --peer raspberry-pi
 edgekit host list
 edgekit host remove retro.blockey.ir --remove-dns
 
-edgekit cert issue [--force]
+edgekit cert install --cert origin.pem --key origin.key
 edgekit cert status
+edgekit host resync                  # re-attach the certificate to existing hosts
 
-edgekit cloudflare token --zone blockey.ir   # prompts, verifies, then saves
-edgekit cloudflare verify
-edgekit npm password                         # re-sync edgekit's copy of the NPM password
+edgekit npm diagnose                 # what NPM is, and which credentials it accepts
+edgekit npm password                 # re-sync edgekit's copy of the NPM password
+edgekit npm reset                    # wipe NPM's data and redeploy (destructive)
 
 edgekit user create alice
 edgekit user passwd admin
@@ -224,14 +259,15 @@ tests/                      142 tests
 
 *Idempotency everywhere.* Every provisioning step checks before it acts, so a half-finished
 run converges instead of erroring or duplicating state. That is what makes it safe to run on
-server after server, and to re-run after changing the public IP or Cloudflare zone.
+server after server, and to re-run after changing the public IP or the certificate.
 
 *The database is the source of truth.* `wg0.conf` is a rendered artifact, regenerated from the
 peer table on every change. The file and the running interface cannot drift.
 
-*The origin private key never leaves the box.* Cloudflare will generate the keypair for you
-and return the private key over the wire; edgekit generates the key locally and sends only a
-CSR.
+*Certificates are validated before installation.* A key that does not match its certificate,
+or an already-expired certificate, is rejected at the point of entry rather than surfacing
+later as a Cloudflare 525. When the optional API path is used, the private key is generated
+locally and only a CSR is sent.
 
 *Firewall rules are a script, not `iptables -A`.* The guide's commands are neither idempotent
 nor reboot-safe. edgekit writes `/usr/local/lib/edgekit/firewall.sh` — each rule added only if

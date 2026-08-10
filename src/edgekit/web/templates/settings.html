@@ -51,7 +51,63 @@
 </section>
 
 <section class="card">
-  <h2>Cloudflare</h2>
+  <h2>Origin certificate</h2>
+  {% if cert_id %}
+  <dl class="kv">
+    <dt>Name</dt><dd>{{ cert_name }}</dd>
+    <dt>NPM id</dt><dd class="mono">{{ cert_id }}</dd>
+    <dt>Expires</dt><dd>{{ cert_expiry[:10] if cert_expiry else 'unknown' }}</dd>
+  </dl>
+  {% else %}
+  <div class="flash warn">
+    No certificate installed. Cloudflare returns 525 for every host while it is set to
+    Full (strict).
+  </div>
+  {% endif %}
+
+  <p class="muted small">
+    Create one in Cloudflare under <strong>SSL/TLS → Origin Server → Create Certificate</strong>,
+    covering <code>*.{{ config.cloudflare.zone_name or 'example.com' }}</code> and
+    <code>{{ config.cloudflare.zone_name or 'example.com' }}</code>. It lasts 15 years and
+    serves every subdomain. Paste both boxes below, or use
+    <code>edgekit cert install --cert FILE --key FILE</code>.
+  </p>
+
+  <form method="post" action="/settings/certificate/upload" class="grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <label>Name
+      <input type="text" name="name" placeholder="Cloudflare Origin - {{ config.cloudflare.zone_name or 'example.com' }}">
+    </label>
+    <label>Certificate (PEM)
+      <textarea name="certificate_pem" rows="7" required class="mono" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+    </label>
+    <label>Private key (PEM)
+      <textarea name="key_pem" rows="7" required class="mono" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
+    </label>
+    <div class="actions"><button class="primary" type="submit">Install into NPM</button></div>
+  </form>
+
+  {% if config.cloudflare.enabled and config.cloudflare.zone_id %}
+  <div class="danger-zone">
+    <form method="post" action="/settings/certificate/issue" class="inline"
+          data-confirm="Issue a new certificate from the Cloudflare API and replace the current one?">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <input type="hidden" name="force" value="true">
+      <button class="button" type="submit">Issue via Cloudflare API instead</button>
+    </form>
+  </div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Cloudflare API <span class="pill">optional</span></h2>
+  <p class="muted">
+    Not required. DNS records, the SSL/TLS mode and the origin certificate are one-time
+    actions in the Cloudflare dashboard — the checklist is in the README. Enable this only if
+    you want edgekit to create DNS records for each new proxy host automatically.
+  </p>
+  <details>
+    <summary class="link">Configure API access</summary>
   <form method="post" action="/settings/cloudflare" class="grid">
     <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
     <label class="check">
@@ -86,48 +142,6 @@
     </label>
     <div class="actions"><button class="primary" type="submit">Save and verify</button></div>
   </form>
-</section>
-
-<section class="card">
-  <h2>Origin certificate</h2>
-  {% if cert_id %}
-  <dl class="kv">
-    <dt>Name</dt><dd>{{ cert_name }}</dd>
-    <dt>NPM id</dt><dd class="mono">{{ cert_id }}</dd>
-    <dt>Expires</dt><dd>{{ cert_expiry[:10] if cert_expiry else 'unknown' }}</dd>
-  </dl>
-  {% else %}
-  <p class="muted">No certificate installed.</p>
-  {% endif %}
-
-  <div class="danger-zone">
-    <form method="post" action="/settings/certificate/issue" class="inline">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-      <button class="button" type="submit">Issue from Cloudflare</button>
-    </form>
-    <form method="post" action="/settings/certificate/issue" class="inline"
-          data-confirm="Force-reissue and replace the certificate in NPM?">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-      <input type="hidden" name="force" value="true">
-      <button class="button" type="submit">Force reissue</button>
-    </form>
-  </div>
-
-  <details>
-    <summary class="link">Upload a certificate manually</summary>
-    <form method="post" action="/settings/certificate/upload" class="grid">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-      <label>Name
-        <input type="text" name="name" placeholder="Cloudflare Origin - {{ config.cloudflare.zone_name or 'example.com' }}">
-      </label>
-      <label>Certificate (PEM)
-        <textarea name="certificate_pem" rows="6" required class="mono" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
-      </label>
-      <label>Private key (PEM)
-        <textarea name="key_pem" rows="6" required class="mono" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
-      </label>
-      <div class="actions"><button class="primary" type="submit">Install into NPM</button></div>
-    </form>
   </details>
 </section>
 

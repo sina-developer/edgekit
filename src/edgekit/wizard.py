@@ -12,6 +12,7 @@ import ipaddress
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -214,50 +215,18 @@ def run_wizard(existing: Config | None = None, *, non_interactive: bool = False)
             npm_password = Prompt.ask("  NPM admin password", password=True)
     config.npm.admin_password = npm_password
 
-    # -- cloudflare -----------------------------------------------------------
-    _section("Cloudflare")
-    config.cloudflare.enabled = _ask_bool(
-        "Manage DNS, SSL mode and origin certificates through the Cloudflare API?",
-        default=config.cloudflare.enabled or bool(env("CF_TOKEN")),
-        env_key="CF_ENABLED",
+    # -- domain and TLS -------------------------------------------------------
+    _section("Domain and TLS")
+    config.cloudflare.zone_name = _ask(
+        "Your domain (root, e.g. example.com)",
+        default=config.cloudflare.zone_name,
+        env_key="ZONE",
+        validator=_validate_domain,
         non_interactive=non_interactive,
     )
-    if config.cloudflare.enabled:
-        config.cloudflare.zone_name = _ask(
-            "Zone (root domain)",
-            default=config.cloudflare.zone_name,
-            env_key="CF_ZONE",
-            validator=_validate_domain,
-            non_interactive=non_interactive,
-        )
-        if not non_interactive and not env("CF_TOKEN"):
-            console.print(
-                "  [dim]Token needs: Zone:Read, DNS:Edit, Zone Settings:Edit, "
-                "SSL and Certificates:Edit.[/dim]"
-            )
-        config.cloudflare.api_token = _ask(
-            "Cloudflare API token",
-            default=config.cloudflare.api_token,
-            env_key="CF_TOKEN",
-            password=True,
-            non_interactive=non_interactive,
-        )
-        # Verify while the operator is still at the keyboard. Discovering a bad token five
-        # minutes later, half way through provisioning, is a much worse experience.
-        _verify_cloudflare(config, non_interactive=non_interactive)
-        config.cloudflare.origin_ca_key = _ask(
-            "Origin CA key (optional, press Enter to skip)",
-            default=config.cloudflare.origin_ca_key,
-            env_key="CF_ORIGIN_CA_KEY",
-            password=True,
-            non_interactive=non_interactive,
-        )
-        config.cloudflare.proxied = _ask_bool(
-            "Proxy DNS records through Cloudflare (orange cloud)?",
-            default=True,
-            env_key="CF_PROXIED",
-            non_interactive=non_interactive,
-        )
+    if not non_interactive:
+        _print_cloudflare_checklist(config)
+    _collect_certificate(config, non_interactive=non_interactive)
 
     # -- panel ----------------------------------------------------------------
     _section("Management panel")
@@ -313,63 +282,129 @@ def run_wizard(existing: Config | None = None, *, non_interactive: bool = False)
     )
 
 
-def _verify_cloudflare(config: Config, *, non_interactive: bool) -> None:
-    """Check the token and resolve the zone id, re-prompting until it works.
+def _print_cloudflare_checklist(config: Config) -> None:
+    """The three one-time dashboard actions, spelled out with this server's real values.
 
-    In unattended mode a bad token is reported but does not block: the rest of the server
-    still provisions, and Cloudflare can be fixed afterwards from the panel.
+    These used to be done over the API. They are one-time clicks, so asking the operator to
+    do them beats maintaining credentials with enough scope to do them automatically.
     """
-    import asyncio
+    zone = config.cloudflare.zone_name
+    ip = config.server.public_ip
 
-    from .services.cloudflare import CloudflareClient, CloudflareError
+    console.print(
+        Panel(
+            f"""Do these three things in the Cloudflare dashboard for [bold]{zone}[/bold].
+Each is one-time — new subdomains later need nothing but a proxy host in edgekit.
 
-    async def check() -> tuple[str, list]:
-        async with CloudflareClient(
-            config.cloudflare.api_token, origin_ca_key=config.cloudflare.origin_ca_key
-        ) as client:
-            await client.verify_token()
-            zone_id = await client.get_zone_id(config.cloudflare.zone_name)
-            return zone_id, await client.require_zone_permissions(zone_id)
+[bold]1. DNS[/bold]  (DNS -> Records)  — add two proxied A records:
+
+     Type   Name   Content          Proxy
+     A      @      {ip:<15}  Proxied
+     A      *      {ip:<15}  Proxied
+
+   The wildcard covers every subdomain you will ever add.
+
+[bold]2. SSL/TLS[/bold]  (SSL/TLS -> Overview) — set the mode to [bold]Full (strict)[/bold].
+   Not Flexible: Flexible leaves the Cloudflare-to-server hop unencrypted.
+
+[bold]3. Origin certificate[/bold]  (SSL/TLS -> Origin Server -> Create Certificate)
+   Accept the defaults and set the hostnames to:
+
+     *.{zone}
+     {zone}
+
+   Cloudflare then shows two boxes, [bold]Origin Certificate[/bold] and [bold]Private Key[/bold].
+   The private key is shown once only. Save both onto this server, for example:
+
+     nano /root/origin.pem   # paste the Origin Certificate
+     nano /root/origin.key   # paste the Private Key
+
+   Then give the paths below. One certificate serves every subdomain, for 15 years.""",
+            title="Cloudflare setup",
+            border_style="blue",
+        )
+    )
+
+
+def _read_pem(path_text: str) -> str:
+    path = Path(path_text).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"{path} does not exist")
+    if path.is_dir():
+        raise IsADirectoryError(f"{path} is a directory")
+    return path.read_text().strip() + "\n"
+
+
+def _collect_certificate(config: Config, *, non_interactive: bool) -> None:
+    """Load the origin certificate from files, validating it before accepting."""
+    from .services.certificates import (
+        CertificateError,
+        certificate_name,
+        inspect_certificate,
+        validate_key_matches,
+    )
+
+    cert_path = env("CERT_PATH")
+    key_path = env("KEY_PATH")
+
+    if not (cert_path and key_path):
+        if non_interactive:
+            return
+        console.print()
+        if not Confirm.ask(
+            "Install the origin certificate now? "
+            "(No is fine — you can add it later in the panel)",
+            default=True,
+        ):
+            console.print(
+                "  [yellow]Skipped. Until a certificate is installed, Cloudflare will "
+                "return 525 while set to Full (strict).[/yellow]\n"
+                "  [dim]Add it later with `edgekit cert install --cert FILE --key FILE`, "
+                "or paste it in the panel under Settings.[/dim]"
+            )
+            return
 
     while True:
         try:
-            config.cloudflare.zone_id, report = asyncio.run(check())
-        except CloudflareError as exc:
-            console.print(f"\n[red]{exc}[/red]\n")
+            certificate = _read_pem(
+                cert_path or Prompt.ask("  Path to the origin certificate",
+                                        default="/root/origin.pem")
+            )
+            key = _read_pem(
+                key_path or Prompt.ask("  Path to the private key", default="/root/origin.key")
+            )
+            validate_key_matches(certificate, key)
+            info = inspect_certificate(certificate)
+        except (OSError, CertificateError) as exc:
+            console.print(f"  [red]{exc}[/red]")
             if non_interactive:
-                console.print(
-                    "[yellow]Continuing without Cloudflare. Fix the token in the panel "
-                    "under Settings, then re-run `edgekit provision`.[/yellow]"
-                )
-                config.cloudflare.enabled = False
                 return
-            if not Confirm.ask("Re-enter the Cloudflare token?", default=True):
-                console.print(
-                    "[yellow]Cloudflare will be left disabled. Enable it later in the "
-                    "panel under Settings.[/yellow]"
-                )
-                config.cloudflare.enabled = False
+            cert_path = key_path = ""
+            if not Confirm.ask("  Try again?", default=True):
                 return
-            config.cloudflare.api_token = Prompt.ask("  Cloudflare API token", password=True)
             continue
-        except Exception as exc:  # noqa: BLE001 - network problems should not be fatal here
-            console.print(f"  [yellow]Could not reach Cloudflare to verify: {exc}[/yellow]")
-            return
+
+        if info.expired:
+            console.print(f"  [red]That certificate expired on {info.not_after.date()}.[/red]")
+            if non_interactive:
+                return
+            cert_path = key_path = ""
+            if not Confirm.ask("  Try again?", default=True):
+                return
+            continue
+
+        config.tls.certificate = certificate
+        config.tls.certificate_key = key
+        config.tls.name = certificate_name(config.cloudflare.zone_name)
 
         console.print(
-            f"  [green]✓[/green] token valid, zone {config.cloudflare.zone_name} "
-            f"= {config.cloudflare.zone_id}"
+            f"  [green]✓[/green] certificate for {', '.join(info.hostnames)}, "
+            f"valid until {info.not_after.date()} ({info.days_remaining} days)"
         )
-        for capability in report:
-            if not capability.ok:
-                console.print(
-                    f"  [yellow]![/yellow] cannot manage {capability.label} "
-                    f"({capability.permission})"
-                )
-        if any(not c.ok for c in report) and not config.cloudflare.origin_ca_key:
+        if config.cloudflare.zone_name and not info.covers(f"test.{config.cloudflare.zone_name}"):
             console.print(
-                "    [dim]Origin certificates also work with the Origin CA Key "
-                "(My Profile -> API Tokens -> Origin CA Key).[/dim]"
+                f"  [yellow]! It does not appear to cover *.{config.cloudflare.zone_name} — "
+                "subdomains served through it will fail TLS.[/yellow]"
             )
         return
 
@@ -395,11 +430,10 @@ def _summary(config: Config, username: str) -> None:
         f"admin {config.npm.admin_port} on {config.npm.admin_bind}",
     )
     table.add_row("NPM admin", config.npm.admin_email)
+    table.add_row("Domain", config.cloudflare.zone_name or "not set")
     table.add_row(
-        "Cloudflare",
-        f"{config.cloudflare.zone_name} (SSL {config.cloudflare.ssl_mode})"
-        if config.cloudflare.enabled
-        else "disabled",
+        "Origin certificate",
+        "supplied" if config.tls.present else "[yellow]none yet[/yellow]",
     )
     table.add_row("Panel", f"{username}@{config.panel.bind}:{config.panel.port}")
     console.print(Panel(table, title="Summary", border_style="blue"))

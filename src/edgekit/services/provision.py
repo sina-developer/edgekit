@@ -366,9 +366,30 @@ class Provisioner:
         return f"SSL mode = {mode}"
 
     async def step_origin_certificate(self) -> str:
+        """Install the origin certificate into NPM.
+
+        Prefers the certificate the operator supplied, which is the normal path — creating
+        one in the Cloudflare dashboard is a single one-time action. Falls back to issuing
+        via the API only when that automation has been explicitly enabled.
+        """
+        if self.skip_docker:
+            raise SkipStep("--skip-docker")
+
+        tls = self.config.tls
+        if tls.present:
+            info = certificates.inspect_certificate(tls.certificate)
+            with session_scope() as session:
+                outcome = await certificates.install_manual_certificate(
+                    session, self.config, tls.certificate, tls.certificate_key, name=tls.name
+                )
+            return (
+                f"installed {', '.join(info.hostnames)} as NPM id "
+                f"{outcome['certificate_id']}, expires {info.not_after.date()}"
+            )
+
         cf = self.config.cloudflare
-        if self.skip_cloudflare or not (cf.enabled and cf.zone_id) or self.skip_docker:
-            raise SkipStep("Cloudflare integration disabled")
+        if self.skip_cloudflare or not (cf.enabled and cf.zone_id):
+            raise SkipStep("no certificate supplied — add one with `edgekit cert install`")
 
         with session_scope() as session:
             outcome = await certificates.issue_and_install(session, self.config)
