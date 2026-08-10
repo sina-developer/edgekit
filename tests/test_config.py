@@ -57,6 +57,14 @@ def test_missing_config_returns_defaults(tmp_path):
     assert loaded.configured is False
 
 
+def test_public_panel_domain_uses_subdomain_and_zone(config):
+    assert config.public_panel_domain == "edgekit.example.com"
+    config.panel.public_subdomain = "panel"
+    assert config.public_panel_domain == "panel.example.com"
+    config.cloudflare.zone_name = ""
+    assert config.public_panel_domain is None
+
+
 def test_encrypt_decrypt_are_inverse():
     token = encrypt("hunter2")
     assert is_encrypted(token)

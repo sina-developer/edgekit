@@ -68,6 +68,8 @@ sudo EDGEKIT_PUBLIC_IP=52.56.216.78 \
 | `EDGEKIT_ZONE` | Your root domain, e.g. `example.com` |
 | `EDGEKIT_CERT_PATH` / `EDGEKIT_KEY_PATH` | Origin certificate and key to install |
 | `EDGEKIT_PANEL_USER` / `EDGEKIT_PANEL_PASSWORD` / `EDGEKIT_PANEL_PORT` | Panel account |
+| `EDGEKIT_PANEL_BIND` | Panel listen address (default: WireGuard hub IP) |
+| `EDGEKIT_PANEL_SUBDOMAIN` | Public panel hostname label (default: `edgekit`) |
 
 Override the source if needed:
 
@@ -146,21 +148,20 @@ Do **not** open the NPM admin port or the panel port. Both are bound to loopback
 
 ## The panel
 
-Bound to `127.0.0.1` by default, because it holds every credential on the box. Reach it with
-an SSH tunnel **from your own machine** — not from the server:
+Setup binds the panel to the WireGuard hub IP (e.g. `10.50.0.1:8088`) and publishes it at
+`https://edgekit.yourdomain` through Nginx Proxy Manager, with the origin certificate
+attached. That is how NPM (running in Docker) can reach the panel — `127.0.0.1` inside the
+container is not the host.
+
+Keep the panel port **closed** on your cloud firewall; only UDP 51820 and TCP 80/443 need to
+be open. For loopback-only access instead, set `EDGEKIT_PANEL_BIND=127.0.0.1` before setup
+and use an SSH tunnel:
 
 ```bash
 ssh -i your-key.pem -L 8088:127.0.0.1:8088 ubuntu@YOUR_SERVER_IP
 ```
 
-Leave that running, then open <http://127.0.0.1:8088>. Use whichever login account your
-server actually accepts (`ubuntu` on AWS Ubuntu images, `root` on most VPS providers) — setup
-prints the correct command with your real user filled in.
-
-To reach it over the tunnel instead, answer yes to "expose the panel on the WireGuard
-address" during setup. It then binds to `10.50.0.1` and any connected peer can open
-<http://10.50.0.1:8088> directly, with no SSH tunnel — but you need a working peer first, so
-it is a poor choice for the very first login.
+Override the public hostname label with `EDGEKIT_PANEL_SUBDOMAIN=panel` (default `edgekit`).
 
 Forgotten the password? `sudo edgekit user passwd admin` prints a new one.
 
@@ -285,8 +286,9 @@ locally and only a CSR is sent.
 nor reboot-safe. edgekit writes `/usr/local/lib/edgekit/firewall.sh` — each rule added only if
 an identical one is absent — plus a systemd unit that replays it after `docker.service`.
 
-*Nothing is exposed by default.* The NPM admin UI binds to `127.0.0.1`, the panel binds to
-`127.0.0.1`, and `0.0.0.0` is never offered as a choice.
+*The NPM admin UI stays on loopback.* The management panel binds to the WireGuard hub IP and
+is published at `edgekit.<zone>` via NPM — never on `0.0.0.0`. Keep the panel port closed on
+the cloud firewall.
 
 ### Files on disk
 

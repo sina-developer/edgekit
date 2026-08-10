@@ -237,14 +237,29 @@ def run_wizard(existing: Config | None = None, *, non_interactive: bool = False)
         _ask("Panel port", default=str(config.panel.port or 8088), env_key="PANEL_PORT",
              validator=_validate_port, non_interactive=non_interactive)
     )
-    expose = _ask_bool(
-        "Expose the panel on the WireGuard address as well as localhost?",
-        default=False,
-        env_key="PANEL_EXPOSE_WG",
-        non_interactive=non_interactive,
-    )
+    # Bind to the WireGuard hub IP so NPM (Docker) can reverse-proxy the panel at
+    # edgekit.<zone>. Override with EDGEKIT_PANEL_BIND=127.0.0.1 for loopback-only.
     # Binding to 0.0.0.0 is never offered: the panel holds every credential on the box.
-    config.panel.bind = config.wireguard.hub_ip if expose else "127.0.0.1"
+    bind_override = env("PANEL_BIND")
+    if bind_override:
+        if bind_override in ("0.0.0.0", "::", "[::]"):
+            console.print(
+                "  [red]Refusing to bind the panel to all interfaces. "
+                "Use the WireGuard hub IP or 127.0.0.1.[/red]"
+            )
+            raise SystemExit(1)
+        config.panel.bind = bind_override
+    else:
+        config.panel.bind = config.wireguard.hub_ip
+    config.panel.public_subdomain = (
+        env("PANEL_SUBDOMAIN") or config.panel.public_subdomain or "edgekit"
+    )
+    if config.cloudflare.zone_name:
+        console.print(
+            f"  Panel will be published at "
+            f"[bold]https://{config.public_panel_domain}[/bold] "
+            f"(bound on {config.panel.bind}:{config.panel.port})"
+        )
 
     username = _ask(
         "Panel username",
@@ -489,5 +504,7 @@ def _summary(config: Config, username: str) -> None:
         "Origin certificate",
         "supplied" if config.tls.present else "[yellow]none yet[/yellow]",
     )
+    if config.public_panel_domain:
+        table.add_row("Panel URL", f"https://{config.public_panel_domain}")
     table.add_row("Panel", f"{username}@{config.panel.bind}:{config.panel.port}")
     console.print(Panel(table, title="Summary", border_style="blue"))

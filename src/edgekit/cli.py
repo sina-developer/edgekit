@@ -193,15 +193,21 @@ def _run_provisioner(config: Config, **flags) -> object:
 
 
 def _panel_access_help(config: Config) -> str:
-    """How to actually reach the panel, given where it is bound.
-
-    The bind address changes the answer: a loopback panel needs an SSH tunnel, while one on
-    the WireGuard address is reached directly from any connected peer and cannot be
-    port-forwarded to in the same way.
-    """
+    """How to actually reach the panel, given where it is bound."""
     port = config.panel.port
     user = config.server.ssh_user
     host = config.server.public_ip
+    public = config.public_panel_domain
+
+    if public and config.panel.bind not in ("127.0.0.1", "localhost"):
+        return (
+            f"\n[bold]Opening the panel[/bold]\n"
+            f"  Public URL: [bold]https://{public}[/bold]\n"
+            f"  Or from a WireGuard peer: [bold]http://{config.panel.bind}:{port}[/bold]\n"
+            "  [dim]Keep TCP "
+            f"{port} closed on your cloud firewall — only 80/443 and UDP "
+            f"{config.wireguard.listen_port} need to be open.[/dim]\n"
+        )
 
     if config.panel.bind in ("127.0.0.1", "localhost"):
         return (
@@ -216,13 +222,16 @@ def _panel_access_help(config: Config) -> str:
         f"\n[bold]Opening the panel[/bold] (it listens on {config.panel.bind})\n"
         f"  From any connected WireGuard peer: [bold]http://{config.panel.bind}:{port}[/bold]\n"
         "  Connect a peer first — add one with [bold]edgekit peer add <name>[/bold].\n"
-        "  [dim]It is not reachable from the public internet, by design.[/dim]\n"
     )
 
 
 def _print_setup_summary(config: Config, result, ok: bool) -> None:
     table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
-    table.add_row("Panel", f"http://{config.panel.bind}:{config.panel.port}")
+    if config.public_panel_domain and config.panel.bind not in ("127.0.0.1", "localhost"):
+        table.add_row("Panel", f"https://{config.public_panel_domain}")
+        table.add_row("Panel bind", f"http://{config.panel.bind}:{config.panel.port}")
+    else:
+        table.add_row("Panel", f"http://{config.panel.bind}:{config.panel.port}")
     table.add_row("Username", result.panel_username)
     if result.panel_password_generated:
         table.add_row("Password", f"[bold yellow]{result.panel_password}[/bold yellow]")

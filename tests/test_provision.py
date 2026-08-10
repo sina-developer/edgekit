@@ -114,6 +114,73 @@ class TestFlags:
             await Provisioner(config).step_cloudflare_zone()
 
 
+class TestPublishPanel:
+    async def test_skips_without_a_zone(self, config):
+        config.cloudflare.zone_name = ""
+        config.panel.bind = "10.50.0.1"
+        with pytest.raises(SkipStep, match="no zone"):
+            await Provisioner(config).step_publish_panel()
+
+    async def test_skips_when_panel_is_loopback_only(self, config):
+        config.panel.bind = "127.0.0.1"
+        with pytest.raises(SkipStep, match="loopback"):
+            await Provisioner(config).step_publish_panel()
+
+    async def test_creates_edgekit_host_on_the_hub(self, config, clean_db, monkeypatch):
+        from edgekit.services import hosts as hosts_module
+
+        config.panel.bind = "10.50.0.1"
+        config.panel.port = 8088
+        created: dict = {}
+
+        async def fake_create(self, **kwargs):
+            created.update(kwargs)
+            host = type("H", (), {
+                "domain": kwargs["domain"],
+                "forward_host": kwargs["forward_host"],
+                "forward_port": kwargs["forward_port"],
+            })()
+            return host
+
+        monkeypatch.setattr(hosts_module.HostService, "create", fake_create)
+        detail = await Provisioner(config).step_publish_panel()
+
+        assert created["domain"] == "edgekit.example.com"
+        assert created["forward_host"] == "10.50.0.1"
+        assert created["forward_port"] == 8088
+        assert "edgekit.example.com" in detail
+
+    async def test_updates_existing_panel_host_target(self, config, clean_db, monkeypatch):
+        from edgekit.db import session_scope
+        from edgekit.models import ProxyHost
+        from edgekit.services import hosts as hosts_module
+
+        config.panel.bind = "10.50.0.1"
+        config.panel.port = 8088
+        with session_scope() as session:
+            session.add(
+                ProxyHost(
+                    domain="edgekit.example.com",
+                    forward_host="10.50.0.9",
+                    forward_port=9999,
+                    scheme="http",
+                )
+            )
+        updated: dict = {}
+
+        async def fake_update(self, host_id, **kwargs):
+            updated["host_id"] = host_id
+            updated.update(kwargs)
+            return self.get(host_id)
+
+        monkeypatch.setattr(hosts_module.HostService, "update", fake_update)
+        detail = await Provisioner(config).step_publish_panel()
+
+        assert updated["forward_host"] == "10.50.0.1"
+        assert updated["forward_port"] == 8088
+        assert "updated" in detail
+
+
 class TestFirewallArtifacts:
     def test_the_generated_script_checks_before_it_appends(self, tmp_path, monkeypatch):
         monkeypatch.setattr(firewall, "FIREWALL_SCRIPT", tmp_path / "firewall.sh")

@@ -18,16 +18,18 @@ from enum import Enum
 from typing import Any
 
 import httpx
+from sqlalchemy import select
 
 from ..config import Config
 from ..db import session_scope
-from ..models import AuditLog
+from ..models import AuditLog, ProxyHost
 from ..paths import NPM_DIR, ensure_dirs
 from ..rendering import render
 from ..system import dockerx, firewall, packages, sysctl
 from ..system import wireguard as wg
 from ..system.shell import is_root
 from . import certificates
+from .hosts import HostService
 from .npm import NPMClient
 from .peers import PeerService
 
@@ -143,6 +145,7 @@ class Provisioner:
             ("cloudflare_dns", "Publish DNS records", self.step_cloudflare_dns),
             ("cloudflare_ssl", "Set SSL mode to Full (strict)", self.step_cloudflare_ssl),
             ("origin_cert", "Install origin certificate", self.step_origin_certificate),
+            ("panel_host", "Publish panel at edgekit.<zone>", self.step_publish_panel),
             ("persist", "Save configuration", self.step_persist),
         ]
 
@@ -400,6 +403,53 @@ class Provisioner:
             f"{outcome['status']}, NPM certificate id {outcome['certificate_id']}"
             + (f", expires {outcome['expires'][:10]}" if outcome.get("expires") else "")
         )
+
+    async def step_publish_panel(self) -> str:
+        """Publish the management panel at edgekit.<zone> via NPM.
+
+        The panel listens on the WireGuard hub IP so the NPM container can reach it.
+        Requires a zone name; origin certificate should already be installed when possible.
+        """
+        if self.skip_docker or not self.config.npm.enabled:
+            raise SkipStep("NPM disabled")
+
+        domain = self.config.public_panel_domain
+        if not domain:
+            raise SkipStep("no zone configured — set cloudflare.zone_name to publish the panel")
+
+        bind = self.config.panel.bind
+        if bind in ("127.0.0.1", "localhost"):
+            raise SkipStep(
+                "panel bound to loopback — set panel.bind to the WireGuard hub IP "
+                "(or omit EDGEKIT_PANEL_BIND) so NPM can reach it"
+            )
+
+        port = self.config.panel.port
+        with session_scope() as session:
+            existing = session.scalar(select(ProxyHost).where(ProxyHost.domain == domain))
+            service = HostService(session, self.config)
+            if existing:
+                # Keep target aligned with the current panel bind/port across re-provisions.
+                if existing.forward_host != bind or existing.forward_port != port:
+                    await service.update(
+                        existing.id,
+                        peer_id=None,
+                        forward_host=bind,
+                        forward_port=port,
+                        manage_dns=True,
+                        actor="provision",
+                    )
+                    return f"{domain} updated -> {bind}:{port}"
+                return f"{domain} already published -> {bind}:{port}"
+
+            host = await service.create(
+                domain=domain,
+                forward_port=port,
+                forward_host=bind,
+                manage_dns=True,
+                actor="provision",
+            )
+            return f"{host.domain} -> {host.forward_host}:{host.forward_port}"
 
     def step_persist(self) -> str:
         self.config.save()

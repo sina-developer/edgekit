@@ -134,9 +134,13 @@ class TLSConfig(_Section):
 class PanelConfig(_Section):
     SECRET_FIELDS: ClassVar[tuple[str, ...]] = ("session_secret",)
 
-    #: Loopback by default. Reach it over an SSH tunnel, or bind it to the WireGuard hub IP.
+    #: WireGuard hub IP by default so Nginx Proxy Manager (in Docker) can reach the panel
+    #: and publish it at edgekit.<zone>. Override with EDGEKIT_PANEL_BIND=127.0.0.1 for
+    #: loopback-only access. Binding to 0.0.0.0 is never offered.
     bind: str = "127.0.0.1"
     port: int = 8088
+    #: Public hostname label used as ``{public_subdomain}.{zone}`` (e.g. edgekit.example.com).
+    public_subdomain: str = "edgekit"
     session_secret: str = Field(default_factory=lambda: secrets.token_urlsafe(48))
     session_max_age_seconds: int = 8 * 3600
 
@@ -161,6 +165,15 @@ class Config(BaseModel):
     #: dashboard actions; the API is available for anyone who wants them automated.
     cloudflare: CloudflareConfig = Field(default_factory=CloudflareConfig)
     panel: PanelConfig = Field(default_factory=PanelConfig)
+
+    @property
+    def public_panel_domain(self) -> str | None:
+        """Hostname published for the management panel, e.g. ``edgekit.example.com``."""
+        zone = (self.cloudflare.zone_name or "").strip().rstrip(".")
+        label = (self.panel.public_subdomain or "").strip().strip(".")
+        if not zone or not label:
+            return None
+        return f"{label}.{zone}"
 
     # ---------------------------------------------------------------- persistence
 
