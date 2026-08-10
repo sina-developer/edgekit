@@ -140,17 +140,23 @@ Do **not** open the NPM admin port or the panel port. Both are bound to loopback
 
 ## The panel
 
-Bound to `127.0.0.1` by default, because it holds every credential on the box. Reach it over
-an SSH tunnel:
+Bound to `127.0.0.1` by default, because it holds every credential on the box. Reach it with
+an SSH tunnel **from your own machine** — not from the server:
 
 ```bash
-ssh -L 8088:127.0.0.1:8088 root@YOUR_SERVER_IP
+ssh -i your-key.pem -L 8088:127.0.0.1:8088 ubuntu@YOUR_SERVER_IP
 ```
 
-then open <http://127.0.0.1:8088>.
+Leave that running, then open <http://127.0.0.1:8088>. Use whichever login account your
+server actually accepts (`ubuntu` on AWS Ubuntu images, `root` on most VPS providers) — setup
+prints the correct command with your real user filled in.
 
 To reach it over the tunnel instead, answer yes to "expose the panel on the WireGuard
-address" during setup — it then binds to `10.50.0.1` and is reachable from any connected peer.
+address" during setup. It then binds to `10.50.0.1` and any connected peer can open
+<http://10.50.0.1:8088> directly, with no SSH tunnel — but you need a working peer first, so
+it is a poor choice for the very first login.
+
+Forgotten the password? `sudo edgekit user passwd admin` prints a new one.
 
 **Overview** — tunnel state, per-peer handshake and traffic, NPM container health,
 certificate expiry, recent activity.

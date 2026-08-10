@@ -146,6 +146,9 @@ class ServerConfig(_Section):
     hostname: str = ""
     #: Detected Docker bridge subnet; needed for the container -> WireGuard NAT rules.
     docker_bridge_subnet: str = "172.17.0.0/16"
+    #: The account used to log in here, so printed ssh commands are copy-pasteable.
+    #: Cloud images commonly disable root SSH, making a hardcoded "root@" wrong.
+    ssh_user: str = "root"
 
 
 class Config(BaseModel):

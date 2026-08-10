@@ -30,6 +30,11 @@ LOG_FILE = LOG_DIR / "edgekit.log"
 WG_DIR = _p("etc", "wireguard")
 NPM_DIR = _p("opt", "nginx-proxy-manager")
 
+#: Where a pasted origin certificate is saved, so it exists as a file you can inspect,
+#: back up, or re-install from later.
+ORIGIN_CERT_FILE = _p("root", "origin.pem")
+ORIGIN_KEY_FILE = _p("root", "origin.key")
+
 FIREWALL_SCRIPT = _p("usr", "local", "lib", "edgekit", "firewall.sh")
 SYSCTL_FILE = _p("etc", "sysctl.d", "99-edgekit.conf")
 

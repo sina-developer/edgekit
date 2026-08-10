@@ -155,7 +155,8 @@
   <p class="muted small">
     The admin UI is bound to {{ config.npm.admin_bind }} so it is not exposed publicly. Reach
     it with an SSH tunnel:
-    <code>ssh -L {{ config.npm.admin_port }}:127.0.0.1:{{ config.npm.admin_port }} root@{{ config.server.public_ip }}</code>
+    <code>ssh -L {{ config.npm.admin_port }}:127.0.0.1:{{ config.npm.admin_port }} {{ config.server.ssh_user }}@{{ config.server.public_ip }}</code>
+    then open <code>http://127.0.0.1:{{ config.npm.admin_port }}</code>
   </p>
   <form method="post" action="/settings/npm" class="grid">
     <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">

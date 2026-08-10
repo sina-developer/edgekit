@@ -191,6 +191,34 @@ def _run_provisioner(config: Config, **flags) -> object:
     return asyncio.run(provisioner.run())
 
 
+def _panel_access_help(config: Config) -> str:
+    """How to actually reach the panel, given where it is bound.
+
+    The bind address changes the answer: a loopback panel needs an SSH tunnel, while one on
+    the WireGuard address is reached directly from any connected peer and cannot be
+    port-forwarded to in the same way.
+    """
+    port = config.panel.port
+    user = config.server.ssh_user
+    host = config.server.public_ip
+
+    if config.panel.bind in ("127.0.0.1", "localhost"):
+        return (
+            f"\n[bold]Opening the panel[/bold] (it listens on {config.panel.bind} only)\n"
+            "  1. On your own machine, open an SSH tunnel and leave it running:\n"
+            f"     [bold]ssh -L {port}:127.0.0.1:{port} {user}@{host}[/bold]\n"
+            "     [dim](add -i /path/to/key.pem if you use a key file)[/dim]\n"
+            f"  2. Then browse to [bold]http://127.0.0.1:{port}[/bold]\n"
+        )
+
+    return (
+        f"\n[bold]Opening the panel[/bold] (it listens on {config.panel.bind})\n"
+        f"  From any connected WireGuard peer: [bold]http://{config.panel.bind}:{port}[/bold]\n"
+        "  Connect a peer first — add one with [bold]edgekit peer add <name>[/bold].\n"
+        "  [dim]It is not reachable from the public internet, by design.[/dim]\n"
+    )
+
+
 def _print_setup_summary(config: Config, result, ok: bool) -> None:
     table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
     table.add_row("Panel", f"http://{config.panel.bind}:{config.panel.port}")
@@ -218,13 +246,7 @@ def _print_setup_summary(config: Config, result, ok: bool) -> None:
             "You will be asked to change it at first sign-in.[/yellow]"
         )
 
-    console.print(
-        "\nThe panel listens on "
-        f"[bold]{config.panel.bind}[/bold]. From your workstation:\n"
-        f"  [bold]ssh -L {config.panel.port}:{config.panel.bind}:{config.panel.port} "
-        f"root@{config.server.public_ip}[/bold]\n"
-        f"then open [bold]http://127.0.0.1:{config.panel.port}[/bold]\n"
-    )
+    console.print(_panel_access_help(config))
     console.print(
         "Remember the firewall rules your cloud provider controls: allow inbound "
         f"UDP {config.wireguard.listen_port}, TCP {config.npm.http_port} and "
@@ -895,7 +917,7 @@ def npm_diagnose() -> None:
             "\n[red]Neither credential set works.[/red] Open the admin UI to see which "
             "account NPM expects:\n"
             f"  ssh -L {config.npm.admin_port}:127.0.0.1:{config.npm.admin_port} "
-            f"root@{config.server.public_ip}\n"
+            f"{config.server.ssh_user}@{config.server.public_ip}\n"
             f"  then http://127.0.0.1:{config.npm.admin_port}\n"
             "Set the real password with `edgekit npm password`, or start NPM over with "
             "`edgekit npm reset`."

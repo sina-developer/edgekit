@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import socket
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -182,6 +183,8 @@ class Provisioner:
             self.config.server.public_ip = detected
         if not self.config.server.hostname:
             self.config.server.hostname = socket.gethostname()
+        # Under sudo, SUDO_USER is the real login account — the one that can actually ssh in.
+        self.config.server.ssh_user = os.environ.get("SUDO_USER") or "root"
 
         return (
             f"{info.get('PRETTY_NAME', 'Linux')}, public IP {self.config.server.public_ip}"
