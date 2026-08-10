@@ -5,16 +5,17 @@
 # Installs edgekit into an isolated virtualenv at /opt/edgekit and hands over to
 # `edgekit setup`, which interviews you and provisions this server.
 #
-# Usage, from a checkout on the server:
-#     sudo ./install.sh
+# Usage:
+#     curl -fsSL https://raw.githubusercontent.com/sina-developer/edgekit/master/install.sh | sudo bash
+#     sudo ./install.sh                          # from a local checkout
 #
 # Or unattended, driven entirely by environment variables:
-#     sudo EDGEKIT_PUBLIC_IP=1.2.3.4 EDGEKIT_CF_ZONE=example.com \
-#          EDGEKIT_CF_TOKEN=... ./install.sh --non-interactive
+#     sudo EDGEKIT_PUBLIC_IP=1.2.3.4 EDGEKIT_ZONE=example.com \
+#          ./install.sh --non-interactive
 #
 # Sources, in the order they are tried:
 #     EDGEKIT_SOURCE   local directory containing pyproject.toml (default: this script's dir)
-#     EDGEKIT_REPO     git URL to clone
+#     EDGEKIT_REPO     git URL to clone (default: sina-developer/edgekit)
 #     EDGEKIT_ARCHIVE  URL of a .tar.gz to download and unpack
 #
 set -Eeuo pipefail
@@ -22,7 +23,12 @@ set -Eeuo pipefail
 PREFIX="${EDGEKIT_PREFIX:-/opt/edgekit}"
 VENV="${PREFIX}/venv"
 BIN="${VENV}/bin/edgekit"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# BASH_SOURCE is unset when the script is piped via `curl | bash`.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ "${BASH_SOURCE[0]}" != "bash" ]; then
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+else
+    SCRIPT_DIR=""
+fi
 WORKDIR=""
 #: Used when this script is piped via curl (no local checkout).
 DEFAULT_REPO="${EDGEKIT_DEFAULT_REPO:-https://github.com/sina-developer/edgekit.git}"
@@ -127,7 +133,7 @@ resolve_source() {
         return
     fi
 
-    if [ -f "${SCRIPT_DIR}/pyproject.toml" ]; then
+    if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/pyproject.toml" ]; then
         SOURCE_DIR="${SCRIPT_DIR}"
         ok "checkout at ${SOURCE_DIR}"
         return
