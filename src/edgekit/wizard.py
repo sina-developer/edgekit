@@ -323,16 +323,17 @@ def _verify_cloudflare(config: Config, *, non_interactive: bool) -> None:
 
     from .services.cloudflare import CloudflareClient, CloudflareError
 
-    async def check() -> str:
+    async def check() -> tuple[str, list]:
         async with CloudflareClient(
             config.cloudflare.api_token, origin_ca_key=config.cloudflare.origin_ca_key
         ) as client:
             await client.verify_token()
-            return await client.get_zone_id(config.cloudflare.zone_name)
+            zone_id = await client.get_zone_id(config.cloudflare.zone_name)
+            return zone_id, await client.require_zone_permissions(zone_id)
 
     while True:
         try:
-            config.cloudflare.zone_id = asyncio.run(check())
+            config.cloudflare.zone_id, report = asyncio.run(check())
         except CloudflareError as exc:
             console.print(f"\n[red]{exc}[/red]\n")
             if non_interactive:
@@ -359,6 +360,17 @@ def _verify_cloudflare(config: Config, *, non_interactive: bool) -> None:
             f"  [green]✓[/green] token valid, zone {config.cloudflare.zone_name} "
             f"= {config.cloudflare.zone_id}"
         )
+        for capability in report:
+            if not capability.ok:
+                console.print(
+                    f"  [yellow]![/yellow] cannot manage {capability.label} "
+                    f"({capability.permission})"
+                )
+        if any(not c.ok for c in report) and not config.cloudflare.origin_ca_key:
+            console.print(
+                "    [dim]Origin certificates also work with the Origin CA Key "
+                "(My Profile -> API Tokens -> Origin CA Key).[/dim]"
+            )
         return
 
 

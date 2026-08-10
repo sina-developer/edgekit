@@ -644,13 +644,14 @@ def cloudflare_token(
 
     from .services.cloudflare import CloudflareClient, CloudflareError
 
-    async def verify() -> str:
+    async def verify() -> tuple[str, list]:
         async with CloudflareClient(token, origin_ca_key=config.cloudflare.origin_ca_key) as c:
             await c.verify_token()
-            return await c.get_zone_id(config.cloudflare.zone_name)
+            zone_id = await c.get_zone_id(config.cloudflare.zone_name)
+            return zone_id, await c.require_zone_permissions(zone_id)
 
     try:
-        config.cloudflare.zone_id = asyncio.run(verify())
+        config.cloudflare.zone_id, report = asyncio.run(verify())
     except CloudflareError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
@@ -658,9 +659,12 @@ def cloudflare_token(
     config.save()
     console.print(
         f"[green]✓[/green] token stored, zone {config.cloudflare.zone_name} "
-        f"= {config.cloudflare.zone_id}\n"
-        "  Run [bold]edgekit provision[/bold] to publish DNS and issue the certificate."
+        f"= {config.cloudflare.zone_id}"
     )
+    for capability in report:
+        marker = "[green]✓[/green]" if capability.ok else "[yellow]![/yellow]"
+        console.print(f"  {marker} {capability.label} ({capability.permission})")
+    console.print("  Run [bold]edgekit provision[/bold] to publish DNS and issue the certificate.")
 
 
 @cf_app.command("verify")
@@ -673,19 +677,27 @@ def cloudflare_verify() -> None:
 
     from .services.cloudflare import CloudflareClient, CloudflareError
 
-    async def verify() -> str:
+    async def verify() -> tuple[str, list]:
         async with CloudflareClient(
             config.cloudflare.api_token, origin_ca_key=config.cloudflare.origin_ca_key
         ) as c:
             await c.verify_token()
-            return await c.get_zone_id(config.cloudflare.zone_name)
+            zone_id = await c.get_zone_id(config.cloudflare.zone_name)
+            return zone_id, await c.check_zone_permissions(zone_id)
 
     try:
-        zone_id = asyncio.run(verify())
+        zone_id, report = asyncio.run(verify())
     except CloudflareError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
+
     console.print(f"[green]✓[/green] zone {config.cloudflare.zone_name} = {zone_id}")
+    for capability in report:
+        marker = "[green]✓[/green]" if capability.ok else "[red]✗[/red]"
+        suffix = "" if capability.required else " [dim](optional)[/dim]"
+        console.print(f"  {marker} {capability.label} ({capability.permission}){suffix}")
+    if any(c.required and not c.ok for c in report):
+        raise typer.Exit(1)
 
 
 # ---------------------------------------------------------------------- npm
@@ -727,6 +739,101 @@ def npm_password(
 
     config.save()
     console.print(f"[green]✓[/green] verified against NPM as {who}")
+
+
+@npm_app.command("diagnose")
+def npm_diagnose() -> None:
+    """Report what Nginx Proxy Manager is and which credentials it accepts."""
+    require_root()
+    config = require_configured()
+
+    from .services.npm import DEFAULT_EMAIL, DEFAULT_PASSWORD, NPMClient
+    from .system import dockerx
+
+    state = dockerx.container_state(config.npm.container_name)
+    console.print(f"Container: {state.get('status')} ({state.get('image', 'n/a')})")
+    console.print(f"API base:  {config.npm.api_base}")
+
+    async def probe() -> tuple[dict, tuple[int, str], tuple[int, str]]:
+        async with NPMClient(
+            config.npm.api_base, config.npm.admin_email, config.npm.admin_password
+        ) as client:
+            info = await client.server_info()
+            configured = await client.login_probe(
+                config.npm.admin_email, config.npm.admin_password
+            )
+            default = await client.login_probe(DEFAULT_EMAIL, DEFAULT_PASSWORD)
+            return info, configured, default
+
+    info, configured, default = asyncio.run(probe())
+    console.print(f"Version:   {info.get('version', info) or 'unknown'}")
+    console.print(
+        f"\nConfigured credentials ({config.npm.admin_email}): "
+        f"HTTP {configured[0]}\n  {configured[1]}"
+    )
+    console.print(
+        f"\nShipped defaults ({DEFAULT_EMAIL}): HTTP {default[0]}\n  {default[1]}"
+    )
+
+    if configured[0] == 200:
+        console.print("\n[green]edgekit's stored credentials work.[/green]")
+    elif default[0] == 200:
+        console.print(
+            "\n[yellow]NPM is still on its default credentials. "
+            "Run `edgekit provision` to rotate them.[/yellow]"
+        )
+    else:
+        console.print(
+            "\n[red]Neither credential set works.[/red] Open the admin UI to see which "
+            "account NPM expects:\n"
+            f"  ssh -L {config.npm.admin_port}:127.0.0.1:{config.npm.admin_port} "
+            f"root@{config.server.public_ip}\n"
+            f"  then http://127.0.0.1:{config.npm.admin_port}\n"
+            "Set the real password with `edgekit npm password`, or start NPM over with "
+            "`edgekit npm reset`."
+        )
+
+
+@npm_app.command("reset")
+def npm_reset(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Delete Nginx Proxy Manager's data and redeploy it from scratch.
+
+    Destroys every proxy host, certificate and account inside NPM. edgekit's own records
+    survive, so `edgekit provision` can repopulate afterwards.
+    """
+    require_root()
+    require_configured()
+
+    from .paths import NPM_DIR
+    from .system import dockerx
+
+    data_dirs = [NPM_DIR / "data", NPM_DIR / "letsencrypt"]
+    console.print("[bold red]This deletes Nginx Proxy Manager's entire state:[/bold red]")
+    for path in data_dirs:
+        console.print(f"  {path}{'' if path.exists() else '  [dim](absent)[/dim]'}")
+    console.print(
+        "\nedgekit's peers and host records are kept, and `edgekit provision` will "
+        "recreate the proxy hosts and certificate afterwards."
+    )
+    if not yes and not typer.confirm("Delete NPM's data and redeploy?"):
+        raise typer.Exit(1)
+
+    import shutil
+
+    dockerx.down()
+    for path in data_dirs:
+        if path.exists():
+            shutil.rmtree(path)
+            console.print(f"  removed {path}")
+    dockerx.up()
+
+    console.print(
+        "[green]✓[/green] Nginx Proxy Manager redeployed.\n"
+        "  Run [bold]edgekit provision[/bold] to secure the admin account and republish "
+        "your hosts."
+    )
 
 
 # ---------------------------------------------------------------------- users

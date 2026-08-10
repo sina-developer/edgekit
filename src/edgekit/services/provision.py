@@ -332,7 +332,13 @@ class Provisioner:
         async with CloudflareClient(cf.api_token, origin_ca_key=cf.origin_ca_key) as client:
             await client.verify_token()
             cf.zone_id = await client.get_zone_id(cf.zone_name)
-        return f"zone {cf.zone_name} = {cf.zone_id}"
+            # Fail here, with a precise list of missing permissions, rather than letting the
+            # DNS and SSL steps each fail separately with an opaque 403.
+            report = await client.require_zone_permissions(cf.zone_id)
+
+        optional = [c.permission for c in report if not c.required and not c.ok]
+        suffix = f"; cannot {', '.join(optional)}" if optional else ""
+        return f"zone {cf.zone_name} = {cf.zone_id}{suffix}"
 
     async def step_cloudflare_dns(self) -> str:
         cf = self.config.cloudflare

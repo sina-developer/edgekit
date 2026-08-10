@@ -147,6 +147,24 @@ class NPMClient:
             await asyncio.sleep(delay)
         raise NPMError(f"NPM API did not become ready in {int(attempts * delay)}s: {last}")
 
+    async def server_info(self) -> dict[str, Any]:
+        """The unauthenticated API root, which reports the running NPM version."""
+        try:
+            response = await self._client.get("/")
+            return response.json() if response.content else {}
+        except (httpx.HTTPError, ValueError):
+            return {}
+
+    async def login_probe(self, email: str, password: str) -> tuple[int, str]:
+        """Raw login attempt, returning ``(status_code, body)`` for diagnostics."""
+        try:
+            response = await self._client.post(
+                "/tokens", json={"identity": email, "secret": password}
+            )
+        except httpx.HTTPError as exc:
+            return 0, str(exc)
+        return response.status_code, response.text[:300]
+
     async def _try_login(self) -> bool:
         """Attempt a login, distinguishing 'wrong credentials' from 'not ready yet'."""
         try:
@@ -197,11 +215,22 @@ class NPMClient:
         probe = NPMClient(self.base_url, DEFAULT_EMAIL, DEFAULT_PASSWORD)
         try:
             if not await probe.wait_for_login(attempts=20, delay=3.0):
+                info = await self.server_info()
+                version = info.get("version") or info.get("status") or "unknown"
+                status, body = await probe.login_probe(DEFAULT_EMAIL, DEFAULT_PASSWORD)
                 raise NPMError(
                     "Nginx Proxy Manager rejected both the configured credentials and the "
-                    "shipped defaults. If its admin password was changed outside edgekit, "
-                    "set the matching password under Settings -> Nginx Proxy Manager (or in "
-                    "/etc/edgekit/config.yaml) and re-run `edgekit provision`."
+                    f"shipped defaults ({DEFAULT_EMAIL}).\n"
+                    f"  NPM version: {version}\n"
+                    f"  Default-credential login returned HTTP {status}: {body}\n"
+                    "Most likely its admin password was already changed — by a previous "
+                    "run, by hand, or by this image's first-run setup.\n"
+                    "Open the admin UI over an SSH tunnel to see which account it wants:\n"
+                    "  ssh -L 8181:127.0.0.1:8181 <user>@<server>   then http://127.0.0.1:8181\n"
+                    "Then tell edgekit the real password with `edgekit npm password`, and "
+                    "re-run `edgekit provision`.\n"
+                    "To start NPM over from scratch instead (destroys its config): "
+                    "`edgekit npm reset`."
                 )
 
             await probe._request(

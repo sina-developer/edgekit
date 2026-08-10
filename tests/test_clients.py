@@ -171,6 +171,28 @@ class TestBootstrapAdmin:
         respx.post(f"{NPM_BASE}/tokens").mock(
             return_value=httpx.Response(400, json={"error": {"message": "Invalid"}})
         )
+        respx.get(f"{NPM_BASE}/").mock(
+            return_value=httpx.Response(200, json={"status": "OK", "version": "2.13.1"})
+        )
+
+        async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
+            with pytest.raises(NPMError) as caught:
+                await client.bootstrap_admin("me@example.com", "new-password")
+
+        message = str(caught.value)
+        assert "rejected both" in message
+        # The message must carry enough to diagnose without a second round trip.
+        assert "2.13.1" in message
+        assert "HTTP 400" in message
+        assert "edgekit npm password" in message
+
+    @respx.mock
+    async def test_diagnostics_survive_an_unreachable_api_root(self):
+        """Gathering diagnostics must not mask the original failure."""
+        respx.post(f"{NPM_BASE}/tokens").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid"}})
+        )
+        respx.get(f"{NPM_BASE}/").mock(side_effect=httpx.ConnectError("refused"))
 
         async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
             with pytest.raises(NPMError, match="rejected both"):
@@ -414,6 +436,77 @@ async def test_origin_certificate_error_names_the_account_token_limitation():
     async with CloudflareClient("account-token") as client:
         with pytest.raises(CloudflareError, match="Origin CA Key"):
             await client.create_origin_certificate(["example.com"])
+
+
+class TestZonePermissions:
+    """A token that can list zones may still be unable to touch DNS or zone settings."""
+
+    @staticmethod
+    def _mock(dns: int = 200, ssl: int = 200, certs: int = 200) -> None:
+        def responder(code: int):
+            if code == 200:
+                return httpx.Response(200, json=cf_ok([]))
+            return httpx.Response(
+                code, json={"success": False, "errors": [{"code": 9109, "message": "Unauthorized"}]}
+            )
+
+        respx.get(f"{CF_BASE}/zones/z1/dns_records").mock(return_value=responder(dns))
+        respx.get(f"{CF_BASE}/zones/z1/settings/ssl").mock(return_value=responder(ssl))
+        respx.get(f"{CF_BASE}/certificates").mock(return_value=responder(certs))
+
+    @respx.mock
+    async def test_a_fully_scoped_token_passes(self):
+        self._mock()
+
+        async with CloudflareClient("token") as client:
+            report = await client.require_zone_permissions("z1")
+
+        assert all(c.ok for c in report)
+
+    @respx.mock
+    async def test_missing_dns_permission_is_named(self):
+        self._mock(dns=403)
+
+        async with CloudflareClient("token") as client:
+            with pytest.raises(CloudflareError) as caught:
+                await client.require_zone_permissions("z1")
+
+        message = str(caught.value)
+        assert "DNS records" in message
+        assert "DNS:Edit" in message
+        assert "Zone:Read alone is not enough" in message
+
+    @respx.mock
+    async def test_missing_zone_settings_permission_is_named(self):
+        self._mock(ssl=403)
+
+        async with CloudflareClient("token") as client:
+            with pytest.raises(CloudflareError, match="Zone Settings:Edit"):
+                await client.require_zone_permissions("z1")
+
+    @respx.mock
+    async def test_every_missing_required_permission_is_listed_at_once(self):
+        self._mock(dns=403, ssl=403)
+
+        async with CloudflareClient("token") as client:
+            with pytest.raises(CloudflareError) as caught:
+                await client.require_zone_permissions("z1")
+
+        message = str(caught.value)
+        assert "DNS:Edit" in message
+        assert "Zone Settings:Edit" in message
+
+    @respx.mock
+    async def test_origin_certificates_are_optional(self):
+        """An account-owned token cannot issue certs, but is otherwise perfectly usable."""
+        self._mock(certs=403)
+
+        async with CloudflareClient("token") as client:
+            report = await client.require_zone_permissions("z1")
+
+        certs = next(c for c in report if c.label == "Origin certificates")
+        assert certs.ok is False
+        assert certs.required is False
 
 
 @respx.mock

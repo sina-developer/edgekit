@@ -40,6 +40,17 @@ class CloudflareError(RuntimeError):
 
 
 @dataclass(slots=True)
+class Capability:
+    """One permission edgekit needs, and whether this token actually has it."""
+
+    label: str
+    permission: str
+    ok: bool
+    required: bool = True
+    detail: str = ""
+
+
+@dataclass(slots=True)
 class OriginCertificate:
     certificate_pem: str
     private_key_pem: str
@@ -172,6 +183,47 @@ class CloudflareClient:
                 "token is not a user token (account-owned); verified by listing zones instead"
             )
             return {"status": "active", "scope": "account"}
+
+    async def check_zone_permissions(self, zone_id: str) -> list[Capability]:
+        """Exercise each permission edgekit needs, against this specific zone.
+
+        Listing zones only proves Zone:Read. A token can pass that and still be unable to
+        touch DNS records or zone settings, which then fails much later during provisioning
+        with an opaque 403. Probing each capability up front turns that into a precise list
+        of what to tick in the Cloudflare UI.
+        """
+        probes = (
+            ("DNS records", "DNS:Edit", f"/zones/{zone_id}/dns_records", {"per_page": 1}, True),
+            ("SSL/TLS mode", "Zone Settings:Edit", f"/zones/{zone_id}/settings/ssl", None, True),
+            ("Origin certificates", "SSL and Certificates:Edit", "/certificates",
+             {"zone_id": zone_id}, False),
+        )
+
+        results: list[Capability] = []
+        for label, permission, path, params, required in probes:
+            try:
+                await self._request("GET", path, params=params or {})
+            except CloudflareError as exc:
+                results.append(Capability(label, permission, False, required, str(exc)))
+            else:
+                results.append(Capability(label, permission, True, required))
+        return results
+
+    async def require_zone_permissions(self, zone_id: str) -> list[Capability]:
+        """Raise unless every *required* capability is available. Returns the full report."""
+        report = await self.check_zone_permissions(zone_id)
+        missing = [c for c in report if c.required and not c.ok]
+        if missing:
+            lines = "\n".join(f"  - {c.label} — needs {c.permission}" for c in missing)
+            raise CloudflareError(
+                "This Cloudflare token can see the zone but lacks the permissions edgekit "
+                f"needs:\n{lines}\n"
+                "Edit the token in the Cloudflare dashboard (the same page you created it "
+                "on) and add those permissions, with Zone Resources set to include this "
+                "zone. Zone:Read alone is not enough.\n"
+                "Then re-run `edgekit cloudflare token --zone <zone>` or `edgekit provision`."
+            )
+        return report
 
     async def list_zones(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/zones", params={"per_page": 50}) or []
