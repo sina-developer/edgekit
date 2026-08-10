@@ -24,6 +24,8 @@ VENV="${PREFIX}/venv"
 BIN="${VENV}/bin/edgekit"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKDIR=""
+#: Used when this script is piped via curl (no local checkout).
+DEFAULT_REPO="${EDGEKIT_DEFAULT_REPO:-https://github.com/sina-developer/edgekit.git}"
 
 # ------------------------------------------------------------------ output helpers
 
@@ -132,16 +134,9 @@ resolve_source() {
     fi
 
     WORKDIR="$(mktemp -d)"
-    if [ -n "${EDGEKIT_REPO:-}" ]; then
-        info "cloning ${EDGEKIT_REPO}"
-        git clone --depth 1 "${EDGEKIT_REPO}" "${WORKDIR}/src" >/dev/null 2>&1 \
-            || die "Could not clone ${EDGEKIT_REPO}"
-        SOURCE_DIR="${WORKDIR}/src"
-        ok "cloned"
-        return
-    fi
 
-    if [ -n "${EDGEKIT_ARCHIVE:-}" ]; then
+    # Archive wins only when explicitly requested without EDGEKIT_REPO.
+    if [ -n "${EDGEKIT_ARCHIVE:-}" ] && [ -z "${EDGEKIT_REPO:-}" ]; then
         info "downloading ${EDGEKIT_ARCHIVE}"
         curl -fsSL "${EDGEKIT_ARCHIVE}" -o "${WORKDIR}/edgekit.tar.gz" \
             || die "Could not download ${EDGEKIT_ARCHIVE}"
@@ -153,7 +148,17 @@ resolve_source() {
         return
     fi
 
-    die "No source found. Run this script from the edgekit checkout, or set EDGEKIT_SOURCE, EDGEKIT_REPO or EDGEKIT_ARCHIVE."
+    # curl | bash lands here: no local checkout, so clone the default (or EDGEKIT_REPO).
+    local repo="${EDGEKIT_REPO:-$DEFAULT_REPO}"
+    info "cloning ${repo}"
+    if ! command -v git >/dev/null 2>&1; then
+        info "installing git"
+        apt-get install -y -qq --no-install-recommends git
+    fi
+    git clone --depth 1 "${repo}" "${WORKDIR}/src" >/dev/null 2>&1 \
+        || die "Could not clone ${repo}"
+    SOURCE_DIR="${WORKDIR}/src"
+    ok "cloned"
 }
 
 # ------------------------------------------------------------------ install

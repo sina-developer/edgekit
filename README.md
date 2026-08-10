@@ -21,7 +21,13 @@ Internet → Cloudflare (Full strict) → this server ─┬─ Nginx Proxy Mana
 
 ## Install
 
-On the server, as root:
+On a fresh Ubuntu/Debian server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sina-developer/edgekit/master/install.sh | sudo bash
+```
+
+Or from a local checkout:
 
 ```bash
 sudo ./install.sh
@@ -63,7 +69,7 @@ sudo EDGEKIT_PUBLIC_IP=52.56.216.78 \
 | `EDGEKIT_CERT_PATH` / `EDGEKIT_KEY_PATH` | Origin certificate and key to install |
 | `EDGEKIT_PANEL_USER` / `EDGEKIT_PANEL_PASSWORD` / `EDGEKIT_PANEL_PORT` | Panel account |
 
-Installing from somewhere other than a local checkout:
+Override the source if needed:
 
 ```bash
 sudo EDGEKIT_REPO=https://github.com/you/edgekit.git ./install.sh
