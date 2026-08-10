@@ -166,11 +166,88 @@ class TestBootstrapAdmin:
         assert client.password == "new-password"
 
     @respx.mock
+    async def test_a_fresh_npm_with_no_seeded_user_gets_one_created(self):
+        """NPM >= 2.13 ships with an empty user table; the first admin must be created."""
+        created = {"done": False}
+
+        def tokens(request: httpx.Request) -> httpx.Response:
+            body = request.read().decode()
+            if "me@example.com" in body and created["done"]:
+                return httpx.Response(200, json={"token": "new-token"})
+            return httpx.Response(400, json={"error": {"message": "Invalid"}})
+
+        def create_user(request: httpx.Request) -> httpx.Response:
+            created["done"] = True
+            return httpx.Response(201, json={"id": 1, "email": "me@example.com"})
+
+        respx.post(f"{NPM_BASE}/tokens").mock(side_effect=tokens)
+        users = respx.post(f"{NPM_BASE}/users").mock(side_effect=create_user)
+
+        async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
+            assert await client.bootstrap_admin("me@example.com", "new-password") is True
+
+        payload = json.loads(users.calls[0].request.read())
+        assert payload["email"] == "me@example.com"
+        assert payload["roles"] == ["admin"]
+        assert payload["auth"] == {"type": "password", "secret": "new-password"}
+
+    @respx.mock
+    async def test_a_build_ignoring_the_nested_auth_gets_the_password_set_explicitly(self):
+        state = {"user": False, "auth": False}
+
+        def tokens(request: httpx.Request) -> httpx.Response:
+            if state["auth"]:
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(400, json={"error": {"message": "Invalid"}})
+
+        def set_auth(request: httpx.Request) -> httpx.Response:
+            state["auth"] = True
+            return httpx.Response(200, json={})
+
+        respx.post(f"{NPM_BASE}/tokens").mock(side_effect=tokens)
+        respx.post(f"{NPM_BASE}/users").mock(
+            return_value=httpx.Response(201, json={"id": 7})
+        )
+        auth = respx.put(f"{NPM_BASE}/users/7/auth").mock(side_effect=set_auth)
+
+        async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
+            assert await client.bootstrap_admin("me@example.com", "new-password") is True
+
+        assert auth.called
+
+    @respx.mock
+    async def test_user_creation_is_not_attempted_when_defaults_still_work(self):
+        """Legacy rotation must take priority; creating a second admin would be wrong."""
+        # The configured credentials must fail first, or this is just the re-run case.
+        calls = {"n": 0}
+
+        def gated(request: httpx.Request) -> httpx.Response:
+            body = request.read().decode()
+            if "changeme" in body:
+                return httpx.Response(200, json={"token": "default"})
+            calls["n"] += 1
+            if calls["n"] > 3:
+                return httpx.Response(200, json={"token": "new"})
+            return httpx.Response(400, json={"error": {"message": "Invalid"}})
+
+        respx.post(f"{NPM_BASE}/tokens").mock(side_effect=gated)
+        respx.put(f"{NPM_BASE}/users/me").mock(return_value=httpx.Response(200, json={}))
+        respx.put(f"{NPM_BASE}/users/me/auth").mock(return_value=httpx.Response(200, json={}))
+        users = respx.post(f"{NPM_BASE}/users")
+
+        async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
+            assert await client.bootstrap_admin("me@example.com", "new-password") is True
+
+        assert not users.called, "must rotate the existing admin, not create a second one"
+
+    @respx.mock
     async def test_neither_credential_set_working_raises_rather_than_lying(self):
         """The old code returned False here, silently leaving NPM on admin/changeme."""
         respx.post(f"{NPM_BASE}/tokens").mock(
             return_value=httpx.Response(400, json={"error": {"message": "Invalid"}})
         )
+        # An already-initialised NPM refuses unauthenticated user creation.
+        respx.post(f"{NPM_BASE}/users").mock(return_value=httpx.Response(403))
         respx.get(f"{NPM_BASE}/").mock(
             return_value=httpx.Response(200, json={"status": "OK", "version": "2.13.1"})
         )
@@ -180,7 +257,7 @@ class TestBootstrapAdmin:
                 await client.bootstrap_admin("me@example.com", "new-password")
 
         message = str(caught.value)
-        assert "rejected both" in message
+        assert "Could not establish an admin account" in message
         # The message must carry enough to diagnose without a second round trip.
         assert "2.13.1" in message
         assert "HTTP 400" in message
@@ -192,10 +269,11 @@ class TestBootstrapAdmin:
         respx.post(f"{NPM_BASE}/tokens").mock(
             return_value=httpx.Response(400, json={"error": {"message": "Invalid"}})
         )
+        respx.post(f"{NPM_BASE}/users").mock(return_value=httpx.Response(403))
         respx.get(f"{NPM_BASE}/").mock(side_effect=httpx.ConnectError("refused"))
 
         async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
-            with pytest.raises(NPMError, match="rejected both"):
+            with pytest.raises(NPMError, match="Could not establish an admin account"):
                 await client.bootstrap_admin("me@example.com", "new-password")
 
     @respx.mock

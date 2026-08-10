@@ -141,7 +141,7 @@ class Provisioner:
             ("cloudflare_zone", "Verify Cloudflare zone", self.step_cloudflare_zone),
             ("cloudflare_dns", "Publish DNS records", self.step_cloudflare_dns),
             ("cloudflare_ssl", "Set SSL mode to Full (strict)", self.step_cloudflare_ssl),
-            ("origin_cert", "Issue and install origin certificate", self.step_origin_certificate),
+            ("origin_cert", "Install origin certificate", self.step_origin_certificate),
             ("persist", "Save configuration", self.step_persist),
         ]
 

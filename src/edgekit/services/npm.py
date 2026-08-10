@@ -190,14 +190,72 @@ class NPMClient:
                 await asyncio.sleep(delay)
         return False
 
+    async def create_initial_user(
+        self, email: str, password: str, name: str = "edgekit"
+    ) -> bool:
+        """Create the first admin account on an NPM that shipped without one.
+
+        Versions from 2.13 onwards no longer seed admin@example.com/changeme; a fresh
+        install has an empty user table and expects the first account to be created through
+        the setup flow. NPM permits that creation unauthenticated *only* while no user
+        exists, so this is safe to attempt: on an already-initialised instance it is refused
+        and we fall through to reporting the real problem.
+        """
+        payload = {
+            "name": name,
+            "nickname": name,
+            "email": email,
+            "roles": ["admin"],
+            "is_disabled": False,
+            "auth": {"type": "password", "secret": password},
+        }
+        try:
+            response = await self._client.post("/users", json=payload)
+        except httpx.HTTPError as exc:
+            log.debug("initial user creation failed at the transport level: %s", exc)
+            return False
+
+        if response.status_code >= 400:
+            log.debug(
+                "NPM refused unauthenticated user creation (%s): %s",
+                response.status_code,
+                response.text[:200],
+            )
+            return False
+
+        log.info("created the initial NPM admin account %s", email)
+        self.email, self.password, self._token = email, password, None
+        if await self.wait_for_login(attempts=5, delay=2.0):
+            return True
+
+        # Some builds create the account but ignore the nested auth block; set it explicitly.
+        try:
+            user_id = response.json().get("id")
+        except ValueError:
+            user_id = None
+        if user_id:
+            try:
+                await self._client.put(
+                    f"/users/{user_id}/auth", json={"type": "password", "secret": password}
+                )
+            except httpx.HTTPError:
+                return False
+            self._token = None
+            return await self.wait_for_login(attempts=5, delay=2.0)
+        return False
+
     async def bootstrap_admin(
         self, new_email: str, new_password: str, name: str = "edgekit"
     ) -> bool:
-        """Ensure the admin account uses our credentials, not the shipped defaults (§11).
+        """Ensure the admin account exists and uses our credentials (guide §11).
 
-        Returns True if the defaults were rotated, False if the account was already secured.
-        Raises if neither credential set works, because the alternative — returning quietly —
-        would leave a publicly reachable proxy manager on admin@example.com/changeme.
+        Handles all three states an NPM instance can be in:
+          1. already using our credentials (a re-run) — nothing to do;
+          2. still on the shipped defaults (NPM < 2.13) — rotate them;
+          3. freshly installed with no user at all (NPM >= 2.13) — create the first admin.
+
+        Raises if none apply, because returning quietly could leave a reachable proxy
+        manager on default or unknown credentials.
         """
         if (new_email, new_password) == (DEFAULT_EMAIL, DEFAULT_PASSWORD):
             raise NPMError(
@@ -205,61 +263,58 @@ class NPMClient:
                 "Choose a different admin password."
             )
 
-        # Already bootstrapped? This is the common case on a re-run.
+        # 1. Already bootstrapped? The common case on a re-run.
         if await self.wait_for_login(attempts=3, delay=2.0):
             log.info("NPM already accepts the configured credentials")
             return False
 
-        # Otherwise the defaults should still be in place — but on a cold start they may not
-        # be seeded yet, so give the migrations time rather than concluding after one try.
+        # 2. Legacy images seed admin@example.com/changeme, sometimes a few seconds after
+        #    the API starts answering.
         probe = NPMClient(self.base_url, DEFAULT_EMAIL, DEFAULT_PASSWORD)
         try:
-            if not await probe.wait_for_login(attempts=20, delay=3.0):
-                info = await self.server_info()
-                version = info.get("version") or info.get("status") or "unknown"
-                status, body = await probe.login_probe(DEFAULT_EMAIL, DEFAULT_PASSWORD)
-                raise NPMError(
-                    "Nginx Proxy Manager rejected both the configured credentials and the "
-                    f"shipped defaults ({DEFAULT_EMAIL}).\n"
-                    f"  NPM version: {version}\n"
-                    f"  Default-credential login returned HTTP {status}: {body}\n"
-                    "Most likely its admin password was already changed — by a previous "
-                    "run, by hand, or by this image's first-run setup.\n"
-                    "Open the admin UI over an SSH tunnel to see which account it wants:\n"
-                    "  ssh -L 8181:127.0.0.1:8181 <user>@<server>   then http://127.0.0.1:8181\n"
-                    "Then tell edgekit the real password with `edgekit npm password`, and "
-                    "re-run `edgekit provision`.\n"
-                    "To start NPM over from scratch instead (destroys its config): "
-                    "`edgekit npm reset`."
+            if await probe.wait_for_login(attempts=6, delay=2.0):
+                await probe._request(
+                    "PUT",
+                    "/users/me",
+                    json={"name": name, "nickname": name, "email": new_email},
                 )
-
-            await probe._request(
-                "PUT",
-                "/users/me",
-                json={"name": name, "nickname": name, "email": new_email},
-            )
-            await probe._request(
-                "PUT",
-                "/users/me/auth",
-                json={
-                    "type": "password",
-                    "current": DEFAULT_PASSWORD,
-                    "secret": new_password,
-                },
-            )
+                await probe._request(
+                    "PUT",
+                    "/users/me/auth",
+                    json={
+                        "type": "password",
+                        "current": DEFAULT_PASSWORD,
+                        "secret": new_password,
+                    },
+                )
+                self.email, self.password, self._token = new_email, new_password, None
+                if not await self.wait_for_login(attempts=5, delay=2.0):
+                    raise NPMError(
+                        "Rotated the NPM admin credentials, but the new ones were then "
+                        "rejected. Check `docker logs nginx-proxy-manager --tail 100`."
+                    )
+                log.info("NPM admin credentials rotated to %s", new_email)
+                return True
         finally:
             await probe.aclose()
 
-        # Force the next call on this client to authenticate with the new credentials.
-        self.email, self.password, self._token = new_email, new_password, None
-        if not await self.wait_for_login(attempts=5, delay=2.0):
-            raise NPMError(
-                "Rotated the NPM admin credentials, but the new ones were then rejected. "
-                "Check `docker logs nginx-proxy-manager --tail 100`."
-            )
+        # 3. No default account: this build expects the first admin to be created.
+        if await self.create_initial_user(new_email, new_password, name):
+            return True
 
-        log.info("NPM admin credentials rotated to %s", new_email)
-        return True
+        info = await self.server_info()
+        version = info.get("version") or info.get("status") or "unknown"
+        status, body = await self.login_probe(new_email, new_password)
+        raise NPMError(
+            "Could not establish an admin account in Nginx Proxy Manager.\n"
+            f"  NPM version: {version}\n"
+            f"  Login as {new_email} returned HTTP {status}: {body}\n"
+            "An account already exists with a password edgekit does not know.\n"
+            "Either tell edgekit the real password:\n"
+            "  edgekit npm password\n"
+            "or wipe NPM and start clean (destroys its config, keeps edgekit's records):\n"
+            "  edgekit npm reset && edgekit provision"
+        )
 
     async def me(self) -> dict[str, Any]:
         return await self._request("GET", "/users/me")

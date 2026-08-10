@@ -233,7 +233,9 @@ def _print_setup_summary(config: Config, result, ok: bool) -> None:
 
     outstanding = []
     zone = config.cloudflare.zone_name
-    if zone:
+    # Only list what edgekit did not already do: with the API enabled these steps ran.
+    api_handled_dns = config.cloudflare.enabled and config.cloudflare.zone_id
+    if zone and not api_handled_dns:
         outstanding.append(
             f"DNS: A records for [bold]{zone}[/bold] and [bold]*.{zone}[/bold] -> "
             f"{config.server.public_ip}, proxied"
