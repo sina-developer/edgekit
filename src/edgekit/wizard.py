@@ -11,6 +11,8 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from .config import Config
+from .paths import ORIGIN_CERT_FILE, ORIGIN_KEY_FILE
 from .security import generate_password
 from .services.provision import detect_public_ip
 
@@ -314,12 +317,9 @@ Each is one-time — new subdomains later need nothing but a proxy host in edgek
      {zone}
 
    Cloudflare then shows two boxes, [bold]Origin Certificate[/bold] and [bold]Private Key[/bold].
-   The private key is shown once only. Save both onto this server, for example:
-
-     nano /root/origin.pem   # paste the Origin Certificate
-     nano /root/origin.key   # paste the Private Key
-
-   Then give the paths below. One certificate serves every subdomain, for 15 years.""",
+   The private key is shown once only. Setup will ask you to paste both next; they are
+   saved to {ORIGIN_CERT_FILE} and {ORIGIN_KEY_FILE}. One certificate serves every
+   subdomain, for 15 years.""",
             title="Cloudflare setup",
             border_style="blue",
         )
@@ -335,8 +335,44 @@ def _read_pem(path_text: str) -> str:
     return path.read_text().strip() + "\n"
 
 
+def _prompt_pem_paste(label: str) -> str:
+    """Read a PEM block from stdin until an END line (or EOF)."""
+    console.print(
+        f"  Paste the {label} (including the BEGIN/END lines), then press Enter:"
+    )
+    lines: list[str] = []
+    while True:
+        line = sys.stdin.readline()
+        if line == "":
+            break
+        stripped = line.rstrip("\r\n")
+        if not lines and not stripped.strip():
+            continue
+        lines.append(stripped)
+        if stripped.strip().startswith("-----END "):
+            break
+    if not lines:
+        raise ValueError(f"No {label} was pasted.")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _write_origin_files(certificate: str, key: str) -> None:
+    """Persist the pasted pair to the canonical paths for later inspection/reinstall."""
+    ORIGIN_CERT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ORIGIN_CERT_FILE.write_text(certificate)
+    ORIGIN_CERT_FILE.chmod(0o644)
+
+    fd = os.open(
+        ORIGIN_KEY_FILE,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    with os.fdopen(fd, "w") as fh:
+        fh.write(key)
+
+
 def _collect_certificate(config: Config, *, non_interactive: bool) -> None:
-    """Load the origin certificate from files, validating it before accepting."""
+    """Collect the origin certificate (paste or env paths), validate, and save it."""
     from .services.certificates import (
         CertificateError,
         certificate_name,
@@ -366,16 +402,16 @@ def _collect_certificate(config: Config, *, non_interactive: bool) -> None:
 
     while True:
         try:
-            certificate = _read_pem(
-                cert_path or Prompt.ask("  Path to the origin certificate",
-                                        default="/root/origin.pem")
-            )
-            key = _read_pem(
-                key_path or Prompt.ask("  Path to the private key", default="/root/origin.key")
-            )
+            if cert_path and key_path:
+                certificate = _read_pem(cert_path)
+                key = _read_pem(key_path)
+            else:
+                certificate = _prompt_pem_paste("Origin Certificate")
+                console.print()
+                key = _prompt_pem_paste("Private Key")
             validate_key_matches(certificate, key)
             info = inspect_certificate(certificate)
-        except (OSError, CertificateError) as exc:
+        except (OSError, CertificateError, ValueError) as exc:
             console.print(f"  [red]{exc}[/red]")
             if non_interactive:
                 return
@@ -393,6 +429,20 @@ def _collect_certificate(config: Config, *, non_interactive: bool) -> None:
                 return
             continue
 
+        saved = False
+        try:
+            _write_origin_files(certificate, key)
+            saved = True
+        except OSError as exc:
+            console.print(f"  [red]Could not save certificate files: {exc}[/red]")
+            if non_interactive:
+                return
+            if not Confirm.ask("  Continue without saving the files?", default=False):
+                cert_path = key_path = ""
+                if not Confirm.ask("  Try again?", default=True):
+                    return
+                continue
+
         config.tls.certificate = certificate
         config.tls.certificate_key = key
         config.tls.name = certificate_name(config.cloudflare.zone_name)
@@ -401,6 +451,10 @@ def _collect_certificate(config: Config, *, non_interactive: bool) -> None:
             f"  [green]✓[/green] certificate for {', '.join(info.hostnames)}, "
             f"valid until {info.not_after.date()} ({info.days_remaining} days)"
         )
+        if saved:
+            console.print(
+                f"  [dim]Saved to {ORIGIN_CERT_FILE} and {ORIGIN_KEY_FILE}[/dim]"
+            )
         if config.cloudflare.zone_name and not info.covers(f"test.{config.cloudflare.zone_name}"):
             console.print(
                 f"  [yellow]! It does not appear to cover *.{config.cloudflare.zone_name} — "

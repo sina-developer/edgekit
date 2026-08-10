@@ -89,8 +89,8 @@ Flexible leaves the Cloudflare-to-server hop unencrypted.
 
 **3. Origin certificate** (SSL/TLS → Origin Server → Create Certificate) — accept the
 defaults, set the hostnames to `*.yourdomain` and `yourdomain`. Cloudflare shows an **Origin
-Certificate** and a **Private Key**; the key is shown once only. Save both to the server and
-point setup at them, or install them later:
+Certificate** and a **Private Key**; the key is shown once only. Interactive setup asks you
+to paste both and writes them to `/root/origin.pem` and `/root/origin.key`. Or install later:
 
 ```bash
 sudo edgekit cert install --cert /root/origin.pem --key /root/origin.key
