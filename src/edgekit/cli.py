@@ -175,8 +175,9 @@ def setup(
 
 def _run_provisioner(config: Config, **flags) -> object:
     def on_event(step) -> None:
+        # Newline (not \r) so package/apt sub-logs under a long step stay readable.
         if step.status is StepStatus.RUNNING:
-            console.print(f"  [dim]…[/dim] {step.title}", end="\r")
+            console.print(f"  [dim]…[/dim] {step.title}")
         elif step.status is StepStatus.DONE:
             console.print(f"  [green]✓[/green] {step.title}"
                           + (f" [dim]— {step.detail}[/dim]" if step.detail else ""))

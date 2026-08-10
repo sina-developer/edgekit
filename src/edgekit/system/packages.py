@@ -66,21 +66,28 @@ def apt_update(max_age_seconds: int = 3600) -> None:
         if candidate.exists():
             newest = max(newest, candidate.stat().st_mtime)
     if newest and (time.time() - newest) < max_age_seconds:
-        log.debug("apt index is fresh; skipping update")
+        log.info("apt: package index is fresh — skipping update")
         return
+    log.info("apt: refreshing package index")
     run(["apt-get", "update", "-qq"], check=True, timeout=600)
+    log.info("apt: package index updated")
 
 
 def apt_install(packages: tuple[str, ...]) -> None:
     missing = [p for p in packages if not _installed(p)]
     if not missing:
-        log.debug("already installed: %s", ", ".join(packages))
+        log.info("apt: already installed — %s", ", ".join(packages))
         return
+    present = [p for p in packages if p not in missing]
+    if present:
+        log.info("apt: already installed — %s", ", ".join(present))
+    log.info("apt: installing — %s", ", ".join(missing))
     run(
         ["apt-get", "install", "-y", "-qq", "--no-install-recommends", *missing],
         check=True,
         timeout=900,
     )
+    log.info("apt: installed — %s", ", ".join(missing))
 
 
 def _installed(package: str) -> bool:
@@ -89,18 +96,24 @@ def _installed(package: str) -> bool:
 
 
 def install_base() -> None:
+    log.info("packages: base tools")
     require_debian_like()
     apt_update()
     apt_install(BASE_PACKAGES)
+    log.info("packages: base tools ready")
 
 
 def install_wireguard() -> None:
     """Guide §2."""
+    log.info("packages: WireGuard")
     if has("wg") and has("wg-quick"):
-        log.info("WireGuard already present")
+        version = wireguard_version() or "present"
+        log.info("packages: WireGuard already present (%s)", version)
         return
     apt_update()
     apt_install(WIREGUARD_PACKAGES)
+    version = wireguard_version() or "installed"
+    log.info("packages: WireGuard ready (%s)", version)
 
 
 def wireguard_version() -> str | None:
@@ -110,8 +123,14 @@ def wireguard_version() -> str | None:
 
 def install_docker() -> None:
     """Guide §8, using Docker's official APT repository."""
+    log.info("packages: Docker Engine + Compose")
     if has("docker") and run(["docker", "compose", "version"]).ok:
-        log.info("Docker with Compose v2 already present")
+        engine, compose = docker_versions()
+        log.info(
+            "packages: Docker already present (%s / %s)",
+            engine or "docker",
+            compose or "compose",
+        )
         return
 
     info = require_debian_like()
@@ -128,6 +147,7 @@ def install_docker() -> None:
     install_base()
     DOCKER_GPG.parent.mkdir(parents=True, exist_ok=True)
     if not DOCKER_GPG.exists():
+        log.info("docker: downloading APT signing key (%s)", distro)
         result = run(
             ["curl", "-fsSL", f"https://download.docker.com/linux/{distro}/gpg"],
             check=True,
@@ -135,6 +155,9 @@ def install_docker() -> None:
         )
         DOCKER_GPG.write_text(result.stdout)
         DOCKER_GPG.chmod(0o644)
+        log.info("docker: signing key saved to %s", DOCKER_GPG)
+    else:
+        log.info("docker: signing key already present")
 
     arch = run(["dpkg", "--print-architecture"], check=True).stdout.strip()
     entry = (
@@ -142,11 +165,22 @@ def install_docker() -> None:
         f"https://download.docker.com/linux/{distro} {codename} stable\n"
     )
     if not DOCKER_LIST.exists() or DOCKER_LIST.read_text() != entry:
+        log.info("docker: configuring APT repository (%s %s %s)", distro, codename, arch)
         DOCKER_LIST.write_text(entry)
+    else:
+        log.info("docker: APT repository already configured")
 
+    log.info("docker: refreshing package index for Docker repo")
     run(["apt-get", "update", "-qq"], check=True, timeout=600)
     apt_install(DOCKER_PACKAGES)
+    log.info("docker: enabling and starting docker.service")
     run(["systemctl", "enable", "--now", "docker"], check=True)
+    engine, compose = docker_versions()
+    log.info(
+        "packages: Docker ready (%s / %s)",
+        engine or "docker",
+        compose or "compose",
+    )
 
 
 def docker_versions() -> tuple[str | None, str | None]:

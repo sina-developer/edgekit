@@ -101,17 +101,20 @@ install_dependencies() {
     step "Installing system dependencies"
     export DEBIAN_FRONTEND=noninteractive
 
-    info "refreshing package index"
+    info "[1/3] refreshing package index"
     apt-get update -qq
+    ok "package index updated"
 
     local packages=(python3 python3-venv python3-pip ca-certificates curl gnupg iproute2 iptables)
     if [ -n "${EDGEKIT_REPO:-}" ]; then
         packages+=(git)
     fi
 
-    info "installing: ${packages[*]}"
-    apt-get install -y -qq --no-install-recommends "${packages[@]}"
+    info "[2/3] installing packages: ${packages[*]}"
+    apt-get install -y --no-install-recommends "${packages[@]}"
+    ok "system packages installed"
 
+    info "[3/3] verifying Python"
     local python_version
     python_version="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
     case "$python_version" in
@@ -156,12 +159,13 @@ resolve_source() {
 
     # curl | bash lands here: no local checkout, so clone the default (or EDGEKIT_REPO).
     local repo="${EDGEKIT_REPO:-$DEFAULT_REPO}"
-    info "cloning ${repo}"
     if ! command -v git >/dev/null 2>&1; then
         info "installing git"
-        apt-get install -y -qq --no-install-recommends git
+        apt-get install -y --no-install-recommends git
+        ok "git installed"
     fi
-    git clone --depth 1 "${repo}" "${WORKDIR}/src" >/dev/null 2>&1 \
+    info "cloning ${repo}"
+    git clone --depth 1 "${repo}" "${WORKDIR}/src" \
         || die "Could not clone ${repo}"
     SOURCE_DIR="${WORKDIR}/src"
     ok "cloned"
@@ -174,22 +178,26 @@ install_edgekit() {
 
     mkdir -p "${PREFIX}"
     if [ ! -x "${VENV}/bin/python" ]; then
-        info "creating virtualenv"
+        info "[1/4] creating virtualenv at ${VENV}"
         python3 -m venv "${VENV}"
+        ok "virtualenv created"
     else
-        info "reusing existing virtualenv"
+        info "[1/4] reusing existing virtualenv at ${VENV}"
+        ok "virtualenv ready"
     fi
 
-    info "upgrading pip"
-    "${VENV}/bin/pip" install --quiet --upgrade pip setuptools wheel
+    info "[2/4] upgrading pip, setuptools, wheel"
+    "${VENV}/bin/pip" install --upgrade pip setuptools wheel
+    ok "pip tooling upgraded"
 
-    info "installing package and dependencies (this takes a minute)"
-    "${VENV}/bin/pip" install --quiet "${SOURCE_DIR}"
+    info "[3/4] installing edgekit and Python dependencies (this takes a minute)"
+    "${VENV}/bin/pip" install "${SOURCE_DIR}"
+    ok "Python package installed"
 
+    info "[4/4] linking edgekit onto PATH"
     # A stable path on PATH means `edgekit` works for the operator and in the systemd unit.
     ln -sf "${BIN}" /usr/local/bin/edgekit
-
-    ok "$("${BIN}" version)"
+    ok "$("${BIN}" version) → /usr/local/bin/edgekit"
 }
 
 # ------------------------------------------------------------------ handover
