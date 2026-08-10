@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..paths import WG_DIR
-from .shell import CommandError, run, service_active, service_enabled, systemctl
+from .shell import CommandError, run, service_enabled, systemctl
 
 log = logging.getLogger("edgekit.wireguard")
 
@@ -97,13 +97,24 @@ def interface_exists(interface: str) -> bool:
 
 
 def bring_up(interface: str) -> None:
+    """Start the interface through systemd so ``wg-quick@`` tracks it as active.
+
+    Calling ``wg-quick up`` directly leaves the unit inactive: peers can handshake
+    while the panel reports WireGuard as down. ``systemctl start`` is the same
+    ``wg-quick up`` under the hood, but systemd records the unit as running.
+    """
     if interface_exists(interface):
         log.debug("%s already up", interface)
         return
-    run(["wg-quick", "up", interface], check=True)
+    systemctl("start", f"wg-quick@{interface}", check=True)
 
 
 def bring_down(interface: str) -> None:
+    if not interface_exists(interface):
+        return
+    # Prefer systemd so the unit state matches the device. If the interface was
+    # brought up outside systemd, ``systemctl stop`` is a no-op and we fall back.
+    systemctl("stop", f"wg-quick@{interface}")
     if not interface_exists(interface):
         return
     run(["wg-quick", "down", interface], check=True)
@@ -167,7 +178,14 @@ def status(interface: str) -> list[PeerStatus]:
 
 
 def interface_up(interface: str) -> bool:
-    return interface_exists(interface) and service_active(f"wg-quick@{interface}")
+    """True when the WireGuard network device is present.
+
+    Status follows the live interface (what ``wg show`` and peer handshakes use),
+    not whether the ``wg-quick@`` systemd unit happens to report active. The unit
+    can be inactive after a direct ``wg-quick up`` or a provision that only
+    ``enable``d the unit — while tunnels are still carrying traffic.
+    """
+    return interface_exists(interface)
 
 
 def ping(address: str, count: int = 2, timeout: int = 5) -> bool:
