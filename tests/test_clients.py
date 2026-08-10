@@ -349,6 +349,74 @@ async def test_api_errors_are_reported_with_cloudflares_own_message():
 
 
 @respx.mock
+async def test_account_owned_tokens_are_accepted_via_the_zones_fallback():
+    """/user/tokens/verify rejects account-owned tokens that are otherwise perfectly valid."""
+    verify = respx.get(f"{CF_BASE}/user/tokens/verify").mock(
+        return_value=httpx.Response(
+            401, json={"success": False, "errors": [{"code": 1000, "message": "Invalid API Token"}]}
+        )
+    )
+    zones = respx.get(f"{CF_BASE}/zones").mock(
+        return_value=httpx.Response(200, json=cf_ok([{"id": "z1", "name": "example.com"}]))
+    )
+
+    async with CloudflareClient("account-token") as client:
+        result = await client.verify_token()
+
+    assert verify.called
+    assert zones.called
+    assert result["scope"] == "account"
+
+
+@respx.mock
+async def test_a_token_failing_both_checks_is_reported_as_unusable():
+    respx.get(f"{CF_BASE}/user/tokens/verify").mock(
+        return_value=httpx.Response(
+            401, json={"success": False, "errors": [{"code": 1000, "message": "Invalid API Token"}]}
+        )
+    )
+    respx.get(f"{CF_BASE}/zones").mock(
+        return_value=httpx.Response(
+            403, json={"success": False, "errors": [{"code": 9109, "message": "Unauthorized"}]}
+        )
+    )
+
+    async with CloudflareClient("bad") as client:
+        with pytest.raises(CloudflareError, match="cannot be used"):
+            await client.verify_token()
+
+
+@respx.mock
+async def test_a_non_token_error_is_not_masked_by_the_fallback():
+    """A 500 from Cloudflare must surface as itself, not as a credential problem."""
+    respx.get(f"{CF_BASE}/user/tokens/verify").mock(
+        return_value=httpx.Response(
+            500, json={"success": False, "errors": [{"code": 10000, "message": "internal"}]}
+        )
+    )
+    zones = respx.get(f"{CF_BASE}/zones")
+
+    async with CloudflareClient("token") as client:
+        with pytest.raises(CloudflareError, match="internal"):
+            await client.verify_token()
+
+    assert not zones.called
+
+
+@respx.mock
+async def test_origin_certificate_error_names_the_account_token_limitation():
+    respx.post(f"{CF_BASE}/certificates").mock(
+        return_value=httpx.Response(
+            403, json={"success": False, "errors": [{"code": 1000, "message": "denied"}]}
+        )
+    )
+
+    async with CloudflareClient("account-token") as client:
+        with pytest.raises(CloudflareError, match="Origin CA Key"):
+            await client.create_origin_certificate(["example.com"])
+
+
+@respx.mock
 async def test_unknown_zone_gives_an_actionable_error():
     respx.get(f"{CF_BASE}/zones").mock(return_value=httpx.Response(200, json=cf_ok([])))
 

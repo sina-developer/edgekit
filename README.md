@@ -58,7 +58,7 @@ sudo EDGEKIT_PUBLIC_IP=52.56.216.78 \
 | `EDGEKIT_NPM_EMAIL` / `EDGEKIT_NPM_PASSWORD` | Nginx Proxy Manager admin account |
 | `EDGEKIT_NPM_HTTP_PORT` / `EDGEKIT_NPM_HTTPS_PORT` / `EDGEKIT_NPM_ADMIN_PORT` | Proxy ports |
 | `EDGEKIT_CF_ENABLED` / `EDGEKIT_CF_ZONE` / `EDGEKIT_CF_TOKEN` | Cloudflare integration |
-| `EDGEKIT_CF_ORIGIN_CA_KEY` | Only if the token cannot issue origin certificates |
+| `EDGEKIT_CF_ORIGIN_CA_KEY` | Needed for origin certificates unless the token is a *user* token |
 | `EDGEKIT_CF_PROXIED` | Orange-cloud the DNS records (default yes) |
 | `EDGEKIT_PANEL_USER` / `EDGEKIT_PANEL_PASSWORD` / `EDGEKIT_PANEL_PORT` | Panel account |
 
@@ -68,6 +68,27 @@ Installing from somewhere other than a local checkout:
 sudo EDGEKIT_REPO=https://github.com/you/edgekit.git ./install.sh
 sudo EDGEKIT_ARCHIVE=https://example.com/edgekit.tar.gz ./install.sh
 ```
+
+### Cloudflare tokens: the two kinds
+
+Cloudflare issues **user tokens** (My Profile → API Tokens) and **account-owned tokens** (an
+account's own API Tokens page, `dash.cloudflare.com/<account-id>/api-tokens`). Both manage DNS
+and zone settings fine, and edgekit accepts either.
+
+They differ in one place: **Origin CA certificate issuance is user-scoped**, so an
+account-owned token cannot issue the origin certificate no matter what permissions it carries.
+If you use an account-owned token, also supply the Origin CA Key:
+
+```
+Cloudflare dashboard → My Profile → API Tokens → Origin CA Key → View
+```
+
+```bash
+sudo edgekit cloudflare token --zone example.com --origin-ca-key v1.0-...
+```
+
+Token permissions required either way: **Zone:Read**, **DNS:Edit**, **Zone Settings:Edit**,
+and — for a user token — **SSL and Certificates:Edit**, with Zone Resources including the zone.
 
 ### The one thing edgekit cannot do for you
 

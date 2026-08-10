@@ -133,25 +133,45 @@ class CloudflareClient:
 
     # ---------------------------------------------------------------- account / zone
 
+    #: Cloudflare's "this token is not usable here" family.
+    _BAD_TOKEN_CODES = (1000, 6003, 9109, 9106)
+
     async def verify_token(self) -> dict[str, Any]:
-        """Fail fast during setup with a clear message rather than at first use."""
+        """Confirm the token works, without assuming which kind of token it is.
+
+        ``/user/tokens/verify`` only accepts *user* tokens (My Profile -> API Tokens).
+        An **account-owned** token — created from an account's own API Tokens page — is
+        rejected there with code 1000 despite being perfectly valid for zones and DNS. So a
+        failure at that endpoint proves nothing on its own, and we fall back to exercising
+        the permission edgekit actually needs: listing zones.
+        """
         try:
             return await self._request("GET", "/user/tokens/verify")
         except CloudflareError as exc:
-            if any(e.get("code") in (1000, 6003, 9109) for e in exc.errors):
+            if not any(e.get("code") in self._BAD_TOKEN_CODES for e in exc.errors):
+                raise
+
+            try:
+                await self._request("GET", "/zones", params={"per_page": 1})
+            except CloudflareError as zone_exc:
                 raise CloudflareError(
-                    "Cloudflare rejected this API token. Three things are worth checking, "
-                    "in order of how often they are the cause:\n"
-                    "  1. It must be an API *token* (Profile -> API Tokens -> Create Token), "
-                    "not the Global API Key and not the token's ID.\n"
-                    "  2. Copy the token exactly once, at creation time — Cloudflare never "
-                    "shows it again, and a truncated or re-wrapped paste fails this way.\n"
-                    "  3. It needs Zone:Read, DNS:Edit, Zone Settings:Edit, and SSL and "
-                    "Certificates:Edit, scoped to include this zone.\n"
-                    "Re-enter it under Settings -> Cloudflare, or run `edgekit provision` "
-                    "again after fixing /etc/edgekit/config.yaml."
+                    "Cloudflare rejected this API token for both token verification and "
+                    "listing zones, so it cannot be used.\n"
+                    "  1. Use the token *secret* shown once at creation — not the token ID, "
+                    "and not the Global API Key.\n"
+                    "  2. A truncated or line-wrapped paste fails exactly this way; create a "
+                    "fresh token and copy it in one go.\n"
+                    "  3. It needs Zone:Read, DNS:Edit, Zone Settings:Edit and SSL and "
+                    "Certificates:Edit, with Zone Resources including this zone.\n"
+                    "  4. Check the token is Active and any IP-address filter on it allows "
+                    "this server.\n"
+                    f"Zone listing said: {zone_exc}"
                 ) from exc
-            raise
+
+            log.info(
+                "token is not a user token (account-owned); verified by listing zones instead"
+            )
+            return {"status": "active", "scope": "account"}
 
     async def list_zones(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/zones", params={"per_page": 50}) or []
@@ -256,10 +276,18 @@ class CloudflareClient:
         except CloudflareError as exc:
             if not self.origin_ca_key:
                 raise CloudflareError(
-                    "Origin certificate issuance failed. If the API token lacks the "
-                    "'SSL and Certificates: Edit' permission at user level, set an "
-                    "Origin CA Key in the panel (Cloudflare dashboard -> My Profile -> "
-                    f"API Tokens -> Origin CA Key). Original error: {exc}"
+                    "Could not issue the origin certificate. Cloudflare's Origin CA endpoint "
+                    "is user-scoped, so an account-owned token cannot drive it even when it "
+                    "manages DNS for this zone perfectly well.\n"
+                    "Fix it with either:\n"
+                    "  - the Origin CA Key: Cloudflare dashboard -> My Profile -> API Tokens "
+                    "-> Origin CA Key -> View, then `edgekit cloudflare token "
+                    "--origin-ca-key <key>`; or\n"
+                    "  - a *user* token (My Profile -> API Tokens) carrying 'SSL and "
+                    "Certificates: Edit'.\n"
+                    "Everything else (DNS, SSL mode) keeps working without this — you can "
+                    "also paste a certificate by hand under Settings -> Origin certificate.\n"
+                    f"Original error: {exc}"
                 ) from exc
             log.info("retrying Origin CA issuance with the Origin CA Key")
             result = await self._request(
