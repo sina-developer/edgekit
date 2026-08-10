@@ -43,10 +43,14 @@ peer_app = typer.Typer(help="Manage WireGuard peers.", no_args_is_help=True)
 host_app = typer.Typer(help="Manage proxy hosts.", no_args_is_help=True)
 cert_app = typer.Typer(help="Manage the origin certificate.", no_args_is_help=True)
 user_app = typer.Typer(help="Manage panel accounts.", no_args_is_help=True)
+cf_app = typer.Typer(help="Manage the Cloudflare integration.", no_args_is_help=True)
+npm_app = typer.Typer(help="Manage Nginx Proxy Manager credentials.", no_args_is_help=True)
 app.add_typer(peer_app, name="peer")
 app.add_typer(host_app, name="host")
 app.add_typer(cert_app, name="cert")
 app.add_typer(user_app, name="user")
+app.add_typer(cf_app, name="cloudflare")
+app.add_typer(npm_app, name="npm")
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -610,6 +614,119 @@ def cert_status() -> None:
         console.print("[yellow]No origin certificate installed.[/yellow]")
         raise typer.Exit(1)
     console.print(f"NPM certificate id {cert_id}, expires {expiry[:10] or 'unknown'}")
+
+
+# ---------------------------------------------------------------------- cloudflare
+
+
+@cf_app.command("token")
+def cloudflare_token(
+    token: str = typer.Option("", "--token", help="Omit to be prompted without echo."),
+    zone: str = typer.Option("", "--zone", help="Root domain, if not already configured."),
+    origin_ca_key: str = typer.Option("", "--origin-ca-key"),
+) -> None:
+    """Store a Cloudflare API token, verifying it before saving."""
+    require_root()
+    config = require_configured()
+
+    if not token:
+        token = typer.prompt("Cloudflare API token", hide_input=True).strip()
+    if zone:
+        config.cloudflare.zone_name = zone.strip()
+    if origin_ca_key:
+        config.cloudflare.origin_ca_key = origin_ca_key.strip()
+    if not config.cloudflare.zone_name:
+        console.print("[red]No zone configured. Pass --zone example.com.[/red]")
+        raise typer.Exit(1)
+
+    config.cloudflare.api_token = token
+    config.cloudflare.enabled = True
+
+    from .services.cloudflare import CloudflareClient, CloudflareError
+
+    async def verify() -> str:
+        async with CloudflareClient(token, origin_ca_key=config.cloudflare.origin_ca_key) as c:
+            await c.verify_token()
+            return await c.get_zone_id(config.cloudflare.zone_name)
+
+    try:
+        config.cloudflare.zone_id = asyncio.run(verify())
+    except CloudflareError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    config.save()
+    console.print(
+        f"[green]✓[/green] token stored, zone {config.cloudflare.zone_name} "
+        f"= {config.cloudflare.zone_id}\n"
+        "  Run [bold]edgekit provision[/bold] to publish DNS and issue the certificate."
+    )
+
+
+@cf_app.command("verify")
+def cloudflare_verify() -> None:
+    """Check the stored Cloudflare token and zone."""
+    config = require_configured()
+    if not (config.cloudflare.enabled and config.cloudflare.api_token):
+        console.print("[yellow]Cloudflare is not configured.[/yellow]")
+        raise typer.Exit(1)
+
+    from .services.cloudflare import CloudflareClient, CloudflareError
+
+    async def verify() -> str:
+        async with CloudflareClient(
+            config.cloudflare.api_token, origin_ca_key=config.cloudflare.origin_ca_key
+        ) as c:
+            await c.verify_token()
+            return await c.get_zone_id(config.cloudflare.zone_name)
+
+    try:
+        zone_id = asyncio.run(verify())
+    except CloudflareError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]✓[/green] zone {config.cloudflare.zone_name} = {zone_id}")
+
+
+# ---------------------------------------------------------------------- npm
+
+
+@npm_app.command("password")
+def npm_password(
+    password: str = typer.Option("", "--password", help="Omit to be prompted without echo."),
+    email: str = typer.Option("", "--email"),
+) -> None:
+    """Tell edgekit which credentials Nginx Proxy Manager actually uses.
+
+    This does not change the NPM account — use it when the password was changed inside NPM
+    and edgekit's stored copy no longer matches.
+    """
+    require_root()
+    config = require_configured()
+
+    if email:
+        config.npm.admin_email = email.strip()
+    if not password:
+        password = typer.prompt("NPM admin password", hide_input=True).strip()
+    config.npm.admin_password = password
+
+    from .services.npm import NPMClient
+
+    async def check() -> str:
+        async with NPMClient(
+            config.npm.api_base, config.npm.admin_email, config.npm.admin_password
+        ) as client:
+            user = await client.me()
+            return user.get("email", config.npm.admin_email)
+
+    try:
+        who = asyncio.run(check())
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]NPM rejected those credentials: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    config.save()
+    console.print(f"[green]✓[/green] verified against NPM as {who}")
 
 
 # ---------------------------------------------------------------------- users

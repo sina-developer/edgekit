@@ -97,6 +97,102 @@ async def test_npm_bad_credentials_raise_auth_error():
 
 
 @respx.mock
+async def test_npm_reports_a_400_as_an_auth_failure():
+    """NPM answers bad credentials on /tokens with 400, not 401."""
+    respx.post(f"{NPM_BASE}/tokens").mock(
+        return_value=httpx.Response(
+            400, json={"error": {"code": 400, "message": "Invalid email or password"}}
+        )
+    )
+
+    async with NPMClient(NPM_BASE, "admin@example.com", "wrong") as client:
+        with pytest.raises(NPMAuthError):
+            await client.list_proxy_hosts()
+
+
+class TestBootstrapAdmin:
+    """Guide §11. The dangerous failure is concluding 'already secured' when it is not."""
+
+    @pytest.fixture(autouse=True)
+    def _no_sleeping(self, monkeypatch):
+        async def instant(_seconds):
+            return None
+
+        monkeypatch.setattr("edgekit.services.npm.asyncio.sleep", instant)
+
+    @respx.mock
+    async def test_refuses_to_keep_the_shipped_defaults(self):
+        async with NPMClient(NPM_BASE, "admin@example.com", "changeme") as client:
+            with pytest.raises(NPMError, match="default credentials"):
+                await client.bootstrap_admin("admin@example.com", "changeme")
+
+    @respx.mock
+    async def test_already_rotated_is_a_no_op(self):
+        respx.post(f"{NPM_BASE}/tokens").mock(
+            return_value=httpx.Response(200, json={"token": "t"})
+        )
+
+        async with NPMClient(NPM_BASE, "me@example.com", "good-password") as client:
+            assert await client.bootstrap_admin("me@example.com", "good-password") is False
+
+    @respx.mock
+    async def test_defaults_seeded_late_are_still_rotated(self):
+        """NPM's API answers before its first-boot migrations seed the admin user."""
+        calls = {"n": 0}
+
+        def tokens(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            body = request.read().decode()
+            if "changeme" in body:
+                # The seed lands on the fourth attempt.
+                if calls["n"] < 5:
+                    return httpx.Response(400, json={"error": {"message": "Invalid"}})
+                return httpx.Response(200, json={"token": "default-token"})
+            # The new credentials only work once the rotation has happened.
+            if calls["n"] > 6:
+                return httpx.Response(200, json={"token": "new-token"})
+            return httpx.Response(400, json={"error": {"message": "Invalid"}})
+
+        respx.post(f"{NPM_BASE}/tokens").mock(side_effect=tokens)
+        respx.put(f"{NPM_BASE}/users/me").mock(return_value=httpx.Response(200, json={}))
+        auth = respx.put(f"{NPM_BASE}/users/me/auth").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
+            assert await client.bootstrap_admin("me@example.com", "new-password") is True
+
+        assert auth.called
+        assert client.password == "new-password"
+
+    @respx.mock
+    async def test_neither_credential_set_working_raises_rather_than_lying(self):
+        """The old code returned False here, silently leaving NPM on admin/changeme."""
+        respx.post(f"{NPM_BASE}/tokens").mock(
+            return_value=httpx.Response(400, json={"error": {"message": "Invalid"}})
+        )
+
+        async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
+            with pytest.raises(NPMError, match="rejected both"):
+                await client.bootstrap_admin("me@example.com", "new-password")
+
+    @respx.mock
+    async def test_a_rotation_that_does_not_take_effect_is_reported(self):
+        def tokens(request: httpx.Request) -> httpx.Response:
+            if "changeme" in request.read().decode():
+                return httpx.Response(200, json={"token": "default-token"})
+            return httpx.Response(400, json={"error": {"message": "Invalid"}})
+
+        respx.post(f"{NPM_BASE}/tokens").mock(side_effect=tokens)
+        respx.put(f"{NPM_BASE}/users/me").mock(return_value=httpx.Response(200, json={}))
+        respx.put(f"{NPM_BASE}/users/me/auth").mock(return_value=httpx.Response(200, json={}))
+
+        async with NPMClient(NPM_BASE, "me@example.com", "new-password") as client:
+            with pytest.raises(NPMError, match="then rejected"):
+                await client.bootstrap_admin("me@example.com", "new-password")
+
+
+@respx.mock
 async def test_upsert_updates_an_existing_domain_instead_of_duplicating_it():
     respx.post(f"{NPM_BASE}/tokens").mock(return_value=httpx.Response(200, json={"token": "t"}))
     respx.get(f"{NPM_BASE}/nginx/proxy-hosts").mock(

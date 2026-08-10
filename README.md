@@ -142,6 +142,10 @@ edgekit host remove retro.blockey.ir --remove-dns
 edgekit cert issue [--force]
 edgekit cert status
 
+edgekit cloudflare token --zone blockey.ir   # prompts, verifies, then saves
+edgekit cloudflare verify
+edgekit npm password                         # re-sync edgekit's copy of the NPM password
+
 edgekit user create alice
 edgekit user passwd admin
 ```
@@ -153,6 +157,20 @@ edgekit host add api.blockey.ir 8080 --peer raspberry-pi
 ```
 
 DNS record, proxy host, SSL — done. No Nginx config editing, no new WireGuard peer.
+
+---
+
+## Upgrading an already-installed server
+
+```bash
+cd ~/edgekit && git pull          # or scp the updated source across
+sudo /opt/edgekit/venv/bin/pip install --upgrade .
+sudo systemctl restart edgekit-panel
+sudo edgekit provision            # idempotent; fixes whatever is out of step
+```
+
+`edgekit provision` is the repair tool. It is safe to run repeatedly and will re-do only the
+steps that are not already in the desired state.
 
 ---
 

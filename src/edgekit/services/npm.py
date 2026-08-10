@@ -92,7 +92,10 @@ class NPMClient:
         response = await self._client.post(
             "/tokens", json={"identity": self.email, "secret": self.password}
         )
-        if response.status_code in (401, 403):
+        # NPM answers bad credentials on /tokens with 400 ("Invalid email or password"),
+        # not 401. Treating 400 as a transport error here would turn a wrong password into
+        # an unrecoverable provisioning failure instead of something callers can handle.
+        if response.status_code in (400, 401, 403):
             raise NPMAuthError(f"NPM rejected credentials for {self.email}")
         if response.status_code >= 400:
             raise NPMError(f"NPM login failed ({response.status_code}): {response.text[:300]}")
@@ -126,13 +129,17 @@ class NPMClient:
     # ---------------------------------------------------------------- health / bootstrap
 
     async def wait_until_ready(self, attempts: int = 40, delay: float = 3.0) -> None:
-        """NPM runs migrations on first boot; the API 502s until they finish."""
+        """Wait for the HTTP listener. See :meth:`wait_for_login` for the stronger check.
+
+        NPM's express app starts answering well before its first-boot migrations have seeded
+        the default admin user, so a 200 here does *not* mean the API is usable yet.
+        """
         last: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
                 response = await self._client.get("/")
                 if response.status_code < 500:
-                    log.info("NPM API ready after %d attempt(s)", attempt)
+                    log.info("NPM API listening after %d attempt(s)", attempt)
                     return
                 last = NPMError(f"status {response.status_code}")
             except httpx.HTTPError as exc:
@@ -140,26 +147,63 @@ class NPMClient:
             await asyncio.sleep(delay)
         raise NPMError(f"NPM API did not become ready in {int(attempts * delay)}s: {last}")
 
+    async def _try_login(self) -> bool:
+        """Attempt a login, distinguishing 'wrong credentials' from 'not ready yet'."""
+        try:
+            await self._login()
+        except NPMAuthError:
+            return False
+        return True
+
+    async def wait_for_login(self, attempts: int = 20, delay: float = 3.0) -> bool:
+        """Poll until these credentials are accepted or definitively rejected.
+
+        Returns True on success, False if the credentials were rejected on every attempt.
+        Transport-level failures keep retrying; an auth rejection is retried too, because on
+        a cold start the user table is seeded a few seconds after the API starts answering.
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                if await self._try_login():
+                    return True
+            except NPMError as exc:
+                log.debug("NPM login attempt %d failed: %s", attempt, exc)
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+        return False
+
     async def bootstrap_admin(
         self, new_email: str, new_password: str, name: str = "edgekit"
     ) -> bool:
-        """Rotate the shipped default credentials (guide §11).
+        """Ensure the admin account uses our credentials, not the shipped defaults (§11).
 
-        Returns True if the defaults were still in place and got rotated, False if the
-        account had already been secured — either way the account ends up usable.
+        Returns True if the defaults were rotated, False if the account was already secured.
+        Raises if neither credential set works, because the alternative — returning quietly —
+        would leave a publicly reachable proxy manager on admin@example.com/changeme.
         """
+        if (new_email, new_password) == (DEFAULT_EMAIL, DEFAULT_PASSWORD):
+            raise NPMError(
+                "Refusing to configure Nginx Proxy Manager with its default credentials. "
+                "Choose a different admin password."
+            )
+
+        # Already bootstrapped? This is the common case on a re-run.
+        if await self.wait_for_login(attempts=3, delay=2.0):
+            log.info("NPM already accepts the configured credentials")
+            return False
+
+        # Otherwise the defaults should still be in place — but on a cold start they may not
+        # be seeded yet, so give the migrations time rather than concluding after one try.
         probe = NPMClient(self.base_url, DEFAULT_EMAIL, DEFAULT_PASSWORD)
         try:
-            await probe._login()
-        except NPMAuthError:
-            log.info("NPM default credentials already rotated")
-            await probe.aclose()
-            return False
-        except NPMError:
-            await probe.aclose()
-            raise
+            if not await probe.wait_for_login(attempts=20, delay=3.0):
+                raise NPMError(
+                    "Nginx Proxy Manager rejected both the configured credentials and the "
+                    "shipped defaults. If its admin password was changed outside edgekit, "
+                    "set the matching password under Settings -> Nginx Proxy Manager (or in "
+                    "/etc/edgekit/config.yaml) and re-run `edgekit provision`."
+                )
 
-        try:
             await probe._request(
                 "PUT",
                 "/users/me",
@@ -179,6 +223,12 @@ class NPMClient:
 
         # Force the next call on this client to authenticate with the new credentials.
         self.email, self.password, self._token = new_email, new_password, None
+        if not await self.wait_for_login(attempts=5, delay=2.0):
+            raise NPMError(
+                "Rotated the NPM admin credentials, but the new ones were then rejected. "
+                "Check `docker logs nginx-proxy-manager --tail 100`."
+            )
+
         log.info("NPM admin credentials rotated to %s", new_email)
         return True
 

@@ -242,6 +242,9 @@ def run_wizard(existing: Config | None = None, *, non_interactive: bool = False)
             password=True,
             non_interactive=non_interactive,
         )
+        # Verify while the operator is still at the keyboard. Discovering a bad token five
+        # minutes later, half way through provisioning, is a much worse experience.
+        _verify_cloudflare(config, non_interactive=non_interactive)
         config.cloudflare.origin_ca_key = _ask(
             "Origin CA key (optional, press Enter to skip)",
             default=config.cloudflare.origin_ca_key,
@@ -308,6 +311,55 @@ def run_wizard(existing: Config | None = None, *, non_interactive: bool = False)
         panel_password_generated=panel_generated,
         npm_password_generated=npm_generated,
     )
+
+
+def _verify_cloudflare(config: Config, *, non_interactive: bool) -> None:
+    """Check the token and resolve the zone id, re-prompting until it works.
+
+    In unattended mode a bad token is reported but does not block: the rest of the server
+    still provisions, and Cloudflare can be fixed afterwards from the panel.
+    """
+    import asyncio
+
+    from .services.cloudflare import CloudflareClient, CloudflareError
+
+    async def check() -> str:
+        async with CloudflareClient(
+            config.cloudflare.api_token, origin_ca_key=config.cloudflare.origin_ca_key
+        ) as client:
+            await client.verify_token()
+            return await client.get_zone_id(config.cloudflare.zone_name)
+
+    while True:
+        try:
+            config.cloudflare.zone_id = asyncio.run(check())
+        except CloudflareError as exc:
+            console.print(f"\n[red]{exc}[/red]\n")
+            if non_interactive:
+                console.print(
+                    "[yellow]Continuing without Cloudflare. Fix the token in the panel "
+                    "under Settings, then re-run `edgekit provision`.[/yellow]"
+                )
+                config.cloudflare.enabled = False
+                return
+            if not Confirm.ask("Re-enter the Cloudflare token?", default=True):
+                console.print(
+                    "[yellow]Cloudflare will be left disabled. Enable it later in the "
+                    "panel under Settings.[/yellow]"
+                )
+                config.cloudflare.enabled = False
+                return
+            config.cloudflare.api_token = Prompt.ask("  Cloudflare API token", password=True)
+            continue
+        except Exception as exc:  # noqa: BLE001 - network problems should not be fatal here
+            console.print(f"  [yellow]Could not reach Cloudflare to verify: {exc}[/yellow]")
+            return
+
+        console.print(
+            f"  [green]✓[/green] token valid, zone {config.cloudflare.zone_name} "
+            f"= {config.cloudflare.zone_id}"
+        )
+        return
 
 
 def _section(title: str) -> None:

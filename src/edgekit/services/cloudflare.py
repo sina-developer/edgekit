@@ -135,7 +135,23 @@ class CloudflareClient:
 
     async def verify_token(self) -> dict[str, Any]:
         """Fail fast during setup with a clear message rather than at first use."""
-        return await self._request("GET", "/user/tokens/verify")
+        try:
+            return await self._request("GET", "/user/tokens/verify")
+        except CloudflareError as exc:
+            if any(e.get("code") in (1000, 6003, 9109) for e in exc.errors):
+                raise CloudflareError(
+                    "Cloudflare rejected this API token. Three things are worth checking, "
+                    "in order of how often they are the cause:\n"
+                    "  1. It must be an API *token* (Profile -> API Tokens -> Create Token), "
+                    "not the Global API Key and not the token's ID.\n"
+                    "  2. Copy the token exactly once, at creation time — Cloudflare never "
+                    "shows it again, and a truncated or re-wrapped paste fails this way.\n"
+                    "  3. It needs Zone:Read, DNS:Edit, Zone Settings:Edit, and SSL and "
+                    "Certificates:Edit, scoped to include this zone.\n"
+                    "Re-enter it under Settings -> Cloudflare, or run `edgekit provision` "
+                    "again after fixing /etc/edgekit/config.yaml."
+                ) from exc
+            raise
 
     async def list_zones(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/zones", params={"per_page": 50}) or []
