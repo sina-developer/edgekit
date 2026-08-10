@@ -24,7 +24,7 @@ Internet → Cloudflare (Full strict) → this server ─┬─ Nginx Proxy Mana
 On a fresh Ubuntu/Debian server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sina-developer/edgekit/master/install.sh | sudo bash
+curl -fsSL https://cdn.jsdelivr.net/gh/sina-developer/edgekit@master/install.sh | sudo bash
 ```
 
 Or from a local checkout:

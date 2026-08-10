@@ -6,7 +6,7 @@
 # `edgekit setup`, which interviews you and provisions this server.
 #
 # Usage:
-#     curl -fsSL https://raw.githubusercontent.com/sina-developer/edgekit/master/install.sh | sudo bash
+#     curl -fsSL https://cdn.jsdelivr.net/gh/sina-developer/edgekit@master/install.sh | sudo bash
 #     sudo ./install.sh                          # from a local checkout
 #
 # Or unattended, driven entirely by environment variables:
