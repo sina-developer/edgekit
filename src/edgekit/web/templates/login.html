@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Sign in — edgekit{% endblock %}
+{% block main_class %}centred{% endblock %}
+
+{% block content %}
+<div class="card auth">
+  <h1>edge<span class="accent">kit</span></h1>
+  <p class="muted">WireGuard hub and proxy management</p>
+
+  {% if error %}<div class="flash bad">{{ error }}</div>{% endif %}
+
+  <form method="post" action="/login">
+    <input type="hidden" name="next" value="{{ next }}">
+    <label>Username
+      <input type="text" name="username" autocomplete="username" required autofocus>
+    </label>
+    <label>Password
+      <input type="password" name="password" autocomplete="current-password" required>
+    </label>
+    <button type="submit" class="primary block">Sign in</button>
+  </form>
+</div>
+{% endblock %}

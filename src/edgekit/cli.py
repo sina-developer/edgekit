@@ -1,0 +1,712 @@
+"""Command line interface.
+
+`edgekit setup` is the entry point the installer calls: interview, provision, create the
+panel account, install the service. Everything else exists so the same operations are
+available without a browser.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+import time
+from typing import Annotated
+
+import typer
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.table import Table
+
+from . import __version__, service_unit
+from .config import Config, load_config
+from .db import init_db, session_scope
+from .models import User
+from .paths import CONFIG_FILE, LOG_FILE, ensure_dirs
+from .security import check_password_strength, generate_password, hash_password
+from .services import certificates, health
+from .services.hosts import SETTING_CERT_EXPIRY, SETTING_CERT_ID, HostService, get_setting
+from .services.peers import PeerError, PeerService
+from .services.provision import Provisioner, StepStatus
+from .system import wireguard as wg
+from .system.shell import is_root
+
+console = Console()
+
+app = typer.Typer(
+    help="WireGuard hub + Nginx Proxy Manager edge server.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+peer_app = typer.Typer(help="Manage WireGuard peers.", no_args_is_help=True)
+host_app = typer.Typer(help="Manage proxy hosts.", no_args_is_help=True)
+cert_app = typer.Typer(help="Manage the origin certificate.", no_args_is_help=True)
+user_app = typer.Typer(help="Manage panel accounts.", no_args_is_help=True)
+app.add_typer(peer_app, name="peer")
+app.add_typer(host_app, name="host")
+app.add_typer(cert_app, name="cert")
+app.add_typer(user_app, name="user")
+
+
+def setup_logging(verbose: bool = False) -> None:
+    ensure_dirs()
+    handlers: list[logging.Handler] = [
+        RichHandler(console=console, show_path=False, rich_tracebacks=True, show_time=False)
+    ]
+    try:
+        file_handler = logging.FileHandler(LOG_FILE)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+        )
+        handlers.append(file_handler)
+    except OSError:
+        pass  # unprivileged inspection runs still get console output
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def require_root() -> None:
+    if not is_root():
+        console.print("[red]This command needs root. Re-run with sudo.[/red]")
+        raise typer.Exit(1)
+
+
+def require_configured() -> Config:
+    config = load_config()
+    if not config.configured:
+        console.print(
+            f"[red]edgekit is not set up yet[/red] (no usable {CONFIG_FILE}).\n"
+            "Run [bold]sudo edgekit setup[/bold] first."
+        )
+        raise typer.Exit(1)
+    return config
+
+
+@app.callback()
+def main_callback(
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Debug logging.")] = False,
+) -> None:
+    setup_logging(verbose)
+
+
+@app.command()
+def version() -> None:
+    """Print the edgekit version."""
+    console.print(f"edgekit {__version__}")
+
+
+# ---------------------------------------------------------------------- setup
+
+
+@app.command()
+def setup(
+    non_interactive: Annotated[
+        bool, typer.Option("--non-interactive", "-y", help="Accept defaults and environment.")
+    ] = False,
+    skip_packages: Annotated[
+        bool, typer.Option("--skip-packages", help="Assume WireGuard and Docker are installed.")
+    ] = False,
+    skip_docker: Annotated[
+        bool, typer.Option("--skip-docker", help="Do not deploy Nginx Proxy Manager.")
+    ] = False,
+    skip_cloudflare: Annotated[
+        bool, typer.Option("--skip-cloudflare", help="Do not touch Cloudflare.")
+    ] = False,
+    no_service: Annotated[
+        bool, typer.Option("--no-service", help="Do not install the panel systemd unit.")
+    ] = False,
+) -> None:
+    """Interview, provision this server, and start the management panel."""
+    require_root()
+    ensure_dirs()
+    init_db()
+
+    from .wizard import run_wizard
+
+    existing = load_config()
+    result = run_wizard(existing if existing.configured else None,
+                        non_interactive=non_interactive)
+    config = result.config
+    config.save()
+
+    console.print()
+    report = _run_provisioner(
+        config,
+        skip_packages=skip_packages,
+        skip_docker=skip_docker,
+        skip_cloudflare=skip_cloudflare,
+    )
+
+    with session_scope() as session:
+        existing_user = session.query(User).filter_by(username=result.panel_username).first()
+        if existing_user is None:
+            session.add(
+                User(
+                    username=result.panel_username,
+                    password_hash=hash_password(result.panel_password),
+                    must_change_password=result.panel_password_generated,
+                )
+            )
+            console.print(f"Created panel account [bold]{result.panel_username}[/bold].")
+        else:
+            console.print(
+                f"Panel account [bold]{result.panel_username}[/bold] already exists; "
+                "password left unchanged."
+            )
+
+    if not no_service:
+        service_unit.install()
+        console.print("Installed and started [bold]edgekit-panel.service[/bold].")
+
+    _print_setup_summary(config, result, report.ok)
+    raise typer.Exit(0 if report.ok else 2)
+
+
+def _run_provisioner(config: Config, **flags) -> object:
+    def on_event(step) -> None:
+        if step.status is StepStatus.RUNNING:
+            console.print(f"  [dim]…[/dim] {step.title}", end="\r")
+        elif step.status is StepStatus.DONE:
+            console.print(f"  [green]✓[/green] {step.title}"
+                          + (f" [dim]— {step.detail}[/dim]" if step.detail else ""))
+        elif step.status is StepStatus.SKIPPED:
+            console.print(f"  [dim]•[/dim] [dim]{step.title} — skipped "
+                          f"({step.detail})[/dim]")
+        else:
+            console.print(f"  [red]✗[/red] {step.title}\n    [red]{step.detail}[/red]")
+
+    console.print("[bold]Provisioning[/bold]")
+    provisioner = Provisioner(config, on_event=on_event, **flags)
+    return asyncio.run(provisioner.run())
+
+
+def _print_setup_summary(config: Config, result, ok: bool) -> None:
+    table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+    table.add_row("Panel", f"http://{config.panel.bind}:{config.panel.port}")
+    table.add_row("Username", result.panel_username)
+    if result.panel_password_generated:
+        table.add_row("Password", f"[bold yellow]{result.panel_password}[/bold yellow]")
+    if result.npm_password_generated:
+        table.add_row("NPM password", f"[bold yellow]{config.npm.admin_password}[/bold yellow]")
+    table.add_row("WireGuard", f"{config.server.public_ip}:{config.wireguard.listen_port}/udp")
+    table.add_row("Hub key", config.wireguard.public_key)
+
+    console.print()
+    console.print(
+        Panel(
+            table,
+            title="[green]Setup complete[/green]"
+            if ok
+            else "[yellow]Setup finished with errors[/yellow]",
+            border_style="green" if ok else "yellow",
+        )
+    )
+    if result.panel_password_generated:
+        console.print(
+            "[yellow]Save the generated password now — it is not stored in plaintext. "
+            "You will be asked to change it at first sign-in.[/yellow]"
+        )
+
+    console.print(
+        "\nThe panel listens on "
+        f"[bold]{config.panel.bind}[/bold]. From your workstation:\n"
+        f"  [bold]ssh -L {config.panel.port}:{config.panel.bind}:{config.panel.port} "
+        f"root@{config.server.public_ip}[/bold]\n"
+        f"then open [bold]http://127.0.0.1:{config.panel.port}[/bold]\n"
+    )
+    console.print(
+        "Remember the firewall rules your cloud provider controls: allow inbound "
+        f"UDP {config.wireguard.listen_port}, TCP {config.npm.http_port} and "
+        f"TCP {config.npm.https_port}."
+    )
+    if not ok:
+        console.print("\n[yellow]Run `edgekit doctor` to see what still needs attention.[/yellow]")
+
+
+@app.command()
+def provision(
+    skip_packages: bool = typer.Option(False, "--skip-packages"),
+    skip_docker: bool = typer.Option(False, "--skip-docker"),
+    skip_cloudflare: bool = typer.Option(False, "--skip-cloudflare"),
+) -> None:
+    """Re-run provisioning. Safe at any time — every step checks before acting."""
+    require_root()
+    config = require_configured()
+    report = _run_provisioner(
+        config,
+        skip_packages=skip_packages,
+        skip_docker=skip_docker,
+        skip_cloudflare=skip_cloudflare,
+    )
+    raise typer.Exit(0 if report.ok else 2)
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("", help="Override the configured bind address."),
+    port: int = typer.Option(0, help="Override the configured port."),
+    reload: bool = typer.Option(False, "--reload", help="Auto-reload (development only)."),
+) -> None:
+    """Run the management panel in the foreground."""
+    import uvicorn
+
+    from .web.app import create_app
+
+    config = require_configured()
+    init_db()
+
+    bind = host or config.panel.bind
+    listen_port = port or config.panel.port
+    console.print(f"edgekit panel on http://{bind}:{listen_port}")
+
+    uvicorn.run(
+        create_app(config),
+        host=bind,
+        port=listen_port,
+        log_level="info",
+        reload=reload,
+        access_log=False,
+    )
+
+
+# ---------------------------------------------------------------------- status
+
+
+@app.command()
+def status() -> None:
+    """Show a one-screen summary of this edge server."""
+    config = require_configured()
+    with session_scope() as session:
+        service = PeerService(session, config)
+        peers = service.list()
+        live = service.status_map()
+        hosts = HostService(session, config).list()
+        cert_expiry = get_setting(session, SETTING_CERT_EXPIRY)
+
+    table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+    table.add_row("Public IP", config.server.public_ip)
+    interface_up = wg.interface_up(config.wireguard.interface)
+    table.add_row(
+        "WireGuard",
+        f"[{'green' if interface_up else 'red'}]"
+        f"{'up' if interface_up else 'down'}[/] "
+        f"{config.wireguard.interface} {config.wireguard.hub_address} "
+        f"port {config.wireguard.listen_port}",
+    )
+    connected = sum(1 for p in peers if (s := live.get(p.public_key)) and s.connected)
+    table.add_row("Peers", f"{connected} connected / {len(peers)} registered")
+    table.add_row("Proxy hosts", str(len(hosts)))
+    table.add_row(
+        "Cloudflare",
+        config.cloudflare.zone_name if config.cloudflare.enabled else "disabled",
+    )
+    table.add_row("Certificate", f"expires {cert_expiry[:10]}" if cert_expiry else "none")
+    console.print(Panel(table, title="edgekit", border_style="blue"))
+
+    if peers:
+        peer_table = Table(title="Peers", title_justify="left")
+        peer_table.add_column("Name")
+        peer_table.add_column("Address")
+        peer_table.add_column("State")
+        peer_table.add_column("Handshake")
+        for peer in peers:
+            state = live.get(peer.public_key)
+            if not peer.enabled:
+                label = "[dim]disabled[/dim]"
+            elif state and state.connected:
+                label = "[green]connected[/green]"
+            else:
+                label = "[red]offline[/red]"
+            handshake = "never"
+            if state and state.latest_handshake:
+                handshake = f"{int(time.time() - state.latest_handshake)}s ago"
+            peer_table.add_row(peer.name, peer.address, label, handshake)
+        console.print(peer_table)
+
+
+@app.command()
+def doctor() -> None:
+    """Run every health check and print what to do about the failures."""
+    config = require_configured()
+    with session_scope() as session:
+        peers = PeerService(session, config).list()
+        report = asyncio.run(health.run_all(config, peers))
+    report.checks.append(health.cloud_firewall_reminder(config))
+
+    for check in report.checks:
+        marker = {
+            health.Level.OK: "[green]✓[/green]",
+            health.Level.WARN: "[yellow]![/yellow]",
+            health.Level.FAIL: "[red]✗[/red]",
+            health.Level.SKIP: "[dim]•[/dim]",
+        }[check.level]
+        console.print(f"{marker} {check.title}"
+                      + (f" [dim]— {check.detail}[/dim]" if check.detail else ""))
+        if check.remedy:
+            console.print(f"    [yellow]{check.remedy}[/yellow]")
+
+    console.print()
+    if report.ok:
+        console.print("[green]All required checks passed.[/green]")
+    else:
+        console.print(f"[red]{len(report.failures)} check(s) failed.[/red]")
+    raise typer.Exit(0 if report.ok else 1)
+
+
+# ---------------------------------------------------------------------- peers
+
+
+@peer_app.command("add")
+def peer_add(
+    name: str = typer.Argument(..., help="Short name, e.g. raspberry-pi."),
+    description: str = typer.Option("", "--description", "-d"),
+    address: str = typer.Option("", "--address", help="Tunnel IP; default is the next free."),
+    public_key: str = typer.Option("", "--public-key", help="Register a client-generated key."),
+    routes: str = typer.Option("", "--routes", help="Extra CIDRs behind this peer."),
+    show_config: bool = typer.Option(True, "--show-config/--no-show-config"),
+) -> None:
+    """Register a peer and print its client configuration."""
+    require_root()
+    config = require_configured()
+    with session_scope() as session:
+        service = PeerService(session, config)
+        try:
+            peer = service.create(
+                name,
+                description=description,
+                address=address or None,
+                public_key=public_key or None,
+                extra_allowed_ips=routes,
+                actor="cli",
+            )
+            session.flush()
+            service.sync()
+            rendered = service.render_peer_config(peer) if show_config and not public_key else None
+            summary = (peer.name, peer.address, peer.public_key)
+        except PeerError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+
+    console.print(f"[green]✓[/green] {summary[0]} at {summary[1]}")
+    console.print(f"  public key: {summary[2]}")
+    if rendered:
+        console.print(Panel(rendered, title=f"{summary[0]} — /etc/wireguard/"
+                                            f"{config.wireguard.interface}.conf",
+                            border_style="blue"))
+
+
+@peer_app.command("list")
+def peer_list() -> None:
+    """List registered peers."""
+    config = require_configured()
+    with session_scope() as session:
+        service = PeerService(session, config)
+        peers = service.list()
+        live = service.status_map()
+
+    table = Table()
+    for column in ("ID", "Name", "Address", "Routed", "State", "Public key"):
+        table.add_column(column)
+    for peer in peers:
+        state = live.get(peer.public_key)
+        if not peer.enabled:
+            label = "[dim]disabled[/dim]"
+        elif state and state.connected:
+            label = "[green]connected[/green]"
+        else:
+            label = "[red]offline[/red]"
+        table.add_row(
+            str(peer.id), peer.name, peer.address, peer.allowed_ips, label,
+            peer.public_key[:16] + "…",
+        )
+    console.print(table if peers else "[dim]No peers registered.[/dim]")
+
+
+@peer_app.command("show")
+def peer_show(name: str) -> None:
+    """Print a peer's client configuration."""
+    require_root()
+    config = require_configured()
+    with session_scope() as session:
+        service = PeerService(session, config)
+        peer = service.get_by_name(name)
+        if peer is None:
+            console.print(f"[red]No peer named {name!r}.[/red]")
+            raise typer.Exit(1)
+        try:
+            rendered = service.render_peer_config(peer)
+        except PeerError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+    console.print(rendered)
+
+
+@peer_app.command("remove")
+def peer_remove(
+    name: str,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+) -> None:
+    """Remove a peer and re-sync the interface."""
+    require_root()
+    config = require_configured()
+    if not yes and not typer.confirm(f"Delete peer {name!r}?"):
+        raise typer.Exit(1)
+
+    with session_scope() as session:
+        service = PeerService(session, config)
+        peer = service.get_by_name(name)
+        if peer is None:
+            console.print(f"[red]No peer named {name!r}.[/red]")
+            raise typer.Exit(1)
+        try:
+            service.delete(peer.id, actor="cli")
+            session.flush()
+            service.sync()
+        except PeerError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+    console.print(f"[green]✓[/green] removed {name}")
+
+
+@peer_app.command("sync")
+def peer_sync() -> None:
+    """Regenerate wg0.conf from the database and apply it without dropping tunnels."""
+    require_root()
+    config = require_configured()
+    with session_scope() as session:
+        PeerService(session, config).sync()
+    console.print("[green]✓[/green] interface synchronised")
+
+
+# ---------------------------------------------------------------------- hosts
+
+
+@host_app.command("add")
+def host_add(
+    domain: str = typer.Argument(..., help="Public hostname, e.g. retro.example.com."),
+    port: int = typer.Argument(..., help="Port the service listens on."),
+    peer: str = typer.Option("", "--peer", help="Peer name to forward to."),
+    target: str = typer.Option("", "--target", help="Explicit forward address."),
+    scheme: str = typer.Option("http", "--scheme"),
+    no_dns: bool = typer.Option(False, "--no-dns", help="Skip the Cloudflare record."),
+) -> None:
+    """Publish a service: DNS record plus NPM proxy host with the origin certificate."""
+    require_root()
+    config = require_configured()
+
+    async def run() -> str:
+        with session_scope() as session:
+            service = HostService(session, config)
+            peer_id = None
+            if peer:
+                found = PeerService(session, config).get_by_name(peer)
+                if found is None:
+                    raise PeerError(f"No peer named {peer!r}")
+                peer_id = found.id
+            host = await service.create(
+                domain=domain,
+                forward_port=port,
+                peer_id=peer_id,
+                forward_host=target or None,
+                scheme=scheme,
+                manage_dns=not no_dns,
+                actor="cli",
+            )
+            return f"{host.domain} -> {host.target}"
+
+    try:
+        console.print(f"[green]✓[/green] {asyncio.run(run())}")
+    except Exception as exc:  # noqa: BLE001 - NPM and Cloudflare errors are user-facing
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+
+@host_app.command("list")
+def host_list() -> None:
+    """List published proxy hosts."""
+    config = require_configured()
+    with session_scope() as session:
+        hosts = HostService(session, config).list()
+
+    table = Table()
+    for column in ("ID", "Domain", "Target", "SSL", "NPM id"):
+        table.add_column(column)
+    for host in hosts:
+        table.add_row(
+            str(host.id), host.domain, f"{host.forward_host}:{host.forward_port}",
+            "forced" if host.force_ssl else "off", str(host.npm_host_id or "—"),
+        )
+    console.print(table if hosts else "[dim]No proxy hosts published.[/dim]")
+
+
+@host_app.command("remove")
+def host_remove(
+    domain: str,
+    remove_dns: bool = typer.Option(False, "--remove-dns"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Remove a proxy host from NPM and from edgekit."""
+    require_root()
+    config = require_configured()
+    if not yes and not typer.confirm(f"Remove {domain}?"):
+        raise typer.Exit(1)
+
+    async def run() -> str:
+        with session_scope() as session:
+            service = HostService(session, config)
+            match = next((h for h in service.list() if h.domain == domain), None)
+            if match is None:
+                raise RuntimeError(f"{domain} is not published")
+            return await service.delete(match.id, remove_dns=remove_dns, actor="cli")
+
+    try:
+        console.print(f"[green]✓[/green] removed {asyncio.run(run())}")
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+
+# ---------------------------------------------------------------------- certificates
+
+
+@cert_app.command("issue")
+def cert_issue(
+    force: bool = typer.Option(False, "--force", help="Reissue even if the current one is valid."),
+) -> None:
+    """Issue a Cloudflare origin certificate and install it into NPM."""
+    require_root()
+    config = require_configured()
+
+    async def run() -> dict:
+        with session_scope() as session:
+            return await certificates.issue_and_install(session, config, actor="cli", force=force)
+
+    try:
+        outcome = asyncio.run(run())
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(
+        f"[green]✓[/green] certificate {outcome['status']} "
+        f"(NPM id {outcome['certificate_id']}, expires {outcome.get('expires', '')[:10]})"
+    )
+
+
+@cert_app.command("status")
+def cert_status() -> None:
+    """Show the installed origin certificate."""
+    require_configured()
+    with session_scope() as session:
+        cert_id = get_setting(session, SETTING_CERT_ID)
+        expiry = get_setting(session, SETTING_CERT_EXPIRY)
+    if not cert_id:
+        console.print("[yellow]No origin certificate installed.[/yellow]")
+        raise typer.Exit(1)
+    console.print(f"NPM certificate id {cert_id}, expires {expiry[:10] or 'unknown'}")
+
+
+# ---------------------------------------------------------------------- users
+
+
+@user_app.command("create")
+def user_create(
+    username: str,
+    password: str = typer.Option("", "--password", help="Omit to generate one."),
+) -> None:
+    """Create a panel account."""
+    require_root()
+    require_configured()
+    init_db()
+
+    generated = not password
+    password = password or generate_password()
+    try:
+        check_password_strength(password)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    with session_scope() as session:
+        if session.query(User).filter_by(username=username).first():
+            console.print(f"[red]{username} already exists.[/red]")
+            raise typer.Exit(1)
+        session.add(
+            User(
+                username=username,
+                password_hash=hash_password(password),
+                must_change_password=generated,
+            )
+        )
+
+    console.print(f"[green]✓[/green] created {username}")
+    if generated:
+        console.print(f"  password: [bold yellow]{password}[/bold yellow]")
+
+
+@user_app.command("passwd")
+def user_passwd(
+    username: str,
+    password: str = typer.Option("", "--password", help="Omit to generate one."),
+) -> None:
+    """Reset a panel account's password."""
+    require_root()
+    require_configured()
+
+    generated = not password
+    password = password or generate_password()
+    try:
+        check_password_strength(password)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    with session_scope() as session:
+        user = session.query(User).filter_by(username=username).first()
+        if user is None:
+            console.print(f"[red]No account named {username!r}.[/red]")
+            raise typer.Exit(1)
+        user.password_hash = hash_password(password)
+        user.must_change_password = generated
+
+    console.print(f"[green]✓[/green] password updated for {username}")
+    if generated:
+        console.print(f"  password: [bold yellow]{password}[/bold yellow]")
+
+
+@user_app.command("list")
+def user_list() -> None:
+    """List panel accounts."""
+    require_configured()
+    with session_scope() as session:
+        users = session.query(User).order_by(User.username).all()
+        rows = [(u.username, u.last_login_at, u.must_change_password) for u in users]
+
+    table = Table()
+    for column in ("Username", "Last login", "Must change password"):
+        table.add_column(column)
+    for username, last_login, must_change in rows:
+        table.add_row(
+            username,
+            last_login.strftime("%Y-%m-%d %H:%M") if last_login else "never",
+            "yes" if must_change else "no",
+        )
+    console.print(table)
+
+
+def main() -> None:
+    try:
+        app()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

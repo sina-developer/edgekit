@@ -1,0 +1,412 @@
+"""The provisioner: the guide, encoded as idempotent steps.
+
+Every step is safe to re-run. That is the property that makes this usable across many
+servers and across repeated runs on the same server — a partially provisioned host converges
+rather than erroring or duplicating state. Steps report progress through a callback so the
+CLI and the panel can both render the same run.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import socket
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+import httpx
+
+from ..config import Config
+from ..db import session_scope
+from ..models import AuditLog
+from ..paths import NPM_DIR, ensure_dirs
+from ..rendering import render
+from ..system import dockerx, firewall, packages, sysctl
+from ..system import wireguard as wg
+from ..system.shell import is_root
+from . import certificates
+from .npm import NPMClient
+from .peers import PeerService
+
+log = logging.getLogger("edgekit.provision")
+
+
+class StepStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+@dataclass
+class StepResult:
+    key: str
+    title: str
+    status: StepStatus
+    detail: str = ""
+
+
+@dataclass
+class ProvisionReport:
+    results: list[StepResult] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not any(r.status is StepStatus.FAILED for r in self.results)
+
+    @property
+    def failures(self) -> list[StepResult]:
+        return [r for r in self.results if r.status is StepStatus.FAILED]
+
+
+EventCallback = Callable[[StepResult], None] | None
+
+
+class ProvisionError(RuntimeError):
+    pass
+
+
+class SkipStep(Exception):
+    """Raised inside a step to record it as skipped rather than failed."""
+
+
+#: Steps whose failure makes everything after them meaningless.
+_FATAL_STEPS = {"preflight", "wireguard_keys", "wireguard_up"}
+
+
+class Provisioner:
+    """Runs the full setup. Construct with a validated :class:`Config` and call :meth:`run`."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        skip_packages: bool = False,
+        skip_docker: bool = False,
+        skip_cloudflare: bool = False,
+        on_event: EventCallback = None,
+    ) -> None:
+        self.config = config
+        self.skip_packages = skip_packages
+        self.skip_docker = skip_docker
+        self.skip_cloudflare = skip_cloudflare
+        self.on_event = on_event
+        self.report = ProvisionReport()
+
+    # ---------------------------------------------------------------- runner
+
+    def _emit(self, result: StepResult) -> None:
+        if self.on_event:
+            try:
+                self.on_event(result)
+            except Exception:  # noqa: BLE001 - a broken listener must not fail provisioning
+                log.exception("provision event listener raised")
+
+    async def _step(
+        self, key: str, title: str, fn: Callable[[], Any | Awaitable[Any]]
+    ) -> StepResult:
+        self._emit(StepResult(key, title, StepStatus.RUNNING))
+        try:
+            outcome = fn()
+            if asyncio.iscoroutine(outcome):
+                outcome = await outcome
+        except SkipStep as skip:
+            result = StepResult(key, title, StepStatus.SKIPPED, str(skip))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator verbatim
+            log.exception("step %s failed", key)
+            result = StepResult(key, title, StepStatus.FAILED, str(exc))
+        else:
+            result = StepResult(key, title, StepStatus.DONE, str(outcome or ""))
+
+        self.report.results.append(result)
+        self._emit(result)
+        return result
+
+    async def run(self) -> ProvisionReport:
+        steps: list[tuple[str, str, Callable[[], Any]]] = [
+            ("preflight", "Preflight checks", self.step_preflight),
+            ("packages", "Install base packages", self.step_base_packages),
+            ("wireguard_install", "Install WireGuard", self.step_install_wireguard),
+            ("wireguard_keys", "Generate hub keypair", self.step_hub_keys),
+            ("wireguard_up", "Configure and start wg0", self.step_wireguard_interface),
+            ("sysctl", "Enable IP forwarding", self.step_sysctl),
+            ("docker_install", "Install Docker", self.step_install_docker),
+            ("host_nginx", "Free ports 80/443", self.step_stop_host_nginx),
+            ("npm_deploy", "Deploy Nginx Proxy Manager", self.step_deploy_npm),
+            ("npm_bootstrap", "Secure the NPM admin account", self.step_bootstrap_npm),
+            ("firewall", "Bridge Docker to WireGuard", self.step_firewall),
+            ("cloudflare_zone", "Verify Cloudflare zone", self.step_cloudflare_zone),
+            ("cloudflare_dns", "Publish DNS records", self.step_cloudflare_dns),
+            ("cloudflare_ssl", "Set SSL mode to Full (strict)", self.step_cloudflare_ssl),
+            ("origin_cert", "Issue and install origin certificate", self.step_origin_certificate),
+            ("persist", "Save configuration", self.step_persist),
+        ]
+
+        for key, title, fn in steps:
+            result = await self._step(key, title, fn)
+            if result.status is StepStatus.FAILED and key in _FATAL_STEPS:
+                log.error("aborting: %s is required and failed", key)
+                break
+
+        with session_scope() as session:
+            session.add(
+                AuditLog(
+                    action="provision.run",
+                    target=self.config.server.public_ip,
+                    detail=f"{len(self.report.results)} steps, "
+                           f"{len(self.report.failures)} failed",
+                    success=self.report.ok,
+                )
+            )
+        return self.report
+
+    # ---------------------------------------------------------------- steps
+
+    def step_preflight(self) -> str:
+        if not is_root():
+            raise ProvisionError("edgekit must provision as root (use sudo)")
+
+        ensure_dirs()
+        info = packages.require_debian_like()
+
+        if not self.config.server.public_ip:
+            detected = detect_public_ip()
+            if not detected:
+                raise ProvisionError(
+                    "Could not determine this server's public IP. Set server.public_ip in "
+                    "/etc/edgekit/config.yaml and re-run."
+                )
+            self.config.server.public_ip = detected
+        if not self.config.server.hostname:
+            self.config.server.hostname = socket.gethostname()
+
+        return (
+            f"{info.get('PRETTY_NAME', 'Linux')}, public IP {self.config.server.public_ip}"
+        )
+
+    def step_base_packages(self) -> str:
+        if self.skip_packages:
+            raise SkipStep("--skip-packages")
+        packages.install_base()
+        return "base packages present"
+
+    def step_install_wireguard(self) -> str:
+        if self.skip_packages:
+            raise SkipStep("--skip-packages")
+        packages.install_wireguard()
+        return packages.wireguard_version() or "installed"
+
+    def step_hub_keys(self) -> str:
+        cfg = self.config.wireguard
+        if cfg.private_key and cfg.public_key:
+            return "existing keypair reused"
+        if cfg.private_key and not cfg.public_key:
+            cfg.public_key = wg.derive_public_key(cfg.private_key)
+            return "public key derived from existing private key"
+        keypair = wg.generate_keypair()
+        cfg.private_key, cfg.public_key = keypair.private_key, keypair.public_key
+        return f"new keypair, public key {cfg.public_key}"
+
+    def step_wireguard_interface(self) -> str:
+        cfg = self.config.wireguard
+        with session_scope() as session:
+            peers = PeerService(session, self.config)
+            wg.write_config(cfg.interface, peers.render_interface_config())
+            peer_count = len([p for p in peers.list() if p.enabled])
+
+        wg.bring_up(cfg.interface)
+        wg.apply_config(cfg.interface)
+        wg.enable_at_boot(cfg.interface)
+        return f"{cfg.interface} up on {cfg.hub_address} with {peer_count} peer(s)"
+
+    def step_sysctl(self) -> str:
+        sysctl.apply()
+        failed = [k for k, ok in sysctl.verify().items() if not ok]
+        if failed:
+            raise ProvisionError(f"could not set: {', '.join(failed)}")
+        return "net.ipv4.ip_forward = 1"
+
+    def step_install_docker(self) -> str:
+        if self.skip_packages or self.skip_docker:
+            raise SkipStep("skipped by flag")
+        packages.install_docker()
+        engine, compose = packages.docker_versions()
+        return f"{engine or 'docker'} / {compose or 'compose'}"
+
+    def step_stop_host_nginx(self) -> str:
+        if self.skip_docker:
+            raise SkipStep("--skip-docker")
+        acted = packages.stop_host_nginx()
+        return "host nginx stopped and disabled" if acted else "no host nginx running"
+
+    def step_deploy_npm(self) -> str:
+        if self.skip_docker or not self.config.npm.enabled:
+            raise SkipStep("NPM deployment disabled")
+
+        npm = self.config.npm
+        content = render(
+            "docker-compose.yml.j2",
+            image=npm.image,
+            container_name=npm.container_name,
+            http_port=npm.http_port,
+            https_port=npm.https_port,
+            admin_port=npm.admin_port,
+            admin_bind=npm.admin_bind,
+        )
+        dockerx.write_compose_file(content)
+        dockerx.validate()
+        dockerx.up()
+
+        state = dockerx.container_state(npm.container_name)
+        if not state.get("running"):
+            raise ProvisionError(
+                f"container {npm.container_name} is not running "
+                f"({state.get('status')}). Recent logs:\n"
+                + dockerx.logs(npm.container_name, 30)
+            )
+        return f"{npm.container_name} running from {NPM_DIR}"
+
+    async def step_bootstrap_npm(self) -> str:
+        if self.skip_docker or not self.config.npm.enabled:
+            raise SkipStep("NPM deployment disabled")
+
+        npm = self.config.npm
+        if not (npm.admin_email and npm.admin_password):
+            raise ProvisionError("NPM admin email and password must be set before provisioning")
+
+        async with NPMClient(npm.api_base, npm.admin_email, npm.admin_password) as client:
+            await client.wait_until_ready()
+            rotated = await client.bootstrap_admin(npm.admin_email, npm.admin_password)
+            user = await client.me()
+
+        return (
+            f"admin is {user.get('email', npm.admin_email)}"
+            + (" (default credentials rotated)" if rotated else "")
+        )
+
+    def step_firewall(self) -> str:
+        if self.skip_docker:
+            raise SkipStep("--skip-docker")
+
+        docker_subnet = firewall.detect_docker_bridge_subnet(
+            self.config.server.docker_bridge_subnet
+        )
+        self.config.server.docker_bridge_subnet = docker_subnet
+        docker_if = firewall.detect_docker_bridge_interface()
+        wg_if = self.config.wireguard.interface
+        wg_subnet = self.config.wireguard.subnet
+
+        firewall.write_rules(
+            docker_subnet=docker_subnet,
+            wg_subnet=wg_subnet,
+            wg_if=wg_if,
+            docker_if=docker_if,
+        )
+        firewall.apply_rules()
+
+        if not firewall.rules_present(
+            docker_subnet=docker_subnet, wg_subnet=wg_subnet, wg_if=wg_if, docker_if=docker_if
+        ):
+            raise ProvisionError("forwarding rules did not apply; check `iptables -S`")
+
+        opened = firewall.open_host_ports(
+            wg_port=self.config.wireguard.listen_port,
+            http_port=self.config.npm.http_port,
+            https_port=self.config.npm.https_port,
+        )
+        suffix = f"; ufw opened {', '.join(opened)}" if opened else ""
+        return f"{docker_if} ({docker_subnet}) -> {wg_if} ({wg_subnet}){suffix}"
+
+    async def step_cloudflare_zone(self) -> str:
+        cf = self.config.cloudflare
+        if self.skip_cloudflare or not cf.enabled:
+            raise SkipStep("Cloudflare integration disabled")
+        if not cf.api_token:
+            raise ProvisionError("Cloudflare is enabled but no API token is configured")
+
+        from .cloudflare import CloudflareClient
+
+        async with CloudflareClient(cf.api_token, origin_ca_key=cf.origin_ca_key) as client:
+            await client.verify_token()
+            cf.zone_id = await client.get_zone_id(cf.zone_name)
+        return f"zone {cf.zone_name} = {cf.zone_id}"
+
+    async def step_cloudflare_dns(self) -> str:
+        cf = self.config.cloudflare
+        if self.skip_cloudflare or not (cf.enabled and cf.zone_id):
+            raise SkipStep("Cloudflare integration disabled")
+
+        from .cloudflare import CloudflareClient
+
+        ip = self.config.server.public_ip
+        names = [cf.zone_name, f"*.{cf.zone_name}"]
+        async with CloudflareClient(cf.api_token, origin_ca_key=cf.origin_ca_key) as client:
+            for name in names:
+                await client.upsert_a_record(cf.zone_id, name, ip, proxied=cf.proxied)
+        return f"{', '.join(names)} -> {ip}" + (" (proxied)" if cf.proxied else "")
+
+    async def step_cloudflare_ssl(self) -> str:
+        cf = self.config.cloudflare
+        if self.skip_cloudflare or not (cf.enabled and cf.zone_id and cf.manage_ssl_mode):
+            raise SkipStep("SSL mode management disabled")
+
+        from .cloudflare import CloudflareClient
+
+        async with CloudflareClient(cf.api_token, origin_ca_key=cf.origin_ca_key) as client:
+            mode = await client.set_ssl_mode(cf.zone_id, cf.ssl_mode)
+        return f"SSL mode = {mode}"
+
+    async def step_origin_certificate(self) -> str:
+        cf = self.config.cloudflare
+        if self.skip_cloudflare or not (cf.enabled and cf.zone_id) or self.skip_docker:
+            raise SkipStep("Cloudflare integration disabled")
+
+        with session_scope() as session:
+            outcome = await certificates.issue_and_install(session, self.config)
+        return (
+            f"{outcome['status']}, NPM certificate id {outcome['certificate_id']}"
+            + (f", expires {outcome['expires'][:10]}" if outcome.get("expires") else "")
+        )
+
+    def step_persist(self) -> str:
+        self.config.save()
+        return "written to /etc/edgekit/config.yaml"
+
+
+def detect_public_ip(timeout: float = 5.0) -> str | None:
+    """Discover the server's public IPv4.
+
+    Cloud metadata first (authoritative, no internet round-trip), then public reflectors.
+    """
+    metadata_sources = (
+        # AWS IMDSv2 requires a token; IMDSv1 still answers on most images.
+        ("http://169.254.169.254/latest/meta-data/public-ipv4", {}),
+        ("http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/"
+         "access-configs/0/external-ip", {"Metadata-Flavor": "Google"}),
+    )
+    public_sources = ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")
+
+    with httpx.Client(timeout=timeout) as client:
+        for url, headers in metadata_sources:
+            try:
+                response = client.get(url, headers=headers)
+                if response.status_code == 200 and _looks_like_ipv4(response.text.strip()):
+                    return response.text.strip()
+            except httpx.HTTPError:
+                continue
+        for url in public_sources:
+            try:
+                response = client.get(url)
+                if response.status_code == 200 and _looks_like_ipv4(response.text.strip()):
+                    return response.text.strip()
+            except httpx.HTTPError:
+                continue
+    return None
+
+
+def _looks_like_ipv4(value: str) -> bool:
+    parts = value.split(".")
+    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)

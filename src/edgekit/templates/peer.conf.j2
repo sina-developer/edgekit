@@ -1,0 +1,21 @@
+# edgekit peer config — {{ peer.name }}
+# Install on the client as /etc/wireguard/{{ interface }}.conf (chmod 600), then:
+#   sudo wg-quick up {{ interface }} && sudo systemctl enable wg-quick@{{ interface }}
+[Interface]
+PrivateKey = {{ private_key }}
+Address = {{ peer.address }}/{{ prefix_len }}
+{%- if dns %}
+DNS = {{ dns }}
+{%- endif %}
+{%- if mtu %}
+MTU = {{ mtu }}
+{%- endif %}
+
+[Peer]
+PublicKey = {{ hub_public_key }}
+{%- if peer.preshared_key %}
+PresharedKey = {{ peer.preshared_key }}
+{%- endif %}
+Endpoint = {{ endpoint }}
+AllowedIPs = {{ allowed_ips }}
+PersistentKeepalive = {{ peer.keepalive }}

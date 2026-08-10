@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Container logs — edgekit{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ config.npm.container_name }}</h1>
+  <div>
+    <a class="button small" href="/logs?lines=50">50</a>
+    <a class="button small" href="/logs?lines=200">200</a>
+    <a class="button small" href="/logs?lines=1000">1000</a>
+  </div>
+</div>
+
+<section class="card">
+  <pre class="code scroll">{{ output }}</pre>
+</section>
+{% endblock %}

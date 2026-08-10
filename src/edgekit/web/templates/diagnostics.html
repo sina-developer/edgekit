@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Diagnostics — edgekit{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Diagnostics</h1>
+  <a class="button small" href="/diagnostics">Re-run</a>
+</div>
+
+<div class="flash {{ 'ok' if report.ok else 'bad' }}">
+  {% if report.ok %}
+    Every required check passed.
+  {% else %}
+    {{ report.failures|length }} check(s) failed.
+  {% endif %}
+  {% if report.warnings %} {{ report.warnings|length }} warning(s).{% endif %}
+</div>
+
+<section class="card">
+  <table class="checks-table">
+    <tbody>
+    {% for check in report.checks %}
+      <tr class="lvl-{{ check.level.value }}">
+        <td class="status">
+          {% if check.level.value == 'ok' %}<span class="pill ok">pass</span>
+          {% elif check.level.value == 'warn' %}<span class="pill warn">warn</span>
+          {% elif check.level.value == 'fail' %}<span class="pill bad">fail</span>
+          {% else %}<span class="pill">skip</span>{% endif %}
+        </td>
+        <td>
+          <strong>{{ check.title }}</strong>
+          {% if check.detail %}<div class="muted small">{{ check.detail }}</div>{% endif %}
+          {% if check.remedy %}<div class="remedy">{{ check.remedy }}</div>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>Commands worth knowing</h2>
+  <pre class="code">sudo wg show
+sudo systemctl status wg-quick@{{ config.wireguard.interface }} --no-pager
+sudo docker logs {{ config.npm.container_name }} --tail 100
+sudo ss -ltnp | grep -E ':{{ config.npm.http_port }}|:{{ config.npm.https_port }}|:{{ config.npm.admin_port }}'
+sudo docker exec {{ config.npm.container_name }} curl -I --connect-timeout 5 http://PEER_IP:PORT
+edgekit doctor</pre>
+</section>
+{% endblock %}

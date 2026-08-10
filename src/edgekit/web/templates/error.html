@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}{{ status_code }} — edgekit{% endblock %}
+{% block main_class %}centred{% endblock %}
+
+{% block content %}
+<div class="card auth">
+  <h1>{{ status_code }}</h1>
+  <p class="muted">{{ detail }}</p>
+  <p><a class="button" href="/">Back to overview</a></p>
+</div>
+{% endblock %}

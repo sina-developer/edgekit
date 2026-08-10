@@ -1,0 +1,18 @@
+# Managed by edgekit — regenerated from the database on every peer change.
+# Manual edits will be lost. Use `edgekit peer ...` or the panel instead.
+[Interface]
+Address = {{ hub_address }}
+ListenPort = {{ listen_port }}
+PrivateKey = {{ private_key }}
+{%- if mtu %}
+MTU = {{ mtu }}
+{%- endif %}
+{% for peer in peers %}
+# {{ peer.name }}{% if peer.description %} — {{ peer.description }}{% endif %}
+[Peer]
+PublicKey = {{ peer.public_key }}
+{%- if peer.preshared_key %}
+PresharedKey = {{ peer.preshared_key }}
+{%- endif %}
+AllowedIPs = {{ peer.allowed_ips }}
+{% endfor %}

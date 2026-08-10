@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Audit log — edgekit{% endblock %}
+
+{% block content %}
+<h1>Audit log</h1>
+
+<section class="card">
+  <table>
+    <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th><th></th></tr></thead>
+    <tbody>
+    {% for entry in entries %}
+      <tr>
+        <td class="muted nowrap">{{ entry.created_at|relative_time }}</td>
+        <td>{{ entry.actor }}</td>
+        <td class="mono">{{ entry.action }}</td>
+        <td>{{ entry.target }}</td>
+        <td class="muted small">{{ entry.detail }}</td>
+        <td>{% if not entry.success %}<span class="pill bad">failed</span>{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td class="empty" colspan="6">Nothing recorded yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="pager">
+    {% if page > 1 %}<a class="button small" href="/audit?page={{ page - 1 }}">Newer</a>{% endif %}
+    <span class="muted">Page {{ page }}</span>
+    {% if has_next %}<a class="button small" href="/audit?page={{ page + 1 }}">Older</a>{% endif %}
+  </div>
+</section>
+{% endblock %}

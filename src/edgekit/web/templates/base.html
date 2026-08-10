@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}edgekit{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+{% if user is defined and user %}
+<header class="topbar">
+  <a class="brand" href="/">edge<span>kit</span></a>
+  <nav>
+    <a href="/" class="{{ 'active' if request.url.path == '/' }}">Overview</a>
+    <a href="/peers" class="{{ 'active' if request.url.path.startswith('/peers') }}">Peers</a>
+    <a href="/hosts" class="{{ 'active' if request.url.path.startswith('/hosts') }}">Proxy hosts</a>
+    <a href="/diagnostics" class="{{ 'active' if request.url.path == '/diagnostics' }}">Diagnostics</a>
+    <a href="/settings" class="{{ 'active' if request.url.path.startswith('/settings') }}">Settings</a>
+    <a href="/audit" class="{{ 'active' if request.url.path == '/audit' }}">Audit</a>
+  </nav>
+  <form method="post" action="/logout" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <span class="who">{{ user.username }}</span>
+    <button class="link" type="submit">Sign out</button>
+  </form>
+</header>
+{% endif %}
+
+<main class="{% block main_class %}{% endblock %}">
+  {% if notice %}<div class="flash ok">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="flash bad">{{ error }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="foot">edgekit {{ version }}</footer>
+<script src="/static/app.js" defer></script>
+</body>
+</html>

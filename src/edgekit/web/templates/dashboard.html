@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}Overview — edgekit{% endblock %}
+
+{% block content %}
+<h1>Overview</h1>
+
+<section class="tiles">
+  <div class="tile {{ 'good' if interface_up else 'bad' }}">
+    <span class="label">WireGuard</span>
+    <strong>{{ 'Up' if interface_up else 'Down' }}</strong>
+    <span class="muted">{{ config.wireguard.interface }} · {{ config.wireguard.hub_address }}</span>
+  </div>
+  <div class="tile {{ 'good' if connected_count == peers|selectattr('enabled')|list|length and peers else 'warn' if peers else '' }}">
+    <span class="label">Peers connected</span>
+    <strong>{{ connected_count }} / {{ peers|length }}</strong>
+    <span class="muted">handshake within 3 minutes</span>
+  </div>
+  <div class="tile {{ 'good' if container.running else 'bad' }}">
+    <span class="label">Proxy manager</span>
+    <strong>{{ 'Running' if container.running else (container.status or 'absent')|title }}</strong>
+    <span class="muted">{{ config.npm.container_name }}</span>
+  </div>
+  <div class="tile {{ 'good' if cert_name else 'warn' }}">
+    <span class="label">Origin certificate</span>
+    <strong>{{ 'Installed' if cert_name else 'None' }}</strong>
+    <span class="muted">
+      {% if cert_expiry %}expires {{ cert_expiry[:10] }}{% else %}no certificate in NPM{% endif %}
+    </span>
+  </div>
+</section>
+
+<section class="split">
+  <div class="card">
+    <div class="card-head">
+      <h2>Peers</h2>
+      <a class="button small" href="/peers">Manage</a>
+    </div>
+    {% if peers %}
+    <table>
+      <thead><tr><th>Name</th><th>Address</th><th>State</th><th>Traffic</th></tr></thead>
+      <tbody>
+      {% for peer in peers %}
+        {% set state = live.get(peer.public_key) %}
+        <tr>
+          <td><a href="/peers/{{ peer.id }}">{{ peer.name }}</a></td>
+          <td class="mono">{{ peer.address }}</td>
+          <td>
+            {% if not peer.enabled %}<span class="pill">disabled</span>
+            {% elif state and state.connected %}<span class="pill ok">connected</span>
+            {% else %}<span class="pill bad">offline</span>{% endif %}
+          </td>
+          <td class="muted">
+            {% if state %}&darr; {{ state.rx_bytes|human_bytes }} &uarr; {{ state.tx_bytes|human_bytes }}
+            {% else %}&mdash;{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty">No peers yet. <a href="/peers">Add the first one</a> — you get a ready
+      config and QR code back.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Proxy hosts</h2>
+      <a class="button small" href="/hosts">Manage</a>
+    </div>
+    {% if hosts %}
+    <table>
+      <thead><tr><th>Domain</th><th>Target</th><th>SSL</th></tr></thead>
+      <tbody>
+      {% for host in hosts %}
+        <tr>
+          <td><a href="https://{{ host.domain }}" rel="noreferrer noopener" target="_blank">{{ host.domain }}</a></td>
+          <td class="mono">{{ host.forward_host }}:{{ host.forward_port }}</td>
+          <td>{% if host.force_ssl %}<span class="pill ok">forced</span>{% else %}<span class="pill">off</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty">No proxy hosts yet. <a href="/hosts">Publish a service</a>.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <h2>Recent activity</h2>
+    <a class="button small" href="/audit">Full log</a>
+  </div>
+  <table>
+    <tbody>
+    {% for entry in recent %}
+      <tr>
+        <td class="muted nowrap">{{ entry.created_at|relative_time }}</td>
+        <td class="mono">{{ entry.action }}</td>
+        <td>{{ entry.target }}</td>
+        <td class="muted">{{ entry.detail }}</td>
+        <td>{% if not entry.success %}<span class="pill bad">failed</span>{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td class="empty" colspan="5">Nothing recorded yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

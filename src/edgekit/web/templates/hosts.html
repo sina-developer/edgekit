@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Proxy hosts — edgekit{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Proxy hosts</h1>
+  <form method="post" action="/hosts/resync" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <button class="button small" type="submit">Re-push all to NPM</button>
+  </form>
+</div>
+
+{% if not certificate_id %}
+<div class="flash warn">
+  No origin certificate is installed, so hosts will be created without SSL and Cloudflare
+  will return 525 while it is set to Full (strict).
+  <a href="/settings">Issue one in Settings</a>.
+</div>
+{% endif %}
+
+<section class="card">
+  <h2>Publish a service</h2>
+  <p class="muted">
+    Creates the Cloudflare A record, then the NPM proxy host with
+    {% if cert_name %}<strong>{{ cert_name }}</strong>{% else %}the installed certificate{% endif %}
+    attached. No Nginx config editing, no new WireGuard peer.
+  </p>
+  <form method="post" action="/hosts" class="grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <label>Domain
+      <input type="text" name="domain" required placeholder="retro.{{ config.cloudflare.zone_name or 'example.com' }}">
+    </label>
+    <label>Peer
+      <select name="peer_id">
+        <option value="">— explicit address —</option>
+        {% for peer in peers %}
+        <option value="{{ peer.id }}">{{ peer.name }} ({{ peer.address }})</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Forward host <span class="muted">(if no peer)</span>
+      <input type="text" name="forward_host" placeholder="10.50.0.2" class="mono">
+    </label>
+    <label>Forward port
+      <input type="number" name="forward_port" required min="1" max="65535" placeholder="3001">
+    </label>
+    <label>Scheme
+      <select name="scheme">
+        <option value="http" selected>http</option>
+        <option value="https">https</option>
+      </select>
+    </label>
+    <div class="checks">
+      <label class="check"><input type="checkbox" name="force_ssl" value="true" checked> Force SSL</label>
+      <label class="check"><input type="checkbox" name="http2" value="true" checked> HTTP/2</label>
+      <label class="check"><input type="checkbox" name="websockets" value="true" checked> WebSockets</label>
+      <label class="check"><input type="checkbox" name="block_exploits" value="true" checked> Block common exploits</label>
+      <label class="check">
+        <input type="checkbox" name="manage_dns" value="true" {{ 'checked' if config.cloudflare.enabled }}
+               {{ 'disabled' if not config.cloudflare.enabled }}>
+        Create the Cloudflare DNS record
+      </label>
+    </div>
+    <div class="actions"><button class="primary" type="submit">Publish</button></div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Published</h2>
+  <table>
+    <thead><tr><th>Domain</th><th>Target</th><th>Options</th><th>IDs</th><th></th></tr></thead>
+    <tbody>
+    {% for host in hosts %}
+      <tr>
+        <td>
+          <a href="https://{{ host.domain }}" target="_blank" rel="noreferrer noopener">{{ host.domain }}</a>
+        </td>
+        <td class="mono">
+          {{ host.scheme }}://{{ host.forward_host }}:{{ host.forward_port }}
+          {% if host.peer %}<div class="muted small">via {{ host.peer.name }}</div>{% endif %}
+        </td>
+        <td class="small">
+          {% if host.force_ssl %}<span class="pill ok">SSL</span>{% endif %}
+          {% if host.http2 %}<span class="pill">h2</span>{% endif %}
+          {% if host.websockets %}<span class="pill">ws</span>{% endif %}
+        </td>
+        <td class="muted small mono">
+          npm:{{ host.npm_host_id or '—' }}<br>
+          dns:{{ 'yes' if host.cloudflare_record_id else '—' }}
+        </td>
+        <td class="row-actions">
+          <details>
+            <summary class="link">Edit</summary>
+            <form method="post" action="/hosts/{{ host.id }}/update" class="grid tight">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+              <label>Peer
+                <select name="peer_id">
+                  <option value="">— explicit —</option>
+                  {% for peer in peers %}
+                  <option value="{{ peer.id }}" {{ 'selected' if host.peer_id == peer.id }}>
+                    {{ peer.name }}
+                  </option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>Forward host
+                <input type="text" name="forward_host" value="{{ host.forward_host }}" class="mono">
+              </label>
+              <label>Port
+                <input type="number" name="forward_port" value="{{ host.forward_port }}" min="1" max="65535">
+              </label>
+              <label>Scheme
+                <select name="scheme">
+                  <option value="http" {{ 'selected' if host.scheme == 'http' }}>http</option>
+                  <option value="https" {{ 'selected' if host.scheme == 'https' }}>https</option>
+                </select>
+              </label>
+              <div class="checks">
+                <label class="check"><input type="checkbox" name="force_ssl" value="true" {{ 'checked' if host.force_ssl }}> Force SSL</label>
+                <label class="check"><input type="checkbox" name="http2" value="true" {{ 'checked' if host.http2 }}> HTTP/2</label>
+                <label class="check"><input type="checkbox" name="websockets" value="true" {{ 'checked' if host.websockets }}> WebSockets</label>
+                <label class="check"><input type="checkbox" name="block_exploits" value="true" {{ 'checked' if host.block_exploits }}> Block exploits</label>
+              </div>
+              <div class="actions"><button class="primary small" type="submit">Save</button></div>
+            </form>
+          </details>
+          <form method="post" action="/hosts/{{ host.id }}/delete" class="inline"
+                data-confirm="Remove {{ host.domain }} from NPM?">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <label class="check small"><input type="checkbox" name="remove_dns" value="true"> +DNS</label>
+            <button class="link danger" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td class="empty" colspan="5">Nothing published yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

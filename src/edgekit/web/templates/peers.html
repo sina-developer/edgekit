@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Peers — edgekit{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Peers</h1>
+  <form method="post" action="/peers/sync" class="inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <button class="button small" type="submit">Re-sync interface</button>
+  </form>
+</div>
+
+<section class="card">
+  <h2>Add a peer</h2>
+  <p class="muted">
+    Leave the public key blank and edgekit generates the keypair, so you get a ready-to-use
+    config and QR code. Supply a public key instead if the private key should never leave the
+    client.
+  </p>
+  <form method="post" action="/peers" class="grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <label>Name
+      <input type="text" name="name" required placeholder="raspberry-pi" pattern="[a-zA-Z0-9][a-zA-Z0-9 ._\-]{0,62}[a-zA-Z0-9]">
+    </label>
+    <label>Description
+      <input type="text" name="description" placeholder="Home Pi running retro + api">
+    </label>
+    <label>Tunnel address
+      <input type="text" name="address" placeholder="{{ suggested_address }}" value="">
+      <small>Blank assigns {{ suggested_address or 'the next free address' }}.</small>
+    </label>
+    <label>Public key <span class="muted">(optional)</span>
+      <input type="text" name="public_key" placeholder="generated automatically" class="mono">
+    </label>
+    <label>Extra routed CIDRs
+      <input type="text" name="extra_allowed_ips" placeholder="192.168.1.0/24" class="mono">
+      <small>Networks behind this peer that the hub should route to it.</small>
+    </label>
+    <label>Keepalive (s)
+      <input type="number" name="keepalive" value="25" min="0" max="3600">
+      <small>25 keeps NAT bindings alive for peers behind a home router.</small>
+    </label>
+    <label class="check">
+      <input type="checkbox" name="use_preshared_key" value="true" checked>
+      Add a pre-shared key
+    </label>
+    <div class="actions"><button class="primary" type="submit">Create peer</button></div>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Registered peers</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th><th>Address</th><th>Routed</th><th>State</th>
+        <th>Handshake</th><th>Traffic</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for peer in peers %}
+      {% set state = live.get(peer.public_key) %}
+      <tr>
+        <td>
+          <a href="/peers/{{ peer.id }}"><strong>{{ peer.name }}</strong></a>
+          {% if peer.description %}<div class="muted small">{{ peer.description }}</div>{% endif %}
+        </td>
+        <td class="mono">{{ peer.address }}</td>
+        <td class="mono small">{{ peer.allowed_ips }}</td>
+        <td>
+          {% if not peer.enabled %}<span class="pill">disabled</span>
+          {% elif state and state.connected %}<span class="pill ok">connected</span>
+          {% else %}<span class="pill bad">offline</span>{% endif %}
+        </td>
+        <td class="muted nowrap">{{ state.latest_handshake|relative_time if state else 'never' }}</td>
+        <td class="muted nowrap">
+          {% if state %}&darr; {{ state.rx_bytes|human_bytes }}<br>&uarr; {{ state.tx_bytes|human_bytes }}{% else %}&mdash;{% endif %}
+        </td>
+        <td class="row-actions">
+          <form method="post" action="/peers/{{ peer.id }}/toggle" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <button class="link" type="submit">{{ 'Disable' if peer.enabled else 'Enable' }}</button>
+          </form>
+          <form method="post" action="/peers/{{ peer.id }}/delete" class="inline"
+                data-confirm="Delete peer {{ peer.name }}? It will lose access immediately.">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <button class="link danger" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td class="empty" colspan="7">No peers registered yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

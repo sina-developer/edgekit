@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}{{ peer.name }} — edgekit{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>{{ peer.name }}</h1>
+  <a class="button small" href="/peers">Back to peers</a>
+</div>
+
+<section class="split">
+  <div class="card">
+    <h2>Details</h2>
+    <dl class="kv">
+      <dt>Tunnel address</dt><dd class="mono">{{ peer.address }}</dd>
+      <dt>Routed networks</dt><dd class="mono">{{ peer.allowed_ips }}</dd>
+      <dt>Public key</dt><dd class="mono breakable">{{ peer.public_key }}</dd>
+      <dt>Pre-shared key</dt><dd>{{ 'yes' if peer.preshared_key else 'no' }}</dd>
+      <dt>Private key held</dt>
+      <dd>{{ 'yes, by edgekit' if peer.private_key else 'no — client-generated' }}</dd>
+      <dt>State</dt>
+      <dd>
+        {% if not peer.enabled %}<span class="pill">disabled</span>
+        {% elif live and live.connected %}<span class="pill ok">connected</span>
+        {% else %}<span class="pill bad">offline</span>{% endif %}
+      </dd>
+      <dt>Last handshake</dt>
+      <dd>{{ live.latest_handshake|relative_time if live else 'never' }}</dd>
+      <dt>Endpoint</dt><dd class="mono">{{ live.endpoint if live and live.endpoint else '—' }}</dd>
+      <dt>Created</dt><dd>{{ peer.created_at|relative_time }}</dd>
+    </dl>
+
+    <h3>Edit</h3>
+    <form method="post" action="/peers/{{ peer.id }}/update" class="grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <label>Description
+        <input type="text" name="description" value="{{ peer.description }}">
+      </label>
+      <label>Extra routed CIDRs
+        <input type="text" name="extra_allowed_ips" value="{{ peer.extra_allowed_ips }}" class="mono">
+      </label>
+      <label>Keepalive (s)
+        <input type="number" name="keepalive" value="{{ peer.keepalive }}" min="0" max="3600">
+      </label>
+      <div class="actions"><button class="primary" type="submit">Save</button></div>
+    </form>
+
+    <h3>Danger zone</h3>
+    <div class="danger-zone">
+      <form method="post" action="/peers/{{ peer.id }}/rotate" class="inline"
+            data-confirm="Rotate keys for {{ peer.name }}? It goes offline until the new config is installed.">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <button class="button" type="submit">Rotate keys</button>
+      </form>
+      <form method="post" action="/peers/{{ peer.id }}/delete" class="inline"
+            data-confirm="Delete {{ peer.name }} permanently?">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <button class="button danger" type="submit">Delete peer</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Client configuration</h2>
+    {% if render_error %}
+      <div class="flash warn">{{ render_error }}</div>
+    {% else %}
+      <div class="qr">{{ qr_svg|safe }}</div>
+      <p class="muted small">Scan with the WireGuard mobile app, or install the file below.</p>
+      <div class="code-head">
+        <a class="button small" href="/peers/{{ peer.id }}/config">Download .conf</a>
+        <button class="button small" type="button" data-copy="#peer-config">Copy</button>
+      </div>
+      <pre id="peer-config" class="code">{{ peer_config }}</pre>
+      <p class="muted small">
+        On the client: save as <code>/etc/wireguard/{{ config.wireguard.interface }}.conf</code>,
+        <code>chmod 600</code> it, then
+        <code>wg-quick up {{ config.wireguard.interface }}</code> and
+        <code>systemctl enable wg-quick@{{ config.wireguard.interface }}</code>.
+      </p>
+    {% endif %}
+  </div>
+</section>
+
+{% if peer.hosts %}
+<section class="card">
+  <h2>Services published from this peer</h2>
+  <table>
+    <thead><tr><th>Domain</th><th>Target</th></tr></thead>
+    <tbody>
+      {% for host in peer.hosts %}
+      <tr><td>{{ host.domain }}</td><td class="mono">{{ host.forward_host }}:{{ host.forward_port }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endblock %}
