@@ -104,6 +104,50 @@ def test_enable_replays_docker_to_wireguard_rules_after_ufw(
     assert enable < restart < replay
 
 
+def test_enable_allows_docker_bridge_to_reach_the_panel(config, monkeypatch):
+    """ufw default-deny INPUT drops container traffic to 10.50.0.1:8088; 443 then hangs."""
+    config.panel.bind = "10.50.0.1"
+    config.panel.port = 8088
+    config.server.docker_bridge_subnet = "172.17.0.0/16"
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        argv = [str(a) for a in argv]
+        calls.append(argv)
+        if argv[:2] == ["ufw", "status"]:
+            return _ok(argv, ACTIVE_STATUS)
+        return _ok(argv)
+
+    monkeypatch.setattr(firewall, "run", fake_run)
+    monkeypatch.setattr(firewall, "has", lambda binary: True)
+    monkeypatch.setattr(firewall, "ensure_forward_policy_accept", lambda: False)
+    monkeypatch.setattr(firewall, "ensure_docker_starts_after_ufw", lambda: False)
+    monkeypatch.setattr(firewall, "restore_container_networking", lambda: None)
+
+    firewall.enable_host_firewall(config)
+
+    docker_allow = [
+        c for c in calls
+        if c[:2] == ["ufw", "allow"] and "172.17.0.0/16" in c and "8088" in c
+    ]
+    assert docker_allow, calls
+    assert "10.50.0.1" in docker_allow[0]
+    assert ["ufw", "allow", "8088/tcp"] not in calls
+    enable = next(i for i, c in enumerate(calls) if c[:3] == ["ufw", "--force", "enable"])
+    assert calls.index(docker_allow[0]) < enable
+
+
+def test_check_does_not_treat_docker_only_panel_allow_as_public(config, monkeypatch):
+    status = ACTIVE_STATUS + "8088/tcp                   ALLOW       172.17.0.0/16\n"
+    monkeypatch.setattr(firewall, "has", lambda binary: True)
+    monkeypatch.setattr(firewall, "run", lambda argv, **k: _ok(argv, status))
+    report = firewall.check_host_firewall(config)
+    panel = next(p for p in report.ports if p.port == 8088)
+    assert panel.allowed is False
+    assert panel.ok is True
+    assert report.ok is True
+
+
 def test_enable_opens_required_ports_and_skips_admin_and_panel(config, monkeypatch):
     calls: list[list[str]] = []
 

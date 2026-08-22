@@ -101,9 +101,24 @@ def require_configured() -> Config:
     return config
 
 
+def _print_version_and_exit(value: bool) -> None:
+    if value:
+        console.print(f"edgekit {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
 def main_callback(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Debug logging.")] = False,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            help="Print version and exit.",
+            callback=_print_version_and_exit,
+            is_eager=True,
+        ),
+    ] = False,
 ) -> None:
     setup_logging(verbose)
 

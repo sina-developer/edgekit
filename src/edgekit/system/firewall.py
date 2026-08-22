@@ -201,6 +201,37 @@ def open_host_ports(*, wg_port: int, http_port: int, https_port: int) -> list[st
     return opened
 
 
+def allow_docker_to_panel(config: Config) -> bool:
+    """Let the NPM container reach the panel on the hub IP.
+
+    10.50.0.1 is a local address, so that packet is INPUT, not FORWARD. ufw's
+    default deny drops it, NPM waits on the backend, and HTTPS on :443 hangs
+    even though 443/tcp is allowed. The panel stays closed from the internet.
+    """
+    if not has("ufw"):
+        return False
+    bind = (config.panel.bind or "").strip()
+    if not bind or bind in ("127.0.0.1", "localhost", "::1"):
+        return False
+    subnet = config.server.docker_bridge_subnet or "172.17.0.0/16"
+    run(
+        [
+            "ufw",
+            "allow",
+            "from",
+            subnet,
+            "to",
+            bind,
+            "port",
+            str(config.panel.port),
+            "proto",
+            "tcp",
+        ],
+        check=True,
+    )
+    return True
+
+
 @dataclass(frozen=True)
 class PortAdvice:
     protocol: str
@@ -296,6 +327,7 @@ def enable_host_firewall(config: Config) -> HostFirewallReport:
         if row.action != "open":
             continue
         run(["ufw", "allow", f"{row.port}/{row.protocol}"], check=True)
+    allow_docker_to_panel(config)
 
     run(["ufw", "--force", "enable"], check=True)
     run(["ufw", "reload"], check=False)
@@ -328,10 +360,13 @@ def check_host_firewall(config: Config) -> HostFirewallReport:
 
 
 def _allowed_specs(status: str) -> set[tuple[str, int]]:
+    """Ports allowed from Anywhere. Source-restricted rules (Docker → panel) are not public."""
     found: set[tuple[str, int]] = set()
     for line in status.splitlines():
         match = _UFW_RULE.match(line.strip())
         if not match or "ALLOW" not in line.upper():
+            continue
+        if "ANYWHERE" not in line.upper():
             continue
         found.add((match.group(2).lower(), int(match.group(1))))
     return found

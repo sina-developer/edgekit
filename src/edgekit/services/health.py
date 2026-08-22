@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
+import ssl
 from dataclasses import dataclass
 from enum import Enum
 from types import SimpleNamespace
@@ -331,31 +333,60 @@ async def _reach_from_container(config: Config, target: tuple) -> Check:
             f"The tunnel works but the service returned {code}. Check the service "
             f"on the peer.",
         )
+    if host == config.panel.bind and port == config.panel.port:
+        subnet = config.server.docker_bridge_subnet or "172.17.0.0/16"
+        remedy = (
+            f"The panel is on this host. ufw default-deny drops Docker INPUT to "
+            f"{host}:{port}. Allow the bridge only: "
+            f"`ufw allow from {subnet} to {host} port {port} proto tcp` "
+            f"(or `edgekit firewall setup`)."
+        )
+    else:
+        remedy = (
+            "Verify the service is listening on the peer, then check IP forwarding "
+            "and the Docker-to-WireGuard rules above."
+        )
     return Check(
         f"npm_reach_{domain}",
         f"NPM can reach {host}:{port}",
         Level.FAIL,
         "no response from inside the container",
-        "Verify the service is listening on the peer, then check IP forwarding "
-        "and the Docker-to-WireGuard rules above.",
+        remedy,
     )
 
 
+def _https_localhost_sni(domain: str, port: int) -> int:
+    """TLS to 127.0.0.1 using the vhost SNI. Host header alone is not enough."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection(("127.0.0.1", port), timeout=PROBE_TIMEOUT) as sock:
+        with ctx.wrap_socket(sock, server_hostname=domain) as tls:
+            tls.settimeout(PROBE_TIMEOUT)
+            tls.sendall(
+                f"GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode()
+            )
+            first = tls.recv(1024)
+    if not first:
+        raise OSError("TLS connected but origin returned no HTTP response")
+    line = first.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+    parts = line.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise OSError(f"bad HTTP status line: {line[:80]}")
+    return int(parts[1])
+
+
 async def _probe_all_local(config: Config, domains: list[str]) -> list[Check]:
-    url = f"https://127.0.0.1:{config.npm.https_port}"
-    timeout = httpx.Timeout(PROBE_TIMEOUT, connect=2.0)
-    async with httpx.AsyncClient(verify=False, timeout=timeout) as client:  # noqa: S501
-        return list(await asyncio.gather(*(_probe_local_proxy(client, url, d) for d in domains)))
+    port = config.npm.https_port
+    return list(await asyncio.gather(*(_probe_local_proxy(d, port) for d in domains)))
 
 
-async def _probe_local_proxy(client: httpx.AsyncClient, url: str, domain: str) -> Check:
+async def _probe_local_proxy(domain: str, port: int) -> Check:
     try:
-        # Certificate verification is deliberately off: we are connecting to the origin
-        # by IP, so the hostname will never match. What we are testing is that the TLS
-        # handshake completes and the vhost routes — a 525 from Cloudflare means exactly
-        # this handshake failed.
-        response = await client.get(url, headers={"Host": domain})
-    except httpx.HTTPError as exc:
+        # SNI must be the vhost name. Connecting to 127.0.0.1 with only a Host header
+        # makes OpenResty return TLSV1_UNRECOGNIZED_NAME even when the origin cert is fine.
+        status = await asyncio.to_thread(_https_localhost_sni, domain, port)
+    except OSError as exc:
         return Check(
             f"local_tls_{domain}",
             f"Local TLS for {domain}",
@@ -367,8 +398,8 @@ async def _probe_local_proxy(client: httpx.AsyncClient, url: str, domain: str) -
     return Check(
         f"local_tls_{domain}",
         f"Local TLS for {domain}",
-        Level.OK if response.status_code < 500 else Level.WARN,
-        f"HTTP {response.status_code}",
+        Level.OK if status < 500 else Level.WARN,
+        f"HTTP {status}",
     )
 
 

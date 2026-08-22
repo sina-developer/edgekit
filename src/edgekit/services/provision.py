@@ -323,6 +323,7 @@ class Provisioner:
             http_port=self.config.npm.http_port,
             https_port=self.config.npm.https_port,
         )
+        firewall.allow_docker_to_panel(self.config)
         suffix = f"; ufw opened {', '.join(opened)}" if opened else ""
         return f"{docker_if} ({docker_subnet}) -> {wg_if} ({wg_subnet}){suffix}"
 
