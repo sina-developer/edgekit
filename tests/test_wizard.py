@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from test_certificates import make_cert
 
 from edgekit.wizard import attach_stdin_to_tty
 
@@ -94,3 +95,77 @@ def test_install_sh_reconnects_stdin_before_setup():
     attach_at = text.index("attach_controlling_tty")
     setup_at = text.index('exec "${BIN}" setup')
     assert attach_at < setup_at
+
+
+def test_existing_origin_pair_reads_saved_files(tmp_path, monkeypatch, config):
+    from edgekit.wizard import existing_origin_pair
+
+    cert, key = make_cert(["*.example.com", "example.com"])
+    cert_file = tmp_path / "origin.pem"
+    key_file = tmp_path / "origin.key"
+    cert_file.write_text(cert)
+    key_file.write_text(key)
+    monkeypatch.setattr("edgekit.wizard.ORIGIN_CERT_FILE", cert_file)
+    monkeypatch.setattr("edgekit.wizard.ORIGIN_KEY_FILE", key_file)
+
+    found = existing_origin_pair(config)
+    assert found == (cert, key)
+
+
+def test_collect_certificate_skips_paste_when_keys_exist_and_renew_is_declined(
+    tmp_path, monkeypatch, config
+):
+    from edgekit.wizard import _collect_certificate
+
+    cert, key = make_cert(["*.example.com", "example.com"])
+    cert_file = tmp_path / "origin.pem"
+    key_file = tmp_path / "origin.key"
+    cert_file.write_text(cert)
+    key_file.write_text(key)
+    monkeypatch.setattr("edgekit.wizard.ORIGIN_CERT_FILE", cert_file)
+    monkeypatch.setattr("edgekit.wizard.ORIGIN_KEY_FILE", key_file)
+    monkeypatch.setattr("edgekit.wizard.env", lambda *_a, **_k: "")
+
+    questions: list[str] = []
+
+    def fake_confirm(question, default=True):
+        questions.append(question)
+        return False
+
+    monkeypatch.setattr("edgekit.wizard.Confirm.ask", fake_confirm)
+    monkeypatch.setattr(
+        "edgekit.wizard._prompt_pem_paste",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not ask for new keys")),
+    )
+
+    _collect_certificate(config, non_interactive=False)
+
+    assert config.tls.certificate == cert
+    assert config.tls.certificate_key == key
+    assert any("renew" in q.lower() for q in questions)
+
+
+def test_collect_certificate_asks_for_new_keys_when_renew_is_accepted(
+    tmp_path, monkeypatch, config
+):
+    from edgekit.wizard import _collect_certificate
+
+    old_cert, old_key = make_cert(["*.example.com", "example.com"])
+    new_cert, new_key = make_cert(["*.example.com", "example.com"])
+    cert_file = tmp_path / "origin.pem"
+    key_file = tmp_path / "origin.key"
+    cert_file.write_text(old_cert)
+    key_file.write_text(old_key)
+    monkeypatch.setattr("edgekit.wizard.ORIGIN_CERT_FILE", cert_file)
+    monkeypatch.setattr("edgekit.wizard.ORIGIN_KEY_FILE", key_file)
+    monkeypatch.setattr("edgekit.wizard.env", lambda *_a, **_k: "")
+    monkeypatch.setattr("edgekit.wizard.Confirm.ask", lambda *a, **k: True)
+
+    pastes = [new_cert, new_key]
+    monkeypatch.setattr("edgekit.wizard._prompt_pem_paste", lambda _label: pastes.pop(0))
+
+    _collect_certificate(config, non_interactive=False)
+
+    assert config.tls.certificate == new_cert
+    assert cert_file.read_text() == new_cert
+    assert key_file.read_text() == new_key

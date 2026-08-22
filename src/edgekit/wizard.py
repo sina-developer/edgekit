@@ -411,6 +411,37 @@ def _write_origin_files(certificate: str, key: str) -> None:
         fh.write(key)
 
 
+def existing_origin_pair(config: Config) -> tuple[str, str] | None:
+    """Return a stored origin cert+key, from config or the files the installer writes."""
+    if config.tls.present:
+        return config.tls.certificate, config.tls.certificate_key
+    try:
+        if ORIGIN_CERT_FILE.is_file() and ORIGIN_KEY_FILE.is_file():
+            cert = ORIGIN_CERT_FILE.read_text()
+            key = ORIGIN_KEY_FILE.read_text()
+            if cert.strip() and key.strip():
+                return cert, key
+    except OSError:
+        return None
+    return None
+
+
+def _keep_existing_origin(config: Config, certificate: str, key: str) -> None:
+    from .services.certificates import CertificateError, certificate_name, inspect_certificate
+
+    config.tls.certificate = certificate
+    config.tls.certificate_key = key
+    config.tls.name = certificate_name(config.cloudflare.zone_name)
+    try:
+        info = inspect_certificate(certificate)
+        console.print(
+            f"  [green]✓[/green] keeping existing certificate for {', '.join(info.hostnames)}, "
+            f"valid until {info.not_after.date()} ({info.days_remaining} days)"
+        )
+    except CertificateError:
+        console.print("  [green]✓[/green] keeping the existing origin certificate")
+
+
 def _collect_certificate(config: Config, *, non_interactive: bool) -> None:
     """Collect the origin certificate (paste or env paths), validate, and save it."""
     from .services.certificates import (
@@ -422,8 +453,43 @@ def _collect_certificate(config: Config, *, non_interactive: bool) -> None:
 
     cert_path = env("CERT_PATH")
     key_path = env("KEY_PATH")
+    existing = None if (cert_path and key_path) else existing_origin_pair(config)
+    renewing = False
 
-    if not (cert_path and key_path):
+    if existing and not (cert_path and key_path):
+        certificate, key = existing
+        info = None
+        try:
+            validate_key_matches(certificate, key)
+            info = inspect_certificate(certificate)
+        except (CertificateError, ValueError, OSError):
+            info = None
+
+        if non_interactive:
+            if info:
+                _keep_existing_origin(config, certificate, key)
+            return
+
+        console.print()
+        if info:
+            console.print(
+                f"  Found an origin certificate covering {', '.join(info.hostnames)}, "
+                f"valid until {info.not_after.date()} ({info.days_remaining} days)."
+            )
+            if info.expired:
+                console.print("  [yellow]It has expired.[/yellow]")
+            renew_default = bool(info.expired)
+            if not Confirm.ask("Renew the SSL keys (origin certificate)?", default=renew_default):
+                _keep_existing_origin(config, certificate, key)
+                return
+            renewing = True
+        else:
+            console.print("  Found origin certificate files, but they could not be read.")
+            if not Confirm.ask("Replace them with new SSL keys?", default=True):
+                return
+            renewing = True
+
+    if not (cert_path and key_path) and not renewing:
         if non_interactive:
             return
         console.print()

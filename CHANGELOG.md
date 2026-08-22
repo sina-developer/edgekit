@@ -6,6 +6,11 @@ All notable changes to edgekit are recorded here. Version numbers follow
 The single source of truth for the number itself is `src/edgekit/__init__.py`
 (`__version__`). Keep this file in lockstep with that string.
 
+## [1.1.0] — 2026-08-22
+
+- Setup asks whether to renew the Cloudflare origin certificate when keys already
+  exist on disk or in config; declining keeps the current pair and skips the paste.
+
 ## [1.0.0] — 2026-08-22
 
 Initial tagged release of the current tree.
