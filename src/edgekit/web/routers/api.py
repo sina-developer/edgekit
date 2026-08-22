@@ -120,4 +120,5 @@ async def health_report(
 ):
     peers = list(db.scalars(select(Peer)))
     report = await health.run_all(config, peers)
+    report.checks.append(health.cloud_firewall_reminder(config))
     return report.as_dict()

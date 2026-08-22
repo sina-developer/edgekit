@@ -299,6 +299,9 @@ class TestHealthChecks:
         assert report.ok is False
         assert len(report.failures) == 1
         assert len(report.warnings) == 1
+        payload = report.as_dict()
+        assert payload["failures"] == 1
+        assert payload["warnings"] == 1
 
     def test_warnings_alone_do_not_fail_a_report(self):
         from edgekit.services.health import Check, HealthReport

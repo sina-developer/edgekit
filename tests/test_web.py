@@ -133,7 +133,7 @@ class TestPages:
         assert response.status_code == 200
         assert "Overview" in response.text
 
-    @pytest.mark.parametrize("path", ["/peers", "/hosts", "/settings", "/audit"])
+    @pytest.mark.parametrize("path", ["/peers", "/hosts", "/diagnostics", "/settings", "/audit"])
     def test_pages_render(self, auth_client, path):
         assert auth_client.get(path).status_code == 200
 
@@ -175,6 +175,35 @@ class TestApi:
 
         body = auth_client.get("/api/peers").text
         assert "private" not in body.lower()
+
+    def test_health_api_returns_the_check_report(self, auth_client, monkeypatch):
+        from edgekit.services.health import Check, HealthReport, Level
+
+        async def fake_run_all(config, peers=None):
+            return HealthReport([Check("ip_forward", "IP forwarding enabled", Level.OK)])
+
+        monkeypatch.setattr("edgekit.web.routers.api.health.run_all", fake_run_all)
+        body = auth_client.get("/api/health").json()
+        assert body["ok"] is True
+        assert body["failures"] == 0
+        assert body["checks"][0]["key"] == "ip_forward"
+        assert body["checks"][0]["level"] == "ok"
+
+
+class TestDiagnosticsPage:
+    def test_the_page_renders_without_running_health_checks(self, auth_client, monkeypatch):
+        """The tab must paint immediately; probes run afterwards via /api/health."""
+
+        async def boom(*_a, **_k):
+            raise AssertionError("health.run_all must not block the diagnostics HTML")
+
+        monkeypatch.setattr("edgekit.services.health.run_all", boom)
+
+        response = auth_client.get("/diagnostics")
+        assert response.status_code == 200
+        assert "Running checks" in response.text
+        assert 'data-diagnostics-src="/api/health"' in response.text
+        assert "Every required check passed" not in response.text
 
 
 def _csrf_for(client: TestClient) -> str:

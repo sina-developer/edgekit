@@ -10,6 +10,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from enum import Enum
+from types import SimpleNamespace
 
 import httpx
 from sqlalchemy import select
@@ -61,6 +62,8 @@ class HealthReport:
     def as_dict(self) -> dict:
         return {
             "ok": self.ok,
+            "failures": len(self.failures),
+            "warnings": len(self.warnings),
             "checks": [
                 {
                     "key": c.key,
@@ -74,15 +77,40 @@ class HealthReport:
         }
 
 
-async def run_all(config: Config, peers: list | None = None) -> HealthReport:
+# Reachability probes should fail fast: a hung peer must not stall the whole report.
+PROBE_TIMEOUT = 4.0
+PUBLIC_TIMEOUT = 6.0
+
+
+def _local_checks(config: Config, peers: list) -> list[Check]:
+    """Synchronous host checks (wg, sysctl, iptables, docker). Run in a worker thread."""
     checks: list[Check] = []
-    checks.extend(_check_wireguard(config, peers or []))
+    checks.extend(_check_wireguard(config, peers))
     checks.append(_check_forwarding())
     checks.append(_check_firewall(config))
     checks.extend(_check_docker(config))
-    checks.extend(await _check_npm(config))
-    checks.extend(await _check_public(config))
-    return HealthReport(checks)
+    return checks
+
+
+async def run_all(config: Config, peers: list | None = None) -> HealthReport:
+    peer_list = list(peers or [])
+    # Snapshot ORM attributes on this thread before the worker touches them.
+    peer_views = [
+        SimpleNamespace(
+            id=p.id,
+            name=p.name,
+            address=p.address,
+            public_key=p.public_key,
+            enabled=p.enabled,
+        )
+        for p in peer_list
+    ]
+    local, npm, public = await asyncio.gather(
+        asyncio.to_thread(_local_checks, config, peer_views),
+        _check_npm(config),
+        _check_public(config),
+    )
+    return HealthReport([*local, *npm, *public])
 
 
 # ---------------------------------------------------------------------- WireGuard
@@ -260,10 +288,9 @@ def _check_docker(config: Config) -> list[Check]:
 
 
 async def _check_npm(config: Config) -> list[Check]:
-    checks: list[Check] = []
-    state = dockerx.container_state(config.npm.container_name)
+    state = await asyncio.to_thread(dockerx.container_state, config.npm.container_name)
     if not state.get("running"):
-        return checks
+        return []
 
     # Guide §17: the check that actually matters is from *inside* the container.
     from ..db import session_scope
@@ -274,53 +301,60 @@ async def _check_npm(config: Config) -> list[Check]:
             (h.domain, h.forward_host, h.forward_port, h.scheme)
             for h in session.scalars(select(ProxyHost))
         ]
+    if not targets:
+        return []
 
-    for domain, host, port, scheme in targets:
-        result = dockerx.curl_from_container(
-            config.npm.container_name, f"{scheme}://{host}:{port}"
+    reach, tls = await asyncio.gather(
+        asyncio.gather(*(_reach_from_container(config, t) for t in targets)),
+        _probe_all_local(config, [t[0] for t in targets]),
+    )
+    return [*reach, *tls]
+
+
+async def _reach_from_container(config: Config, target: tuple) -> Check:
+    domain, host, port, scheme = target
+    result = await asyncio.to_thread(
+        dockerx.curl_from_container,
+        config.npm.container_name,
+        f"{scheme}://{host}:{port}",
+        int(PROBE_TIMEOUT),
+    )
+    code = (result.stdout or "").strip()
+    if code and code != "000":
+        level = Level.OK if code[0] in "23" else Level.WARN
+        return Check(
+            f"npm_reach_{domain}",
+            f"NPM can reach {host}:{port}",
+            level,
+            f"HTTP {code}",
+            "" if level is Level.OK else
+            f"The tunnel works but the service returned {code}. Check the service "
+            f"on the peer.",
         )
-        code = (result.stdout or "").strip()
-        if code and code != "000":
-            level = Level.OK if code[0] in "23" else Level.WARN
-            checks.append(
-                Check(
-                    f"npm_reach_{domain}",
-                    f"NPM can reach {host}:{port}",
-                    level,
-                    f"HTTP {code}",
-                    "" if level is Level.OK else
-                    f"The tunnel works but the service returned {code}. Check the service "
-                    f"on the peer.",
-                )
-            )
-        else:
-            checks.append(
-                Check(
-                    f"npm_reach_{domain}",
-                    f"NPM can reach {host}:{port}",
-                    Level.FAIL,
-                    "no response from inside the container",
-                    "Verify the service is listening on the peer, then check IP forwarding "
-                    "and the Docker-to-WireGuard rules above.",
-                )
-            )
-
-    # Guide §18: prove the proxy answers locally before blaming Cloudflare.
-    for domain, *_ in targets:
-        checks.append(await _probe_local_proxy(config, domain))
-
-    return checks
+    return Check(
+        f"npm_reach_{domain}",
+        f"NPM can reach {host}:{port}",
+        Level.FAIL,
+        "no response from inside the container",
+        "Verify the service is listening on the peer, then check IP forwarding "
+        "and the Docker-to-WireGuard rules above.",
+    )
 
 
-async def _probe_local_proxy(config: Config, domain: str) -> Check:
+async def _probe_all_local(config: Config, domains: list[str]) -> list[Check]:
     url = f"https://127.0.0.1:{config.npm.https_port}"
+    timeout = httpx.Timeout(PROBE_TIMEOUT, connect=2.0)
+    async with httpx.AsyncClient(verify=False, timeout=timeout) as client:  # noqa: S501
+        return list(await asyncio.gather(*(_probe_local_proxy(client, url, d) for d in domains)))
+
+
+async def _probe_local_proxy(client: httpx.AsyncClient, url: str, domain: str) -> Check:
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10) as client:  # noqa: S501
-            # Certificate verification is deliberately off: we are connecting to the origin
-            # by IP, so the hostname will never match. What we are testing is that the TLS
-            # handshake completes and the vhost routes — a 525 from Cloudflare means exactly
-            # this handshake failed.
-            response = await client.get(url, headers={"Host": domain})
+        # Certificate verification is deliberately off: we are connecting to the origin
+        # by IP, so the hostname will never match. What we are testing is that the TLS
+        # handshake completes and the vhost routes — a 525 from Cloudflare means exactly
+        # this handshake failed.
+        response = await client.get(url, headers={"Host": domain})
     except httpx.HTTPError as exc:
         return Check(
             f"local_tls_{domain}",
@@ -350,10 +384,11 @@ async def _check_public(config: Config) -> list[Check]:
     if not domains:
         return []
 
-    async def probe(domain: str) -> Check:
+    timeout = httpx.Timeout(PUBLIC_TIMEOUT, connect=2.0)
+
+    async def probe(client: httpx.AsyncClient, domain: str) -> Check:
         try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-                response = await client.head(f"https://{domain}")
+            response = await client.head(f"https://{domain}")
         except httpx.HTTPError as exc:
             return Check(
                 f"public_{domain}",
@@ -381,7 +416,8 @@ async def _check_public(config: Config) -> list[Check]:
             f"HTTP {response.status_code} via {response.headers.get('server', 'unknown')}",
         )
 
-    return list(await asyncio.gather(*(probe(d) for d in domains)))
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        return list(await asyncio.gather(*(probe(client, d) for d in domains)))
 
 
 def _human(size: int) -> str:

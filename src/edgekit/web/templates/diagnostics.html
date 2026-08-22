@@ -4,39 +4,30 @@
 {% block content %}
 <div class="page-head">
   <h1>Diagnostics</h1>
-  <a class="button small" href="/diagnostics">Re-run</a>
+  <button class="button small" type="button" id="diagnostics-rerun">Re-run</button>
 </div>
 
-<div class="flash {{ 'ok' if report.ok else 'bad' }}">
-  {% if report.ok %}
-    Every required check passed.
-  {% else %}
-    {{ report.failures|length }} check(s) failed.
-  {% endif %}
-  {% if report.warnings %} {{ report.warnings|length }} warning(s).{% endif %}
+<div id="diagnostics-app" data-diagnostics-src="/api/health">
+  <div class="flash" id="diagnostics-summary">Running checks…</div>
+
+  <section class="card">
+    <table class="checks-table">
+      <tbody id="diagnostics-rows">
+        <tr class="check-pending">
+          <td class="status"><span class="pill pulse">…</span></td>
+          <td>
+            <strong>Running health checks</strong>
+            <div class="muted small">WireGuard, Docker, NPM reachability, public TLS.</div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
 </div>
 
-<section class="card">
-  <table class="checks-table">
-    <tbody>
-    {% for check in report.checks %}
-      <tr class="lvl-{{ check.level.value }}">
-        <td class="status">
-          {% if check.level.value == 'ok' %}<span class="pill ok">pass</span>
-          {% elif check.level.value == 'warn' %}<span class="pill warn">warn</span>
-          {% elif check.level.value == 'fail' %}<span class="pill bad">fail</span>
-          {% else %}<span class="pill">skip</span>{% endif %}
-        </td>
-        <td>
-          <strong>{{ check.title }}</strong>
-          {% if check.detail %}<div class="muted small">{{ check.detail }}</div>{% endif %}
-          {% if check.remedy %}<div class="remedy">{{ check.remedy }}</div>{% endif %}
-        </td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
-</section>
+<noscript>
+  <div class="flash warn">JavaScript is required to run these checks in the panel. Use <code>edgekit doctor</code> instead.</div>
+</noscript>
 
 <section class="card">
   <h2>Commands worth knowing</h2>

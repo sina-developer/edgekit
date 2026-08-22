@@ -45,6 +45,30 @@ def env(key: str, default: str = "") -> str:
     return os.environ.get(f"EDGEKIT_{key}", default).strip()
 
 
+def attach_stdin_to_tty(tty_path: str = "/dev/tty") -> bool:
+    """Reconnect stdin to the controlling terminal so prompts can wait for input.
+
+    ``curl | sudo bash`` feeds the installer on stdin. By the time ``edgekit setup``
+    runs that pipe is at EOF, so the first prompt raises ``EOFError`` and Click
+    prints ``Aborted``. Opening ``/dev/tty`` is how sudo itself asks for a password
+    in the same situation.
+
+    Returns True if stdin is (now) readable as a terminal or the given path.
+    """
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return True
+    except ValueError:
+        pass  # stdin is closed
+    try:
+        new_stdin = open(tty_path, encoding="utf-8")  # noqa: SIM115
+    except OSError:
+        return False
+    sys.stdin = new_stdin
+    sys.__stdin__ = new_stdin
+    return True
+
+
 def _ask(
     question: str,
     *,
@@ -137,6 +161,7 @@ def run_wizard(existing: Config | None = None, *, non_interactive: bool = False)
     config = existing or Config()
 
     if not non_interactive:
+        attach_stdin_to_tty()
         console.print(
             Panel.fit(
                 "[bold]edgekit setup[/bold]\n"

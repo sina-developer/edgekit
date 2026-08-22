@@ -7,8 +7,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from ...config import Config
-from ...models import AuditLog, Peer, ProxyHost, User
-from ...services import health
+from ...models import AuditLog, ProxyHost, User
 from ...services.hosts import SETTING_CERT_EXPIRY, SETTING_CERT_NAME, get_setting
 from ...services.peers import PeerService
 from ...system import dockerx
@@ -61,16 +60,13 @@ async def index(
 async def diagnostics(
     request: Request,
     user: User = Depends(current_user),
-    db: Session = Depends(get_db),
     config: Config = Depends(get_config),
 ):
-    peers = list(db.scalars(select(Peer)))
-    report = await health.run_all(config, peers)
-    report.checks.append(health.cloud_firewall_reminder(config))
+    # Checks run afterwards via /api/health so this tab paints immediately.
     return templates.TemplateResponse(
         request,
         "diagnostics.html",
-        {"user": user, "config": config, "report": report},
+        {"user": user, "config": config},
     )
 
 

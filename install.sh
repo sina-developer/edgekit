@@ -202,9 +202,23 @@ install_edgekit() {
 
 # ------------------------------------------------------------------ handover
 
+attach_controlling_tty() {
+    # `curl | sudo bash` feeds this script on stdin. Once that pipe is consumed,
+    # the first setup prompt (public IP) gets EOF and Click prints "Aborted".
+    # Reopen the controlling terminal so the interview can wait for the operator.
+    # Skip when /dev/tty is absent (cloud-init, CI) so --non-interactive still works.
+    if [ -t 0 ]; then
+        return 0
+    fi
+    if [ -r /dev/tty ]; then
+        exec </dev/tty
+    fi
+}
+
 run_setup() {
     step "Starting setup"
     printf '\n'
+    attach_controlling_tty
     # exec so signals and the exit code belong to setup, not to this wrapper.
     exec "${BIN}" setup "$@"
 }
