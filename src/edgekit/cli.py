@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -29,8 +31,9 @@ from .services import certificates, health
 from .services.hosts import SETTING_CERT_EXPIRY, SETTING_CERT_ID, HostService, get_setting
 from .services.peers import PeerError, PeerService
 from .services.provision import Provisioner, StepStatus
+from .system import firewall
 from .system import wireguard as wg
-from .system.shell import is_root
+from .system.shell import CommandError, is_root
 
 console = Console()
 
@@ -51,6 +54,11 @@ app.add_typer(cert_app, name="cert")
 app.add_typer(user_app, name="user")
 app.add_typer(cf_app, name="cloudflare")
 app.add_typer(npm_app, name="npm")
+fw_app = typer.Typer(
+    help="Host firewall (ufw): enable, open ports, and check.",
+    no_args_is_help=True,
+)
+app.add_typer(fw_app, name="firewall")
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -225,6 +233,36 @@ def _panel_access_help(config: Config) -> str:
     )
 
 
+def _print_firewall_ports(config: Config) -> None:
+    """Show every cloud-firewall port after install — open vs leave closed."""
+    rows = firewall.cloud_firewall_ports(config)
+    table = Table(title="Cloud firewall (security group)", title_justify="left")
+    table.add_column("Action")
+    table.add_column("Proto")
+    table.add_column("Port")
+    table.add_column("Why")
+    for row in rows:
+        if row.action == "open":
+            action = "[green]OPEN[/green]"
+        else:
+            action = "[red]KEEP CLOSED[/red]"
+        table.add_row(action, row.protocol.upper(), str(row.port), row.purpose)
+
+    console.print()
+    console.print(table)
+    console.print(
+        "  [dim]These rules live at your cloud provider (AWS security group, Hetzner, …), "
+        "not in ufw on this host.[/dim]"
+    )
+    console.print(
+        "\n[bold]Next:[/bold] turn on the host firewall and open those ports:\n"
+        "  [bold]sudo edgekit firewall setup[/bold]\n"
+        "  [bold]sudo edgekit firewall check[/bold]\n"
+        "  [dim]ufw covers this VM only. The OPEN ports above still need to be allowed "
+        "in the cloud security group.[/dim]"
+    )
+
+
 def _print_setup_summary(config: Config, result, ok: bool) -> None:
     table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
     if config.public_panel_domain and config.panel.bind not in ("127.0.0.1", "localhost"):
@@ -257,11 +295,7 @@ def _print_setup_summary(config: Config, result, ok: bool) -> None:
         )
 
     console.print(_panel_access_help(config))
-    console.print(
-        "Remember the firewall rules your cloud provider controls: allow inbound "
-        f"UDP {config.wireguard.listen_port}, TCP {config.npm.http_port} and "
-        f"TCP {config.npm.https_port}."
-    )
+    _print_firewall_ports(config)
 
     outstanding = []
     zone = config.cloudflare.zone_name
@@ -303,6 +337,135 @@ def provision(
         skip_cloudflare=skip_cloudflare,
     )
     raise typer.Exit(0 if report.ok else 2)
+
+
+@app.command()
+def update(
+    repo: Annotated[str, typer.Option("--repo", help="Git URL to fetch.")] = "",
+    ref: Annotated[str, typer.Option("--ref", help="Branch or tag to check out.")] = "",
+    skip_provision: Annotated[
+        bool,
+        typer.Option("--skip-provision", help="Reinstall and restart only; do not re-provision."),
+    ] = False,
+    resume: Annotated[bool, typer.Option("--resume", hidden=True)] = False,
+    sha: Annotated[str, typer.Option("--sha", hidden=True)] = "",
+) -> None:
+    """Fetch the latest edgekit, reinstall, and re-provision. Keeps current settings."""
+    require_root()
+    config = require_configured()
+
+    if not resume:
+        from . import updater
+
+        repo_url = repo or updater.default_repo()
+        git_ref = ref or updater.default_ref()
+        dest = updater.source_dir()
+        console.print(f"Fetching [bold]{repo_url}[/bold] ({git_ref})…")
+        try:
+            path, identity = updater.resolve_source(repo_url, git_ref, dest)
+            console.print(f"Installing [bold]{path}[/bold] ({identity}) into {sys.prefix}")
+            updater.install_package(path)
+        except (OSError, RuntimeError) as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from exc
+
+        new_bin = Path(sys.prefix) / "bin" / "edgekit"
+        if not new_bin.is_file():
+            console.print(f"[red]pip install succeeded but {new_bin} is missing.[/red]")
+            raise typer.Exit(1)
+        argv = [str(new_bin), "update", "--resume", "--sha", identity]
+        if skip_provision:
+            argv.append("--skip-provision")
+        # Re-exec so provision and the unit file come from the just-installed package.
+        os.execv(str(new_bin), argv)
+
+    console.print(
+        f"[green]✓[/green] Installed edgekit {__version__}"
+        + (f" ({sha})" if sha else "")
+    )
+    console.print(f"  Current settings in [bold]{CONFIG_FILE}[/bold] were left unchanged.")
+
+    service_unit.install()
+    console.print("Restarted [bold]edgekit-panel.service[/bold].")
+
+    if skip_provision:
+        raise typer.Exit(0)
+
+    report = _run_provisioner(config)
+    raise typer.Exit(0 if report.ok else 2)
+
+
+@fw_app.command("setup")
+def firewall_setup() -> None:
+    """Enable ufw, allow the OPEN ports (SSH first), and print the result."""
+    require_root()
+    config = require_configured()
+    console.print("Allowing SSH first so enabling ufw cannot lock you out.")
+    try:
+        report = firewall.enable_host_firewall(config)
+    except (OSError, RuntimeError, CommandError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    _print_host_firewall_report(report)
+    raise typer.Exit(0 if report.ok else 1)
+
+
+@fw_app.command("check")
+def firewall_check() -> None:
+    """Show whether ufw is on and whether each port matches the expected policy."""
+    require_root()
+    config = require_configured()
+    report = firewall.check_host_firewall(config)
+    _print_host_firewall_report(report)
+    raise typer.Exit(0 if report.ok else 1)
+
+
+def _print_host_firewall_report(report: firewall.HostFirewallReport) -> None:
+    if not report.installed:
+        console.print(
+            "[red]ufw is not installed.[/red] Install it with [bold]apt install ufw[/bold]."
+        )
+        return
+
+    state = "[green]active[/green]" if report.active else "[red]inactive[/red]"
+    console.print(f"Host firewall (ufw): {state}")
+
+    table = Table(title="Host firewall ports", title_justify="left")
+    table.add_column("Desired")
+    table.add_column("Proto")
+    table.add_column("Port")
+    table.add_column("On this host")
+    table.add_column("Why")
+    for row in report.ports:
+        desired = (
+            "[green]OPEN[/green]" if row.action == "open" else "[red]KEEP CLOSED[/red]"
+        )
+        if row.allowed is True:
+            actual = "[green]allowed[/green]"
+        elif row.allowed is False:
+            actual = "[dim]not allowed[/dim]"
+        else:
+            actual = "[dim]n/a[/dim]"
+        if not row.ok:
+            actual = f"[red]fix[/red] ({actual})"
+        table.add_row(desired, row.protocol.upper(), str(row.port), actual, row.purpose)
+    console.print(table)
+
+    if report.ok:
+        console.print("[green]✓[/green] Host firewall matches the expected policy.")
+    elif not report.active:
+        console.print(
+            "[yellow]ufw is off.[/yellow] "
+            "Run [bold]sudo edgekit firewall setup[/bold] to enable it."
+        )
+    else:
+        console.print(
+            "[yellow]One or more ports are wrong.[/yellow] "
+            "Run [bold]sudo edgekit firewall setup[/bold] to apply the policy."
+        )
+    console.print(
+        "  [dim]Cloud security groups are separate — they still need the OPEN ports.[/dim]"
+    )
 
 
 @app.command()

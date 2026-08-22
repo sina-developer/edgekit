@@ -8,6 +8,7 @@
 # Usage:
 #     curl -fsSL https://cdn.jsdelivr.net/gh/sina-developer/edgekit@master/install.sh | sudo bash
 #     sudo ./install.sh                          # from a local checkout
+#     sudo edgekit update                        # later: fetch latest, keep settings
 #
 # Or unattended, driven entirely by environment variables:
 #     sudo EDGEKIT_PUBLIC_IP=1.2.3.4 EDGEKIT_ZONE=example.com \

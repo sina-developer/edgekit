@@ -10,8 +10,12 @@ so running the script any number of times converges on the same ruleset.
 from __future__ import annotations
 
 import logging
+import re
 import stat
+from dataclasses import dataclass
+from pathlib import Path
 
+from ..config import Config
 from ..paths import FIREWALL_SCRIPT, FIREWALL_UNIT
 from .shell import has, run, systemctl
 
@@ -162,3 +166,137 @@ def open_host_ports(*, wg_port: int, http_port: int, https_port: int) -> list[st
             opened.append(spec)
     run(["ufw", "reload"])
     return opened
+
+
+@dataclass(frozen=True)
+class PortAdvice:
+    protocol: str
+    port: int
+    purpose: str
+    action: str  # "open" or "closed"
+
+
+def cloud_firewall_ports(config: Config) -> list[PortAdvice]:
+    """Every inbound port the operator must decide on at the cloud firewall.
+
+    edgekit can open ufw on the host, but AWS security groups / Hetzner firewalls live
+    outside the machine. This list is what setup prints after install.
+    """
+    return [
+        PortAdvice("tcp", 22, "SSH (keep if you administer this server over SSH)", "open"),
+        PortAdvice("udp", config.wireguard.listen_port, "WireGuard tunnel", "open"),
+        PortAdvice("tcp", config.npm.http_port, "HTTP / ACME (Let's Encrypt)", "open"),
+        PortAdvice("tcp", config.npm.https_port, "HTTPS", "open"),
+        PortAdvice(
+            "tcp",
+            config.npm.admin_port,
+            f"NPM admin UI (bound to {config.npm.admin_bind})",
+            "closed",
+        ),
+        PortAdvice(
+            "tcp",
+            config.panel.port,
+            f"edgekit panel (bound to {config.panel.bind})",
+            "closed",
+        ),
+    ]
+
+
+UFW_DEFAULTS = Path("/etc/default/ufw")
+_UFW_RULE = re.compile(r"^(\d+)/(tcp|udp)\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class PortCheck:
+    protocol: str
+    port: int
+    purpose: str
+    action: str
+    allowed: bool | None
+    ok: bool
+
+
+@dataclass
+class HostFirewallReport:
+    installed: bool
+    active: bool
+    status_text: str
+    ports: list[PortCheck]
+
+    @property
+    def ok(self) -> bool:
+        if not self.installed or not self.active:
+            return False
+        return all(p.ok for p in self.ports)
+
+
+def ensure_forward_policy_accept(path: Path | None = None) -> bool:
+    """Docker → WireGuard forwarding needs ACCEPT; ufw's default DROP breaks it."""
+    path = path or UFW_DEFAULTS
+    if not path.exists():
+        return False
+    text = path.read_text()
+    updated = text.replace('DEFAULT_FORWARD_POLICY="DROP"', 'DEFAULT_FORWARD_POLICY="ACCEPT"')
+    updated = updated.replace("DEFAULT_FORWARD_POLICY='DROP'", "DEFAULT_FORWARD_POLICY='ACCEPT'")
+    if updated == text:
+        return False
+    path.write_text(updated)
+    return True
+
+
+def enable_host_firewall(config: Config) -> HostFirewallReport:
+    """Turn ufw on, allow the OPEN ports (SSH first), leave admin/panel closed."""
+    if not has("ufw"):
+        run(
+            ["apt-get", "install", "-y", "--no-install-recommends", "ufw"],
+            check=True,
+        )
+        if not has("ufw"):
+            raise RuntimeError("ufw is not installed and apt-get could not provide it.")
+
+    ensure_forward_policy_accept()
+    run(["ufw", "default", "deny", "incoming"], check=True)
+    run(["ufw", "default", "allow", "outgoing"], check=True)
+
+    # SSH is first in cloud_firewall_ports so a failed enable cannot lock the operator out.
+    for row in cloud_firewall_ports(config):
+        if row.action != "open":
+            continue
+        run(["ufw", "allow", f"{row.port}/{row.protocol}"], check=True)
+
+    run(["ufw", "--force", "enable"], check=True)
+    run(["ufw", "reload"], check=False)
+    return check_host_firewall(config)
+
+
+def check_host_firewall(config: Config) -> HostFirewallReport:
+    """Read ufw status and compare it to the OPEN / KEEP CLOSED list."""
+    if not has("ufw"):
+        return HostFirewallReport(installed=False, active=False, status_text="", ports=[])
+
+    result = run(["ufw", "status"], check=False)
+    status = result.stdout or result.stderr
+    active = "Status: active" in status
+    allowed = _allowed_specs(status) if active else set()
+
+    ports: list[PortCheck] = []
+    for row in cloud_firewall_ports(config):
+        is_allowed = (row.protocol, row.port) in allowed if active else None
+        if row.action == "open":
+            ok = bool(is_allowed)
+        else:
+            ok = not bool(is_allowed)
+        ports.append(
+            PortCheck(row.protocol, row.port, row.purpose, row.action, is_allowed, ok)
+        )
+    return HostFirewallReport(installed=True, active=active, status_text=status, ports=ports)
+
+
+def _allowed_specs(status: str) -> set[tuple[str, int]]:
+    found: set[tuple[str, int]] = set()
+    for line in status.splitlines():
+        match = _UFW_RULE.match(line.strip())
+        if not match or "ALLOW" not in line.upper():
+            continue
+        found.add((match.group(2).lower(), int(match.group(1))))
+    return found

@@ -431,13 +431,20 @@ def _human(size: int) -> str:
 
 def cloud_firewall_reminder(config: Config) -> Check:
     """Not something we can verify from inside the host — surfaced as a standing reminder."""
+    opened = ", ".join(
+        f"{r.protocol.upper()} {r.port}"
+        for r in firewall.cloud_firewall_ports(config)
+        if r.action == "open"
+    )
+    closed = ", ".join(
+        f"{r.protocol.upper()} {r.port}"
+        for r in firewall.cloud_firewall_ports(config)
+        if r.action == "closed"
+    )
     return Check(
         "cloud_firewall",
         "Cloud firewall (manual)",
         Level.WARN,
         "edgekit cannot see your cloud provider's firewall",
-        f"Confirm inbound UDP {config.wireguard.listen_port}, TCP {config.npm.http_port} "
-        f"and TCP {config.npm.https_port} are allowed. Keep the NPM admin port "
-        f"{config.npm.admin_port} closed to the internet — it is bound to "
-        f"{config.npm.admin_bind} here.",
+        f"Open inbound {opened}. Keep closed: {closed}.",
     )

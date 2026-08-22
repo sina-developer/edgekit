@@ -136,13 +136,16 @@ complexity the manual path avoids.
 Your **cloud provider's firewall** (AWS security group, Hetzner firewall, …) lives outside the
 server, so it must be opened by hand:
 
-| Port | Protocol | Why |
+| Port | Protocol | Action |
 |---|---|---|
-| 51820 | UDP | WireGuard |
-| 80 | TCP | HTTP / ACME |
-| 443 | TCP | HTTPS |
+| 22 | TCP | Open — SSH (keep if you administer over SSH) |
+| 51820 | UDP | Open — WireGuard |
+| 80 | TCP | Open — HTTP / ACME |
+| 443 | TCP | Open — HTTPS |
+| 8181 | TCP | Keep closed — NPM admin (localhost) |
+| 8088 | TCP | Keep closed — edgekit panel |
 
-Do **not** open the NPM admin port or the panel port. Both are bound to loopback.
+Those values are the defaults; setup prints the real ones if you changed them.
 
 ---
 
@@ -194,7 +197,11 @@ Everything the panel does is available without a browser.
 ```bash
 edgekit status                      # one-screen summary
 edgekit doctor                      # health checks with remedies
+edgekit update                      # git pull, reinstall, re-provision (keeps settings)
 edgekit provision                   # re-run provisioning (idempotent)
+
+edgekit firewall setup              # enable ufw, allow OPEN ports, print result
+edgekit firewall check              # verify ufw is on and ports match
 
 edgekit peer add raspberry-pi       # register a peer, print its config
 edgekit peer add pi --public-key K  # client-generated key; edgekit never sees the private key
@@ -232,14 +239,24 @@ DNS record, proxy host, SSL — done. No Nginx config editing, no new WireGuard 
 ## Upgrading an already-installed server
 
 ```bash
-cd ~/edgekit && git pull          # or scp the updated source across
-sudo /opt/edgekit/venv/bin/pip install --upgrade .
-sudo systemctl restart edgekit-panel
-sudo edgekit provision            # idempotent; fixes whatever is out of step
+sudo edgekit update
 ```
 
-`edgekit provision` is the repair tool. It is safe to run repeatedly and will re-do only the
-steps that are not already in the desired state.
+That fetches the latest tree from git, reinstalls into `/opt/edgekit`, restarts the panel,
+and re-runs provisioning with the settings already on disk. The interview is not shown
+again: config, peers, hosts, certificates, and panel accounts stay as they are.
+
+Override the source if needed:
+
+```bash
+sudo EDGEKIT_REPO=https://github.com/you/edgekit.git edgekit update
+sudo EDGEKIT_SOURCE=/home/you/edgekit edgekit update   # local checkout, no git fetch
+sudo edgekit update --ref main
+sudo edgekit update --skip-provision                   # package + restart only
+```
+
+`edgekit provision` remains the repair tool. It is safe to run repeatedly and will re-do
+only the steps that are not already in the desired state.
 
 ---
 
@@ -248,7 +265,7 @@ steps that are not already in the desired state.
 ```
 install.sh                  bootstrap: deps → virtualenv → `edgekit setup`
 src/edgekit/
-  cli.py                    Typer CLI; `setup` is what the installer calls
+  cli.py                    Typer CLI; `setup` is what the installer calls, `update` refreshes
   wizard.py                 the interview (flags → environment → prompt)
   config.py                 typed config; secrets encrypted at rest
   crypto.py                 Fernet secret handling

@@ -198,6 +198,32 @@ class TestFirewallArtifacts:
         assert "MASQUERADE" in script
         assert "ESTABLISHED,RELATED" in script
 
+    def test_cloud_firewall_ports_lists_every_edgekit_port(self, config):
+        """After install the operator must know exactly what to open — and what not to."""
+        rows = firewall.cloud_firewall_ports(config)
+        opened = {(r.protocol, r.port) for r in rows if r.action == "open"}
+        closed = {(r.protocol, r.port) for r in rows if r.action == "closed"}
+
+        assert ("udp", 51820) in opened
+        assert ("tcp", 80) in opened
+        assert ("tcp", 443) in opened
+        assert ("tcp", 22) in opened
+        assert ("tcp", 8181) in closed
+        assert ("tcp", 8088) in closed
+
+    def test_cloud_firewall_ports_follow_configured_values(self, config):
+        config.wireguard.listen_port = 41194
+        config.npm.http_port = 8080
+        config.npm.https_port = 8443
+        config.npm.admin_port = 9000
+        config.panel.port = 9090
+        rows = { (r.protocol, r.port, r.action) for r in firewall.cloud_firewall_ports(config) }
+        assert ("udp", 41194, "open") in rows
+        assert ("tcp", 8080, "open") in rows
+        assert ("tcp", 8443, "open") in rows
+        assert ("tcp", 9000, "closed") in rows
+        assert ("tcp", 9090, "closed") in rows
+
     def test_the_generated_script_is_valid_shell(self, tmp_path, monkeypatch):
         import subprocess
 
@@ -286,6 +312,8 @@ class TestHealthChecks:
         assert "51820" in check.remedy
         assert "80" in check.remedy
         assert "443" in check.remedy
+        assert "8181" in check.remedy
+        assert "8088" in check.remedy
 
     def test_a_report_with_a_failure_is_not_ok(self):
         from edgekit.services.health import Check, HealthReport
