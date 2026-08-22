@@ -110,6 +110,85 @@ def detect_docker_bridge_interface(default: str = "docker0") -> str:
     return default
 
 
+@dataclass(frozen=True)
+class DockerBridge:
+    """A Docker bridge network as the kernel sees it: subnet plus interface name."""
+
+    network: str
+    subnet: str
+    interface: str
+
+
+_NETWORK_FORMAT = (
+    "{{.Name}}|{{.Driver}}|"
+    "{{if .IPAM.Config}}{{(index .IPAM.Config 0).Subnet}}{{end}}|"
+    '{{index .Options "com.docker.network.bridge.name"}}|{{.Id}}'
+)
+
+
+def _inspect_bridge(network: str) -> DockerBridge | None:
+    """Read one network, returning None unless it is a bridge with a usable subnet."""
+    result = run(["docker", "network", "inspect", network, "--format", _NETWORK_FORMAT])
+    if not result.ok:
+        return None
+    parts = [part.strip() for part in result.stdout.strip().split("|")]
+    if len(parts) != 5:
+        return None
+    name, driver, subnet, interface, network_id = parts
+    if driver != "bridge" or "/" not in subnet:
+        return None
+    if not interface or interface == "<no value>":
+        # Compose networks carry no explicit name; the kernel calls them br-<id[:12]>.
+        interface = "docker0" if name == "bridge" else f"br-{network_id[:12]}"
+    return DockerBridge(network=name, subnet=subnet, interface=interface)
+
+
+def container_bridges(container: str) -> list[DockerBridge]:
+    """Every bridge network a container is really attached to.
+
+    Compose gives Nginx Proxy Manager a project network of its own
+    (``nginx-proxy-manager_default``) rather than the default ``bridge``, with its own
+    subnet from the address pool and a ``br-<hash>`` interface. Rules written for
+    docker0/172.17.0.0/16 therefore target an interface NPM holds no address on, and
+    never match a single packet.
+    """
+    result = run(
+        [
+            "docker",
+            "inspect",
+            container,
+            "--format",
+            "{{range $name, $cfg := .NetworkSettings.Networks}}{{$name}}\n{{end}}",
+        ]
+    )
+    if not result.ok:
+        return []
+    bridges = []
+    for name in (line.strip() for line in result.stdout.splitlines()):
+        if not name:
+            continue
+        bridge = _inspect_bridge(name)
+        if bridge is not None:
+            bridges.append(bridge)
+    return bridges
+
+
+def detect_proxy_bridge(config: Config) -> DockerBridge:
+    """The bridge Nginx Proxy Manager sits on — the one the rules have to name."""
+    bridges = container_bridges(config.npm.container_name)
+    if bridges:
+        return bridges[0]
+    log.warning(
+        "could not read %s's networks; falling back to the default bridge",
+        config.npm.container_name,
+    )
+    return DockerBridge(
+        network="bridge",
+        subnet=detect_docker_bridge_subnet(config.server.docker_bridge_subnet),
+        interface=detect_docker_bridge_interface(),
+    )
+
+
 def write_rules(
     *, docker_subnet: str, wg_subnet: str, wg_if: str, docker_if: str = "docker0"
 ) -> None:
@@ -201,35 +280,88 @@ def open_host_ports(*, wg_port: int, http_port: int, https_port: int) -> list[st
     return opened
 
 
-def allow_docker_to_panel(config: Config) -> bool:
+def allow_docker_to_panel(config: Config) -> list[str]:
     """Let the NPM container reach the panel on the hub IP.
 
     10.50.0.1 is a local address, so that packet is INPUT, not FORWARD. ufw's
     default deny drops it, NPM waits on the backend, and HTTPS on :443 hangs
     even though 443/tcp is allowed. The panel stays closed from the internet.
+
+    The source has to be the subnet NPM is really on. Compose gives it a project
+    network of its own, so allowing the default bridge opens a path nothing uses and
+    leaves ``edgekit.<zone>`` timing out with 80/443 apparently fine.
     """
     if not has("ufw"):
-        return False
+        return []
     bind = (config.panel.bind or "").strip()
     if not bind or bind in ("127.0.0.1", "localhost", "::1"):
-        return False
-    subnet = config.server.docker_bridge_subnet or "172.17.0.0/16"
-    run(
-        [
-            "ufw",
-            "allow",
-            "from",
-            subnet,
-            "to",
-            bind,
-            "port",
-            str(config.panel.port),
-            "proto",
-            "tcp",
-        ],
-        check=True,
-    )
-    return True
+        return []
+
+    subnets = [bridge.subnet for bridge in container_bridges(config.npm.container_name)]
+    if not subnets:
+        subnets = [config.server.docker_bridge_subnet or "172.17.0.0/16"]
+
+    for subnet in subnets:
+        run(
+            [
+                "ufw",
+                "allow",
+                "from",
+                subnet,
+                "to",
+                bind,
+                "port",
+                str(config.panel.port),
+                "proto",
+                "tcp",
+            ],
+            check=True,
+        )
+    _revoke_stale_panel_rules(config, keep=subnets)
+    return subnets
+
+
+def _revoke_stale_panel_rules(config: Config, *, keep: list[str]) -> None:
+    """Drop panel openings for bridges NPM is not on.
+
+    Earlier releases allowed the default bridge, which NPM was never attached to. Left
+    in place it hands the panel to every unrelated container on docker0.
+    """
+    bind = (config.panel.bind or "").strip()
+    status = run(["ufw", "status"], check=False).stdout
+    for subnet in _panel_rule_sources(status, bind, config.panel.port):
+        if subnet in keep:
+            continue
+        run(
+            [
+                "ufw",
+                "delete",
+                "allow",
+                "from",
+                subnet,
+                "to",
+                bind,
+                "port",
+                str(config.panel.port),
+                "proto",
+                "tcp",
+            ],
+            check=False,
+        )
+
+
+def _panel_rule_sources(status: str, bind: str, port: int) -> list[str]:
+    """Source subnets of existing `<bind> <port>/tcp ALLOW <subnet>` rules."""
+    target = f"{bind} {port}/tcp"
+    sources = []
+    for line in status.splitlines():
+        line = line.strip()
+        if not line.startswith(target) or "ALLOW" not in line.upper():
+            continue
+        source = line.split()[-1]
+        if "/" in source:
+            sources.append(source)
+    return sources
 
 
 @dataclass(frozen=True)

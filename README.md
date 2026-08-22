@@ -154,7 +154,9 @@ Those values are the defaults; setup prints the real ones if you changed them.
 Setup binds the panel to the WireGuard hub IP (e.g. `10.50.0.1:8088`) and publishes it at
 `https://edgekit.yourdomain` through Nginx Proxy Manager, with the origin certificate
 attached. That is how NPM (running in Docker) can reach the panel — `127.0.0.1` inside the
-container is not the host.
+container is not the host. The hub IP is a *local* address, so that packet hits ufw's INPUT
+chain: `edgekit firewall setup` opens the panel port to NPM's Docker subnet only, and to
+nothing else.
 
 Keep the panel port **closed** on your cloud firewall; only UDP 51820 and TCP 80/443 need to
 be open. For loopback-only access instead, set `EDGEKIT_PANEL_BIND=127.0.0.1` before setup
@@ -301,7 +303,10 @@ locally and only a CSR is sent.
 
 *Firewall rules are a script, not `iptables -A`.* The guide's commands are neither idempotent
 nor reboot-safe. edgekit writes `/usr/local/lib/edgekit/firewall.sh` — each rule added only if
-an identical one is absent — plus a systemd unit that replays it after `docker.service`.
+an identical one is absent — plus a systemd unit that replays it after `docker.service`. The
+subnet and interface in that script are read from the network Nginx Proxy Manager is actually
+attached to: Compose gives it a project network of its own, so rules naming `docker0` and
+`172.17.0.0/16` would compile fine and match nothing.
 
 *The NPM admin UI stays on loopback.* The management panel binds to the WireGuard hub IP and
 is published at `edgekit.<zone>` via NPM — never on `0.0.0.0`. Keep the panel port closed on

@@ -215,27 +215,30 @@ def _check_firewall(config: Config) -> Check:
     if not has("iptables"):
         return Check("fw_rules", "Docker to WireGuard rules", Level.SKIP, "iptables not present")
 
+    # NPM lives on its Compose project network, so the rules have to name that bridge.
+    bridge = firewall.detect_proxy_bridge(config)
     present = firewall.rules_present(
-        docker_subnet=config.server.docker_bridge_subnet,
+        docker_subnet=bridge.subnet,
         wg_subnet=config.wireguard.subnet,
         wg_if=config.wireguard.interface,
-        docker_if=firewall.detect_docker_bridge_interface(),
+        docker_if=bridge.interface,
     )
     if present:
         return Check(
             "fw_rules",
             "Docker to WireGuard rules",
             Level.OK,
-            f"{config.server.docker_bridge_subnet} -> {config.wireguard.subnet}",
+            f"{bridge.interface} {bridge.subnet} -> {config.wireguard.subnet}",
         )
     return Check(
         "fw_rules",
         "Docker to WireGuard rules",
         Level.FAIL,
-        "forwarding or NAT rules are missing",
-        "Run `systemctl start edgekit-firewall` (or `edgekit provision`). Verify the Docker "
-        "bridge subnet with `docker network inspect bridge` — if it differs from "
-        f"{config.server.docker_bridge_subnet}, update it in /etc/edgekit/config.yaml.",
+        f"forwarding or NAT rules are missing for {bridge.interface} ({bridge.subnet})",
+        "Run `systemctl start edgekit-firewall` (or `edgekit provision`). The rules must "
+        f"name the network {config.npm.container_name} is on ({bridge.network}), not the "
+        "default bridge — check with `docker inspect "
+        f"{config.npm.container_name} --format '{{{{json .NetworkSettings.Networks}}}}'`.",
     )
 
 
@@ -334,10 +337,16 @@ async def _reach_from_container(config: Config, target: tuple) -> Check:
             f"on the peer.",
         )
     if host == config.panel.bind and port == config.panel.port:
-        subnet = config.server.docker_bridge_subnet or "172.17.0.0/16"
+        bridges = firewall.container_bridges(config.npm.container_name)
+        subnet = (
+            bridges[0].subnet
+            if bridges
+            else (config.server.docker_bridge_subnet or "172.17.0.0/16")
+        )
         remedy = (
             f"The panel is on this host. ufw default-deny drops Docker INPUT to "
-            f"{host}:{port}. Allow the bridge only: "
+            f"{host}:{port}. Allow the network {config.npm.container_name} is really on "
+            f"— Compose gives it one of its own, not the default bridge: "
             f"`ufw allow from {subnet} to {host} port {port} proto tcp` "
             f"(or `edgekit firewall setup`)."
         )

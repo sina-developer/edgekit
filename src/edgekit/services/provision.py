@@ -297,11 +297,12 @@ class Provisioner:
         if self.skip_docker:
             raise SkipStep("--skip-docker")
 
-        docker_subnet = firewall.detect_docker_bridge_subnet(
-            self.config.server.docker_bridge_subnet
-        )
+        # The bridge NPM is on, not the default one: Compose puts it on its own project
+        # network, and rules naming docker0/172.17.0.0/16 match nothing.
+        bridge = firewall.detect_proxy_bridge(self.config)
+        docker_subnet = bridge.subnet
+        docker_if = bridge.interface
         self.config.server.docker_bridge_subnet = docker_subnet
-        docker_if = firewall.detect_docker_bridge_interface()
         wg_if = self.config.wireguard.interface
         wg_subnet = self.config.wireguard.subnet
 
@@ -323,9 +324,11 @@ class Provisioner:
             http_port=self.config.npm.http_port,
             https_port=self.config.npm.https_port,
         )
-        firewall.allow_docker_to_panel(self.config)
+        panel = firewall.allow_docker_to_panel(self.config)
         suffix = f"; ufw opened {', '.join(opened)}" if opened else ""
-        return f"{docker_if} ({docker_subnet}) -> {wg_if} ({wg_subnet}){suffix}"
+        if panel:
+            suffix += f"; panel reachable from {', '.join(panel)}"
+        return f"{bridge.network}: {docker_if} ({docker_subnet}) -> {wg_if} ({wg_subnet}){suffix}"
 
     async def step_cloudflare_zone(self) -> str:
         cf = self.config.cloudflare

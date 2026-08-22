@@ -6,6 +6,17 @@ All notable changes to edgekit are recorded here. Version numbers follow
 The single source of truth for the number itself is `src/edgekit/__init__.py`
 (`__version__`). Keep this file in lockstep with that string.
 
+## [1.1.2] — 2026-08-22
+
+- Firewall rules now name the Docker network Nginx Proxy Manager is really on. Compose
+  puts NPM on its own project network (`nginx-proxy-manager_default`, typically
+  `172.18.0.0/16` on a `br-<hash>` interface), not the default bridge, so the ufw rule
+  that let NPM reach the panel allowed `172.17.0.0/16` and matched nothing: with ufw on,
+  `edgekit.<zone>` timed out while 80/443 looked healthy. The docker→WireGuard forwarding
+  and NAT rules had the same wrong interface and subnet.
+- The stale default-bridge opening on the panel port is revoked when it is found, so the
+  panel is not left reachable from unrelated containers on docker0.
+
 ## [1.1.1] — 2026-08-22
 
 - `edgekit firewall setup` restarts Docker after enabling ufw, so published 80/443

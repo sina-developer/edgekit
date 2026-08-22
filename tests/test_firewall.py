@@ -262,3 +262,139 @@ def test_firewall_check_command_prints_missing_ports(monkeypatch, config):
     result = runner.invoke(app, ["firewall", "check"])
     assert result.exit_code == 1
     assert "51820" in result.output
+
+
+# --------------------------------------------------- NPM's real Docker network
+
+# Compose gives NPM a project network of its own; the default bridge is a red herring.
+NPM_NETWORK = (
+    "nginx-proxy-manager_default|bridge|172.18.0.0/16|<no value>|"
+    "9f3c1d2b7a5e4c6d8f0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f506"
+)
+DEFAULT_NETWORK = "bridge|bridge|172.17.0.0/16|docker0|" + "0" * 64
+
+
+def _fail(argv) -> Result:
+    return Result(tuple(str(a) for a in argv), 1, "", "No such object")
+
+
+def _docker_replies(status: str = ACTIVE_STATUS, attached: bool = True):
+    """A fake `run` where NPM is attached to its Compose network, not docker0."""
+
+    def fake_run(argv, **_kwargs):
+        argv = [str(a) for a in argv]
+        if argv[:2] == ["docker", "inspect"]:
+            if not attached:
+                return _fail(argv)
+            return _ok(argv, "nginx-proxy-manager_default\n")
+        if argv[:3] == ["docker", "network", "inspect"]:
+            fields = argv[-1]
+            if "|" not in fields:  # the single-field probes on the default bridge
+                default = DEFAULT_NETWORK.split("|")
+                return _ok(argv, (default[2] if "IPAM" in fields else default[3]) + "\n")
+            if argv[3] == "bridge":
+                return _ok(argv, DEFAULT_NETWORK + "\n")
+            return _ok(argv, NPM_NETWORK + "\n")
+        if argv[:2] == ["ufw", "status"]:
+            return _ok(argv, status)
+        return _ok(argv)
+
+    return fake_run
+
+
+def test_container_bridges_reads_the_compose_network_not_docker0(monkeypatch):
+    monkeypatch.setattr(firewall, "run", _docker_replies())
+
+    bridges = firewall.container_bridges("nginx-proxy-manager")
+
+    assert [b.subnet for b in bridges] == ["172.18.0.0/16"]
+    # Compose networks have no bridge-name option; the kernel calls them br-<id[:12]>.
+    assert bridges[0].interface == "br-9f3c1d2b7a5e"
+
+
+def test_detect_proxy_bridge_falls_back_when_the_container_is_absent(config, monkeypatch):
+    monkeypatch.setattr(firewall, "run", _docker_replies(attached=False))
+
+    bridge = firewall.detect_proxy_bridge(config)
+
+    assert bridge.subnet == "172.17.0.0/16"
+    assert bridge.interface == "docker0"
+
+
+def test_panel_allow_names_the_network_npm_is_actually_on(config, monkeypatch):
+    """Allowing 172.17.0.0/16 matches no packet: NPM sits on 172.18.0.0/16."""
+    config.panel.bind = "10.50.0.1"
+    config.panel.port = 8088
+    config.server.docker_bridge_subnet = "172.17.0.0/16"
+    calls: list[list[str]] = []
+
+    replies = _docker_replies()
+
+    def fake_run(argv, **kwargs):
+        calls.append([str(a) for a in argv])
+        return replies(argv, **kwargs)
+
+    monkeypatch.setattr(firewall, "run", fake_run)
+    monkeypatch.setattr(firewall, "has", lambda binary: True)
+
+    assert firewall.allow_docker_to_panel(config) == ["172.18.0.0/16"]
+
+    allows = [c for c in calls if c[:3] == ["ufw", "allow", "from"]]
+    assert allows == [
+        ["ufw", "allow", "from", "172.18.0.0/16", "to", "10.50.0.1",
+         "port", "8088", "proto", "tcp"]
+    ]
+
+
+def test_panel_allow_revokes_the_stale_default_bridge_rule(config, monkeypatch):
+    """The pre-fix rule opened the panel to docker0, which NPM is not on."""
+    config.panel.bind = "10.50.0.1"
+    config.panel.port = 8088
+    status = (
+        ACTIVE_STATUS
+        + "10.50.0.1 8088/tcp          ALLOW       172.17.0.0/16\n"
+        + "10.50.0.1 8088/tcp          ALLOW       172.18.0.0/16\n"
+    )
+    calls: list[list[str]] = []
+    replies = _docker_replies(status=status)
+
+    def fake_run(argv, **kwargs):
+        calls.append([str(a) for a in argv])
+        return replies(argv, **kwargs)
+
+    monkeypatch.setattr(firewall, "run", fake_run)
+    monkeypatch.setattr(firewall, "has", lambda binary: True)
+
+    firewall.allow_docker_to_panel(config)
+
+    deletes = [c for c in calls if c[:2] == ["ufw", "delete"]]
+    assert [c[4] for c in deletes] == ["172.17.0.0/16"], deletes
+
+
+def test_enable_allows_the_compose_bridge_to_reach_the_panel(config, monkeypatch):
+    """End to end: `edgekit firewall setup` must open the subnet NPM really uses."""
+    config.panel.bind = "10.50.0.1"
+    config.panel.port = 8088
+    calls: list[list[str]] = []
+    replies = _docker_replies()
+
+    def fake_run(argv, **kwargs):
+        calls.append([str(a) for a in argv])
+        return replies(argv, **kwargs)
+
+    monkeypatch.setattr(firewall, "run", fake_run)
+    monkeypatch.setattr(firewall, "has", lambda binary: True)
+    monkeypatch.setattr(firewall, "ensure_forward_policy_accept", lambda: False)
+    monkeypatch.setattr(firewall, "ensure_docker_starts_after_ufw", lambda: False)
+    monkeypatch.setattr(firewall, "restore_container_networking", lambda: None)
+
+    firewall.enable_host_firewall(config)
+
+    panel_allow = [
+        c for c in calls
+        if c[:3] == ["ufw", "allow", "from"] and "8088" in c
+    ]
+    assert panel_allow and panel_allow[0][3] == "172.18.0.0/16", calls
+    enable = next(i for i, c in enumerate(calls) if c[:3] == ["ufw", "--force", "enable"])
+    assert calls.index(panel_allow[0]) < enable
+    assert ["ufw", "allow", "8088/tcp"] not in calls
