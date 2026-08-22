@@ -50,6 +50,60 @@ def test_enable_allows_ssh_before_turning_ufw_on(config, monkeypatch):
     assert ssh < enable, "SSH must be allowed before ufw is enabled"
 
 
+def test_enable_restarts_docker_after_ufw_rewrites_iptables(config, monkeypatch):
+    """ufw enable replaces iptables; Docker's published 80/443 die until docker restarts."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        argv = [str(a) for a in argv]
+        calls.append(argv)
+        if argv[:2] == ["ufw", "status"]:
+            return _ok(argv, ACTIVE_STATUS)
+        return _ok(argv)
+
+    monkeypatch.setattr(firewall, "run", fake_run)
+    monkeypatch.setattr(firewall, "has", lambda binary: True)
+    monkeypatch.setattr(firewall, "ensure_forward_policy_accept", lambda: False)
+
+    firewall.enable_host_firewall(config)
+
+    enable = next(i for i, c in enumerate(calls) if c[:3] == ["ufw", "--force", "enable"])
+    restart = next(
+        i for i, c in enumerate(calls) if c[:3] == ["systemctl", "try-restart", "docker"]
+    )
+    assert enable < restart
+
+
+def test_enable_replays_docker_to_wireguard_rules_after_ufw(
+    config, monkeypatch, tmp_path
+):
+    """The docker0↔wg0 rules live outside ufw and are wiped by `ufw enable`."""
+    script = tmp_path / "firewall.sh"
+    script.write_text("#!/bin/sh\n")
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        argv = [str(a) for a in argv]
+        calls.append(argv)
+        if argv[:2] == ["ufw", "status"]:
+            return _ok(argv, ACTIVE_STATUS)
+        return _ok(argv)
+
+    monkeypatch.setattr(firewall, "FIREWALL_SCRIPT", script)
+    monkeypatch.setattr(firewall, "run", fake_run)
+    monkeypatch.setattr(firewall, "has", lambda binary: True)
+    monkeypatch.setattr(firewall, "ensure_forward_policy_accept", lambda: False)
+
+    firewall.enable_host_firewall(config)
+
+    enable = next(i for i, c in enumerate(calls) if c[:3] == ["ufw", "--force", "enable"])
+    restart = next(
+        i for i, c in enumerate(calls) if c[:3] == ["systemctl", "try-restart", "docker"]
+    )
+    replay = next(i for i, c in enumerate(calls) if c == [str(script)])
+    assert enable < restart < replay
+
+
 def test_enable_opens_required_ports_and_skips_admin_and_panel(config, monkeypatch):
     calls: list[list[str]] = []
 

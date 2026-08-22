@@ -407,6 +407,11 @@ def firewall_setup() -> None:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
     _print_host_firewall_report(report)
+    if report.ok:
+        console.print(
+            "  [dim]Docker was restarted so published 80/443 survive ufw rewriting "
+            "iptables.[/dim]"
+        )
     raise typer.Exit(0 if report.ok else 1)
 
 

@@ -248,8 +248,10 @@ class TestFirewallArtifacts:
         )
         unit = (tmp_path / "unit.service").read_text()
 
-        assert "After=network-online.target docker.service wg-quick@wg0.service" in unit
+        assert "After=network-online.target ufw.service docker.service wg-quick@wg0.service" in unit
         assert "RemainAfterExit=yes" in unit
+        assert firewall.DOCKER_AFTER_UFW_DROPIN.is_file()
+        assert "After=ufw.service" in firewall.DOCKER_AFTER_UFW_DROPIN.read_text()
 
 
 class TestComposeRendering:

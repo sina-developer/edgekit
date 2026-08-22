@@ -6,6 +6,11 @@ All notable changes to edgekit are recorded here. Version numbers follow
 The single source of truth for the number itself is `src/edgekit/__init__.py`
 (`__version__`). Keep this file in lockstep with that string.
 
+## [1.1.1] — 2026-08-22
+
+- `edgekit firewall setup` restarts Docker after enabling ufw, so published 80/443
+  and the docker0↔WireGuard rules survive ufw rewriting iptables.
+
 ## [1.1.0] — 2026-08-22
 
 - Setup asks whether to renew the Cloudflare origin certificate when keys already

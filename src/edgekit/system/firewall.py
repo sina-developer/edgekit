@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import Config
-from ..paths import FIREWALL_SCRIPT, FIREWALL_UNIT
+from ..paths import FIREWALL_SCRIPT, FIREWALL_UNIT, SYSTEMD_DIR
 from .shell import has, run, systemctl
 
 log = logging.getLogger("edgekit.firewall")
@@ -56,7 +56,7 @@ add nat POSTROUTING -s "$DOCKER_SUBNET" -d "$WG_SUBNET" -o "$WG_IF" -j MASQUERAD
 
 UNIT_TEMPLATE = """[Unit]
 Description=edgekit Docker-to-WireGuard forwarding rules
-After=network-online.target docker.service wg-quick@{wg_if}.service
+After=network-online.target ufw.service docker.service wg-quick@{wg_if}.service
 Wants=network-online.target
 Requires=docker.service
 
@@ -68,6 +68,9 @@ ExecStart={script}
 [Install]
 WantedBy=multi-user.target
 """
+
+DOCKER_AFTER_UFW_DROPIN = SYSTEMD_DIR / "docker.service.d" / "edgekit-after-ufw.conf"
+DOCKER_AFTER_UFW_UNIT = "[Unit]\nAfter=ufw.service\n"
 
 
 def detect_docker_bridge_subnet(default: str = "172.17.0.0/16") -> str:
@@ -124,9 +127,38 @@ def write_rules(
     )
 
     unit = UNIT_TEMPLATE.format(wg_if=wg_if, script=FIREWALL_SCRIPT)
-    if not FIREWALL_UNIT.exists() or FIREWALL_UNIT.read_text() != unit:
+    unit_changed = not FIREWALL_UNIT.exists() or FIREWALL_UNIT.read_text() != unit
+    if unit_changed:
         FIREWALL_UNIT.write_text(unit)
+    dropin_changed = ensure_docker_starts_after_ufw()
+    if unit_changed or dropin_changed:
         systemctl("daemon-reload")
+
+
+def ensure_docker_starts_after_ufw() -> bool:
+    """Docker must re-insert published-port NAT *after* ufw has rewritten iptables."""
+    DOCKER_AFTER_UFW_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        DOCKER_AFTER_UFW_DROPIN.exists()
+        and DOCKER_AFTER_UFW_DROPIN.read_text() == DOCKER_AFTER_UFW_UNIT
+    ):
+        return False
+    DOCKER_AFTER_UFW_DROPIN.write_text(DOCKER_AFTER_UFW_UNIT)
+    return True
+
+
+def restore_container_networking() -> None:
+    """Re-insert Docker published ports and docker0↔wg0 rules after a ufw rewrite.
+
+    ``ufw enable`` / ``ufw reload`` replace the kernel tables. ``ufw status`` can still
+    show 80/443 ALLOW on INPUT while Docker's DNAT into Nginx Proxy Manager is gone,
+    so Cloudflare times out on the origin until Docker is restarted.
+    """
+    run(["systemctl", "daemon-reload"], check=False)
+    if has("docker"):
+        run(["systemctl", "try-restart", "docker"], check=False)
+    if FIREWALL_SCRIPT.is_file():
+        run([str(FIREWALL_SCRIPT)], check=False)
 
 
 def apply_rules() -> None:
@@ -165,6 +197,7 @@ def open_host_ports(*, wg_port: int, http_port: int, https_port: int) -> list[st
         if run(["ufw", "allow", spec]).ok:
             opened.append(spec)
     run(["ufw", "reload"])
+    restore_container_networking()
     return opened
 
 
@@ -266,6 +299,8 @@ def enable_host_firewall(config: Config) -> HostFirewallReport:
 
     run(["ufw", "--force", "enable"], check=True)
     run(["ufw", "reload"], check=False)
+    ensure_docker_starts_after_ufw()
+    restore_container_networking()
     return check_host_firewall(config)
 
 
