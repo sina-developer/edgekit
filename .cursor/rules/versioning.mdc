@@ -1,0 +1,33 @@
+---
+description: Bump the project version and changelog after every behavior change.
+alwaysApply: true
+---
+
+# Versioning
+
+This repo is at **SemVer**. The current release is whatever `__version__` says
+in `src/edgekit/__init__.py` (pyproject reads it from there). Do not ship a
+behavior change without bumping that string and adding a `CHANGELOG.md` entry.
+
+## When you finish a change
+
+1. Decide the bump (see below).
+2. Set `__version__` in `src/edgekit/__init__.py`.
+3. Add a `## [X.Y.Z] — YYYY-MM-DD` section at the top of `CHANGELOG.md` (below
+   the intro) with one or two bullets on **why**.
+4. Do not edit `version` in `pyproject.toml` — it is dynamic.
+
+## What to bump
+
+| Change | Bump | Example |
+|---|---|---|
+| Bug fix, copy, small hardening | PATCH `1.0.0` → `1.0.1` | installer TTY abort, diagnostics timeout |
+| New command, user-visible feature | MINOR `1.0.0` → `1.1.0` | `edgekit update`, `firewall setup` |
+| Breaking CLI/config/API change | MAJOR `1.0.0` → `2.0.0` | rename env vars, drop a command |
+
+Docs-only, comments, tests-only, or formatting: **no bump**.
+
+## Checks
+
+`tests/test_version.py` fails if `__version__` is not SemVer or is missing from
+`CHANGELOG.md`. Run that test after the bump.

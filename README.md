@@ -350,6 +350,9 @@ python3 -m venv .venv
 .venv/bin/ruff check src/ tests/
 ```
 
+Version lives in `src/edgekit/__init__.py` (`__version__`). After a behavior change,
+bump it (SemVer) and add a `CHANGELOG.md` entry — see `.cursor/rules/versioning.mdc`.
+
 Tests set `EDGEKIT_ROOT` to a temporary directory, so nothing touches `/etc` or `/var`. The
 `wg` binary and Docker are stubbed; the API clients are tested against mocked HTTP.
 

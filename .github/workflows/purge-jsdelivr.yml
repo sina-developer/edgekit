@@ -1,0 +1,22 @@
+# Keep the documented curl installer on jsDelivr in sync with GitHub master.
+# `cdn.jsdelivr.net/gh/...@master/...` is cached; without a purge, install.sh
+# can stay stale for hours after a push.
+name: Purge jsDelivr
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Purge install.sh on jsDelivr
+        env:
+          CDN_PATH: gh/${{ github.repository }}@master/install.sh
+        run: |
+          set -euo pipefail
+          echo "Purging https://cdn.jsdelivr.net/${CDN_PATH}"
+          curl -fsSL "https://purge.jsdelivr.net/${CDN_PATH}"
+          echo

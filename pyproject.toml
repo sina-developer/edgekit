@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edgekit"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Self-installing WireGuard hub + Nginx Proxy Manager edge server, with a management panel."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,9 @@ edgekit = "edgekit.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "edgekit.__version__"}
 
 [tool.setuptools.package-data]
 edgekit = ["templates/*.j2", "web/templates/*.html", "web/static/*"]
