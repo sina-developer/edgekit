@@ -1,17 +1,43 @@
 {% extends "base.html" %}
 {% block title %}Container logs — edgekit{% endblock %}
+{% block crumb %}
+<a class="dim" href="/settings">Settings</a> {% include "icons/chevron-right.svg" %}
+{{ config.npm.container_name }} logs
+{% endblock %}
+
+{% block topbar_actions %}
+<div class="tabs">
+  <a class="tab {{ 'active' if lines == 50 }}" href="/logs?lines=50">50</a>
+  <a class="tab {{ 'active' if lines == 200 }}" href="/logs?lines=200">200</a>
+  <a class="tab {{ 'active' if lines == 1000 }}" href="/logs?lines=1000">1000</a>
+</div>
+<button class="ghost small" type="button" data-copy="#container-log">
+  {% include "icons/copy.svg" %} Copy
+</button>
+<a class="ghost icon button" href="/logs?lines={{ lines }}" title="Refresh" aria-label="Refresh">
+  {% include "icons/refresh.svg" %}
+</a>
+{% endblock %}
 
 {% block content %}
 <div class="page-head">
-  <h1>{{ config.npm.container_name }}</h1>
   <div>
-    <a class="button small" href="/logs?lines=50">50</a>
-    <a class="button small" href="/logs?lines=200">200</a>
-    <a class="button small" href="/logs?lines=1000">1000</a>
+    <h1 class="mono" style="font-size:22px">{{ config.npm.container_name }}</h1>
+    <p class="lede">
+      Container logs, straight from <span class="mono">docker logs</span>. Not stored by
+      edgekit — this is Docker's own buffer.
+    </p>
   </div>
 </div>
 
 <section class="card">
-  <pre class="code scroll">{{ output }}</pre>
+  <div class="log-head">
+    {% include "icons/terminal.svg" %}
+    <span class="mono">docker logs {{ config.npm.container_name }} --tail {{ lines }}</span>
+    <span class="muted small" style="margin-left:auto">last {{ lines }} lines &middot; oldest first</span>
+  </div>
+  <div class="card-body" style="padding-top:16px">
+    <pre id="container-log" class="code scroll">{{ output }}</pre>
+  </div>
 </section>
 {% endblock %}

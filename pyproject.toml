@@ -46,7 +46,7 @@ where = ["src"]
 version = {attr = "edgekit.__version__"}
 
 [tool.setuptools.package-data]
-edgekit = ["templates/*.j2", "web/templates/*.html", "web/static/*"]
+edgekit = ["templates/*.j2", "web/templates/*.html", "web/templates/icons/*.svg", "web/static/*"]
 
 [tool.ruff]
 line-length = 100

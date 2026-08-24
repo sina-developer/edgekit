@@ -1,36 +1,56 @@
 {% extends "base.html" %}
 {% block title %}Peers — edgekit{% endblock %}
+{% block crumb %}Peers{% endblock %}
+
+{% block topbar_actions %}
+<form method="post" action="/peers/sync" class="inline">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+  <button class="ghost small" type="submit">{% include "icons/refresh.svg" %} Re-sync interface</button>
+</form>
+{% endblock %}
 
 {% block content %}
 <div class="page-head">
-  <h1>Peers</h1>
-  <form method="post" action="/peers/sync" class="inline">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <button class="button small" type="submit">Re-sync interface</button>
-  </form>
+  <div>
+    <h1>Peers</h1>
+    <p class="lede">
+      WireGuard clients attached to this hub. Every change regenerates
+      <span class="mono">{{ config.wireguard.interface }}.conf</span> and hot-applies it, so
+      adding a peer never drops the tunnels already up.
+    </p>
+  </div>
 </div>
 
-<section class="card">
-  <h2>Add a peer</h2>
-  <p class="muted">
-    Leave the public key blank and edgekit generates the keypair, so you get a ready-to-use
-    config and QR code. Supply a public key instead if the private key should never leave the
-    client.
-  </p>
+<details class="card" open>
+  <summary class="disclosure">
+    <div>
+      <h2>Add a peer</h2>
+      <p class="card-desc">
+        Leave the public key blank and edgekit generates the keypair, so you get a ready
+        config and QR code back. Supply one instead if the private key should never leave
+        the client.
+      </p>
+    </div>
+    <span class="disclosure-chevron">{% include "icons/chevron-down.svg" %}</span>
+  </summary>
+
   <form method="post" action="/peers" class="grid">
     <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
     <label>Name
-      <input type="text" name="name" required placeholder="raspberry-pi" pattern="[a-zA-Z0-9][a-zA-Z0-9 ._\-]{0,62}[a-zA-Z0-9]">
+      <input type="text" name="name" required placeholder="raspberry-pi"
+             pattern="[a-zA-Z0-9][a-zA-Z0-9 ._\-]{0,62}[a-zA-Z0-9]">
     </label>
     <label>Description
       <input type="text" name="description" placeholder="Home Pi running retro + api">
     </label>
     <label>Tunnel address
-      <input type="text" name="address" placeholder="{{ suggested_address }}" value="">
+      <input type="text" name="address" placeholder="{{ suggested_address }}" value="" class="mono">
       <small>Blank assigns {{ suggested_address or 'the next free address' }}.</small>
     </label>
-    <label>Public key <span class="muted">(optional)</span>
+    <label>Public key <span class="opt">optional</span>
       <input type="text" name="public_key" placeholder="generated automatically" class="mono">
+      <small>Supplying one means edgekit never sees the private key — and cannot re-serve
+        the config.</small>
     </label>
     <label>Extra routed CIDRs
       <input type="text" name="extra_allowed_ips" placeholder="192.168.1.0/24" class="mono">
@@ -40,21 +60,32 @@
       <input type="number" name="keepalive" value="25" min="0" max="3600">
       <small>25 keeps NAT bindings alive for peers behind a home router.</small>
     </label>
-    <label class="check">
+    <label class="check" style="grid-column:1/-1">
       <input type="checkbox" name="use_preshared_key" value="true" checked>
-      Add a pre-shared key
+      <span>Add a pre-shared key <small>An extra symmetric layer on top of the tunnel.
+        Recommended.</small></span>
     </label>
     <div class="actions"><button class="primary" type="submit">Create peer</button></div>
   </form>
-</section>
+</details>
 
 <section class="card">
-  <h2>Registered peers</h2>
-  <table>
+  <div class="card-head">
+    <div>
+      <h2>Registered peers</h2>
+      <p class="card-desc">
+        {{ peers|length }} peer{{ 's' if peers|length != 1 }}
+        {%- if peers %} &middot; {{ peers|selectattr('enabled')|selectattr('id')|list|length
+          }} enabled{% endif %}
+      </p>
+    </div>
+  </div>
+  {% if peers %}
+  <div class="table-wrap"><table>
     <thead>
       <tr>
-        <th>Name</th><th>Address</th><th>Routed</th><th>State</th>
-        <th>Handshake</th><th>Traffic</th><th></th>
+        <th>Name</th><th>Address</th><th>Routed</th><th>Status</th>
+        <th>Handshake</th><th class="right">Traffic</th><th style="width:48px"></th>
       </tr>
     </thead>
     <tbody>
@@ -62,36 +93,69 @@
       {% set state = live.get(peer.public_key) %}
       <tr>
         <td>
-          <a href="/peers/{{ peer.id }}"><strong>{{ peer.name }}</strong></a>
-          {% if peer.description %}<div class="muted small">{{ peer.description }}</div>{% endif %}
+          <a href="/peers/{{ peer.id }}">{{ peer.name }}</a>
+          {% if peer.description %}<div class="sub">{{ peer.description }}</div>{% endif %}
         </td>
         <td class="mono">{{ peer.address }}</td>
-        <td class="mono small">{{ peer.allowed_ips }}</td>
+        <td class="mono small muted">{{ peer.allowed_ips }}</td>
         <td>
-          {% if not peer.enabled %}<span class="pill">disabled</span>
-          {% elif state and state.connected %}<span class="pill ok">connected</span>
-          {% else %}<span class="pill bad">offline</span>{% endif %}
+          {% if not peer.enabled %}<span class="pill">Disabled</span>
+          {% elif state and state.connected %}
+            <span class="pill ok"><span class="dot ok sm"></span>Connected</span>
+          {% else %}
+            <span class="pill bad"><span class="dot bad sm"></span>Offline</span>
+          {% endif %}
         </td>
-        <td class="muted nowrap">{{ state.latest_handshake|relative_time if state else 'never' }}</td>
-        <td class="muted nowrap">
-          {% if state %}&darr; {{ state.rx_bytes|human_bytes }}<br>&uarr; {{ state.tx_bytes|human_bytes }}{% else %}&mdash;{% endif %}
+        <td class="muted num nowrap">{{ state.latest_handshake|relative_time if state else 'never' }}</td>
+        <td>
+          {% if state %}
+          <div class="traffic mono">
+            <span>{% include "icons/arrow-down.svg" %}{{ state.rx_bytes|human_bytes }}</span>
+            <span>{% include "icons/arrow-up.svg" %}{{ state.tx_bytes|human_bytes }}</span>
+          </div>
+          {% else %}<div class="right muted">&mdash;</div>{% endif %}
         </td>
-        <td class="row-actions">
-          <form method="post" action="/peers/{{ peer.id }}/toggle" class="inline">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-            <button class="link" type="submit">{{ 'Disable' if peer.enabled else 'Enable' }}</button>
-          </form>
-          <form method="post" action="/peers/{{ peer.id }}/delete" class="inline"
-                data-confirm="Delete peer {{ peer.name }}? It will lose access immediately.">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-            <button class="link danger" type="submit">Delete</button>
-          </form>
+        <td class="right">
+          <button class="ghost icon" type="button" popovertarget="peer-menu-{{ peer.id }}"
+                  aria-label="Actions for {{ peer.name }}">
+            {% include "icons/ellipsis.svg" %}
+          </button>
+          <div id="peer-menu-{{ peer.id }}" popover class="menu">
+            <a class="menu-item" href="/peers/{{ peer.id }}">
+              {% include "icons/eye.svg" %} Open peer
+            </a>
+            <a class="menu-item" href="/peers/{{ peer.id }}/config">
+              {% include "icons/download.svg" %} Download .conf
+            </a>
+            <form method="post" action="/peers/{{ peer.id }}/toggle">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+              <button class="menu-item" type="submit">
+                {% include "icons/power.svg" %} {{ 'Disable' if peer.enabled else 'Enable' }}
+              </button>
+            </form>
+            <div class="menu-sep"></div>
+            <form method="post" action="/peers/{{ peer.id }}/delete"
+                  data-confirm="{{ peer.name }} will lose access to the tunnel immediately, and its address {{ peer.address }} is released for reuse."
+                  data-confirm-title="Delete {{ peer.name }}?"
+                  data-confirm-action="Delete peer"
+                  data-confirm-danger>
+              <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+              <button class="menu-item danger" type="submit">
+                {% include "icons/trash.svg" %} Delete peer
+              </button>
+            </form>
+          </div>
         </td>
       </tr>
-    {% else %}
-      <tr><td class="empty" colspan="7">No peers registered yet.</td></tr>
     {% endfor %}
     </tbody>
-  </table>
+  </table></div>
+  {% else %}
+  <div class="empty-state">
+    <span class="ring">{% include "icons/peers.svg" %}</span>
+    <strong>No peers yet</strong>
+    <p>Add one above and you get a client config plus a QR code back.</p>
+  </div>
+  {% endif %}
 </section>
 {% endblock %}

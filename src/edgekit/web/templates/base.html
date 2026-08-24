@@ -4,35 +4,126 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}edgekit{% endblock %}</title>
-  <link rel="stylesheet" href="/static/app.css?v={{ version }}">
+  <link rel="stylesheet" href="{{ static_url('app.css') }}">
 </head>
 <body>
 {% if user is defined and user %}
-<header class="topbar">
-  <a class="brand" href="/">edge<span>kit</span></a>
-  <nav>
-    <a href="/" class="{{ 'active' if request.url.path == '/' }}">Overview</a>
-    <a href="/peers" class="{{ 'active' if request.url.path.startswith('/peers') }}">Peers</a>
-    <a href="/hosts" class="{{ 'active' if request.url.path.startswith('/hosts') }}">Proxy hosts</a>
-    <a href="/diagnostics" class="{{ 'active' if request.url.path == '/diagnostics' }}">Diagnostics</a>
-    <a href="/settings" class="{{ 'active' if request.url.path.startswith('/settings') }}">Settings</a>
-    <a href="/audit" class="{{ 'active' if request.url.path == '/audit' }}">Audit</a>
-  </nav>
-  <form method="post" action="/logout" class="inline">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <span class="who">{{ user.username }}</span>
-    <button class="link" type="submit">Sign out</button>
-  </form>
-</header>
-{% endif %}
+{% set path = request.url.path %}
+<div class="app-shell">
 
+  <aside class="sidebar" id="nav-drawer" popover>
+    <a class="side-brand" href="/">
+      <span class="mark">{% include "icons/shield.svg" %}</span>
+      <span class="brand-name">
+        <strong>edgekit</strong>
+        <span>{{ site_name }}</span>
+      </span>
+    </a>
+    <button class="ghost icon drawer-close" type="button" popovertarget="nav-drawer"
+            popovertargetaction="hide" aria-label="Close navigation">
+      {% include "icons/x.svg" %}
+    </button>
+
+    <nav class="side-nav">
+      <div class="nav-group">
+        <div class="nav-label">Platform</div>
+        <a class="nav-item {{ 'active' if path == '/' }}" href="/">
+          {% include "icons/overview.svg" %} Overview
+        </a>
+        <a class="nav-item {{ 'active' if path.startswith('/peers') }}" href="/peers">
+          {% include "icons/peers.svg" %} Peers
+          {% if peer_count %}<span class="nav-count">{{ peer_count }}</span>{% endif %}
+        </a>
+        <a class="nav-item {{ 'active' if path.startswith('/hosts') }}" href="/hosts">
+          {% include "icons/globe.svg" %} Proxy hosts
+          {% if host_count %}<span class="nav-count">{{ host_count }}</span>{% endif %}
+        </a>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-label">Operations</div>
+        <a class="nav-item {{ 'active' if path == '/diagnostics' }}" href="/diagnostics">
+          {% include "icons/pulse.svg" %} Diagnostics
+        </a>
+        <a class="nav-item {{ 'active' if path == '/audit' }}" href="/audit">
+          {% include "icons/scroll.svg" %} Audit
+        </a>
+        <a class="nav-item {{ 'active' if path.startswith('/settings') or path == '/logs' }}"
+           href="/settings">
+          {% include "icons/settings.svg" %} Settings
+        </a>
+      </div>
+    </nav>
+
+    <div class="side-foot">
+      <form method="post" action="/logout" class="user-chip">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <span class="avatar">{{ user.username[:2] }}</span>
+        <span class="who">
+          <strong>{{ user.username }}</strong>
+          <span>Signed in</span>
+        </span>
+        <button class="ghost icon" type="submit" title="Sign out" aria-label="Sign out">
+          {% include "icons/logout.svg" %}
+        </button>
+      </form>
+    </div>
+  </aside>
+
+  <div class="main-col">
+    <header class="topbar">
+      <button class="ghost icon nav-toggle" type="button" popovertarget="nav-drawer"
+              aria-label="Open navigation">
+        {% include "icons/menu.svg" %}
+      </button>
+      <nav class="crumb">
+        <span class="dim">edgekit</span>
+        {% include "icons/chevron-right.svg" %}
+        <span class="here">{% block crumb %}{% endblock %}</span>
+      </nav>
+      <div class="topbar-actions">{% block topbar_actions %}{% endblock %}</div>
+    </header>
+
+    <main>
+      {% if notice %}
+      <div class="flash ok">{% include "icons/check-circle.svg" %}<div>{{ notice }}</div></div>
+      {% endif %}
+      {% if error %}
+      <div class="flash bad">{% include "icons/alert.svg" %}<div>{{ error }}</div></div>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+
+</div>
+{% else %}
 <main class="{% block main_class %}{% endblock %}">
   {% if notice %}<div class="flash ok">{{ notice }}</div>{% endif %}
   {% if error %}<div class="flash bad">{{ error }}</div>{% endif %}
-  {% block content %}{% endblock %}
+  {% block anon_content %}{{ self.content() }}{% endblock %}
 </main>
+{% endif %}
 
-<footer class="foot">edgekit {{ version }}</footer>
-<script src="/static/app.js?v={{ version }}" defer></script>
+<!-- Shared confirmation modal. Any form carrying data-confirm routes through this
+     instead of window.confirm(); app.js fills it in and submits on confirm. -->
+<dialog id="confirm-dialog" class="modal narrow">
+  <div class="modal-head">
+    <div>
+      <h2 id="confirm-title">Are you sure?</h2>
+    </div>
+    <button class="ghost icon" type="button" data-dialog-close aria-label="Close">
+      {% include "icons/x.svg" %}
+    </button>
+  </div>
+  <div class="modal-body">
+    <p class="card-desc" id="confirm-message"></p>
+  </div>
+  <div class="modal-foot">
+    <button type="button" data-dialog-close>Cancel</button>
+    <button type="button" id="confirm-accept" class="primary">Confirm</button>
+  </div>
+</dialog>
+
+<script src="{{ static_url('app.js') }}" defer></script>
 </body>
 </html>

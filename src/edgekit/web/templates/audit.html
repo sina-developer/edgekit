@@ -1,32 +1,88 @@
 {% extends "base.html" %}
 {% block title %}Audit log — edgekit{% endblock %}
+{% block crumb %}Audit log{% endblock %}
 
 {% block content %}
-<h1>Audit log</h1>
+<div class="page-head">
+  <div>
+    <h1>Audit log</h1>
+    <p class="lede">
+      Append-only record of every state change, whether it came from this panel or from the
+      command line. Nothing here can be edited or deleted.
+    </p>
+  </div>
+</div>
 
 <section class="card">
-  <table>
-    <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th><th></th></tr></thead>
+  <div class="card-head">
+    <div>
+      <h2>Page {{ page }}</h2>
+      <p class="card-desc">{{ entries|length }} entr{{ 'y' if entries|length == 1 else 'ies' }} on this page</p>
+    </div>
+  </div>
+
+  {% if entries %}
+  <div class="table-wrap"><table>
+    <thead>
+      <tr>
+        <th style="width:110px">When</th>
+        <th style="width:130px">Actor</th>
+        <th style="width:180px">Action</th>
+        <th>Target</th>
+        <th>Detail</th>
+        <th style="width:76px"></th>
+      </tr>
+    </thead>
     <tbody>
     {% for entry in entries %}
-      <tr>
+      <tr class="{{ 'row-failed' if not entry.success }}">
         <td class="muted nowrap">{{ entry.created_at|relative_time }}</td>
-        <td>{{ entry.actor }}</td>
-        <td class="mono">{{ entry.action }}</td>
+        <td>
+          <span class="actor">
+            <span class="actor-av">{{ entry.actor[:2] }}</span>{{ entry.actor }}
+          </span>
+        </td>
+        <td class="mono" style="font-weight:500">{{ entry.action }}</td>
         <td>{{ entry.target }}</td>
-        <td class="muted small">{{ entry.detail }}</td>
-        <td>{% if not entry.success %}<span class="pill bad">failed</span>{% endif %}</td>
+        <td class="mono small {{ 'muted' if entry.success }}"
+            style="{{ 'color:var(--bad)' if not entry.success }}">{{ entry.detail }}</td>
+        <td class="right">
+          {% if not entry.success %}<span class="pill bad">Failed</span>{% endif %}
+        </td>
       </tr>
-    {% else %}
-      <tr><td class="empty" colspan="6">Nothing recorded yet.</td></tr>
     {% endfor %}
     </tbody>
-  </table>
+  </table></div>
 
   <div class="pager">
-    {% if page > 1 %}<a class="button small" href="/audit?page={{ page - 1 }}">Newer</a>{% endif %}
-    <span class="muted">Page {{ page }}</span>
-    {% if has_next %}<a class="button small" href="/audit?page={{ page + 1 }}">Older</a>{% endif %}
+    <span class="muted small">Page {{ page }}</span>
+    <div class="pages">
+      {% if page > 1 %}
+      <a class="button small" href="/audit?page={{ page - 1 }}">
+        {% include "icons/chevron-left.svg" %} Newer
+      </a>
+      {% else %}
+      <span class="button small" style="opacity:.5;pointer-events:none">
+        {% include "icons/chevron-left.svg" %} Newer
+      </span>
+      {% endif %}
+      {% if has_next %}
+      <a class="button small" href="/audit?page={{ page + 1 }}">
+        Older {% include "icons/chevron-right.svg" %}
+      </a>
+      {% else %}
+      <span class="button small" style="opacity:.5;pointer-events:none">
+        Older {% include "icons/chevron-right.svg" %}
+      </span>
+      {% endif %}
+    </div>
   </div>
+  {% else %}
+  <div class="empty-state">
+    <span class="ring">{% include "icons/scroll.svg" %}</span>
+    <strong>Nothing recorded yet</strong>
+    <p>Every peer, host, certificate and settings change lands here as it happens.</p>
+  </div>
+  {% endif %}
 </section>
 {% endblock %}

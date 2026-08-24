@@ -2,22 +2,45 @@
 {% block title %}Sign in — edgekit{% endblock %}
 {% block main_class %}centred{% endblock %}
 
-{% block content %}
-<div class="card auth">
-  <h1>edge<span class="accent">kit</span></h1>
-  <p class="muted">WireGuard hub and proxy management</p>
+{% block anon_content %}
+<div class="auth-wrap">
 
-  {% if error %}<div class="flash bad">{{ error }}</div>{% endif %}
+  <div class="auth-brand">
+    <span class="mark" style="width:44px;height:44px;border-radius:11px">
+      {% include "icons/shield.svg" %}
+    </span>
+    <div style="text-align:center">
+      <h1 style="font-size:22px">Sign in to edgekit</h1>
+      <p class="muted" style="margin:4px 0 0">WireGuard hub and proxy management</p>
+    </div>
+  </div>
 
-  <form method="post" action="/login">
-    <input type="hidden" name="next" value="{{ next }}">
-    <label>Username
-      <input type="text" name="username" autocomplete="username" required autofocus>
-    </label>
-    <label>Password
-      <input type="password" name="password" autocomplete="current-password" required>
-    </label>
-    <button type="submit" class="primary block">Sign in</button>
-  </form>
+  {% if error %}
+  <div class="flash bad">{% include "icons/alert.svg" %}<div>{{ error }}</div></div>
+  {% endif %}
+
+  <div class="card" style="padding:24px">
+    <form method="post" action="/login" class="stack" style="gap:18px">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>Username
+        <input type="text" name="username" autocomplete="username" required autofocus>
+      </label>
+      <label>Password
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit" class="primary block">Sign in</button>
+    </form>
+  </div>
+
+  <div class="flash">
+    {% include "icons/info.svg" %}
+    <div>
+      Forgotten the password? Run <code>sudo edgekit user passwd admin</code> on the server —
+      it prints a new one.
+    </div>
+  </div>
+
+  <p class="muted small" style="text-align:center;margin:0">edgekit {{ version }}</p>
+
 </div>
 {% endblock %}

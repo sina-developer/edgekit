@@ -1,188 +1,351 @@
 {% extends "base.html" %}
 {% block title %}Settings — edgekit{% endblock %}
+{% block crumb %}Settings{% endblock %}
 
 {% block content %}
-<h1>Settings</h1>
-
-<section class="card">
-  <h2>Server</h2>
-  <dl class="kv">
-    <dt>Hostname</dt><dd class="mono">{{ config.server.hostname }}</dd>
-    <dt>Docker bridge</dt><dd class="mono">{{ config.server.docker_bridge_subnet }}</dd>
-  </dl>
-  <form method="post" action="/settings/server" class="grid">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <label>Public IP
-      <input type="text" name="public_ip" value="{{ config.server.public_ip }}" class="mono" required>
-      <small>Used for peer endpoints and Cloudflare A records.</small>
-    </label>
-    <div class="actions"><button class="primary" type="submit">Save</button></div>
-  </form>
-</section>
-
-<section class="card">
-  <h2>WireGuard</h2>
-  <dl class="kv">
-    <dt>Interface</dt><dd class="mono">{{ config.wireguard.interface }}</dd>
-    <dt>Hub address</dt><dd class="mono">{{ config.wireguard.hub_address }}</dd>
-    <dt>Subnet</dt><dd class="mono">{{ config.wireguard.subnet }}</dd>
-    <dt>Hub public key</dt><dd class="mono breakable">{{ config.wireguard.public_key }}</dd>
-  </dl>
-  <form method="post" action="/settings/wireguard" class="grid">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <label>Listen port (UDP)
-      <input type="number" name="listen_port" value="{{ config.wireguard.listen_port }}" min="1" max="65535">
-      <small>Must also be open in your cloud firewall.</small>
-    </label>
-    <label>Default keepalive (s)
-      <input type="number" name="persistent_keepalive" value="{{ config.wireguard.persistent_keepalive }}" min="0" max="3600">
-    </label>
-    <label>MTU
-      <input type="number" name="mtu" value="{{ config.wireguard.mtu or '' }}" min="576" max="9000" placeholder="auto">
-      <small>Leave blank unless you are debugging fragmentation.</small>
-    </label>
-    <div class="actions"><button class="primary" type="submit">Apply</button></div>
-  </form>
-  <p class="muted small">
-    The subnet is fixed after setup — changing it would strand every peer's address.
-    To change it, edit <code>/etc/edgekit/config.yaml</code>, re-run
-    <code>edgekit provision</code>, and re-issue every peer config.
-  </p>
-</section>
-
-<section class="card">
-  <h2>Origin certificate</h2>
-  {% if cert_id %}
-  <dl class="kv">
-    <dt>Name</dt><dd>{{ cert_name }}</dd>
-    <dt>NPM id</dt><dd class="mono">{{ cert_id }}</dd>
-    <dt>Expires</dt><dd>{{ cert_expiry[:10] if cert_expiry else 'unknown' }}</dd>
-  </dl>
-  {% else %}
-  <div class="flash warn">
-    No certificate installed. Cloudflare returns 525 for every host while it is set to
-    Full (strict).
+<div class="page-head">
+  <div>
+    <h1>Settings</h1>
+    <p class="lede">
+      Everything here is also in <span class="mono">/etc/edgekit/config.yaml</span> and on the
+      command line. Changes are written, then applied — the provisioner is idempotent, so
+      re-running it is always safe.
+    </p>
   </div>
-  {% endif %}
+</div>
 
-  <p class="muted small">
-    Create one in Cloudflare under <strong>SSL/TLS → Origin Server → Create Certificate</strong>,
-    covering <code>*.{{ config.cloudflare.zone_name or 'example.com' }}</code> and
-    <code>{{ config.cloudflare.zone_name or 'example.com' }}</code>. It lasts 15 years and
-    serves every subdomain. Paste both boxes below, or use
-    <code>edgekit cert install --cert FILE --key FILE</code>.
-  </p>
+<section class="settings-layout">
 
-  <form method="post" action="/settings/certificate/upload" class="grid">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <label>Name
-      <input type="text" name="name" placeholder="Cloudflare Origin - {{ config.cloudflare.zone_name or 'example.com' }}">
-    </label>
-    <label>Certificate (PEM)
-      <textarea name="certificate_pem" rows="7" required class="mono" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
-    </label>
-    <label>Private key (PEM)
-      <textarea name="key_pem" rows="7" required class="mono" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
-    </label>
-    <div class="actions"><button class="primary" type="submit">Install into NPM</button></div>
-  </form>
+  <label class="subnav-select">
+    <span class="sr-only">Jump to section</span>
+    <select id="subnav-select">
+      <option value="#server">Server</option>
+      <option value="#wireguard">WireGuard</option>
+      <option value="#certificate">Origin certificate</option>
+      <option value="#cloudflare">Cloudflare API</option>
+      <option value="#npm">Nginx Proxy Manager</option>
+      <option value="#maintenance">Maintenance</option>
+    </select>
+  </label>
 
-  {% if config.cloudflare.enabled and config.cloudflare.zone_id %}
-  <div class="danger-zone">
-    <form method="post" action="/settings/certificate/issue" class="inline"
-          data-confirm="Issue a new certificate from the Cloudflare API and replace the current one?">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-      <input type="hidden" name="force" value="true">
-      <button class="button" type="submit">Issue via Cloudflare API instead</button>
-    </form>
+  <nav class="subnav">
+    <a href="#server">{% include "icons/server.svg" %} Server</a>
+    <a href="#wireguard">{% include "icons/network.svg" %} WireGuard</a>
+    <a href="#certificate">{% include "icons/shield.svg" %} Origin certificate</a>
+    <a href="#cloudflare">{% include "icons/globe.svg" %} Cloudflare API</a>
+    <a href="#npm">{% include "icons/server.svg" %} Nginx Proxy Manager</a>
+    <a href="#maintenance">{% include "icons/terminal.svg" %} Maintenance</a>
+  </nav>
+
+  <div class="stack">
+
+    <!-- ------------------------------------------------------------ server -->
+    <div class="card" id="server">
+      <div class="card-head">
+        <div>
+          <h2>Server</h2>
+          <p class="card-desc">Used for peer endpoints and Cloudflare A records.</p>
+        </div>
+      </div>
+      <div class="card-body" style="padding-bottom:0">
+        <dl class="kv">
+          <dt>Hostname</dt><dd class="mono">{{ config.server.hostname or '—' }}</dd>
+          <dt>Docker bridge</dt><dd class="mono">{{ config.server.docker_bridge_subnet }}</dd>
+        </dl>
+      </div>
+      <form method="post" action="/settings/server" class="grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <label>Public IP
+          <input type="text" name="public_ip" value="{{ config.server.public_ip }}" class="mono" required>
+          <small>Changing this needs a re-provision and new peer configs.</small>
+        </label>
+        <div></div>
+        <div class="actions"><button class="primary" type="submit">Save</button></div>
+      </form>
+    </div>
+
+    <!-- --------------------------------------------------------- wireguard -->
+    <div class="card" id="wireguard">
+      <div class="card-head">
+        <div>
+          <h2>WireGuard</h2>
+          <p class="card-desc">
+            Applying re-writes <span class="mono">{{ config.wireguard.interface }}.conf</span>
+            and reloads the interface.
+          </p>
+        </div>
+      </div>
+      <div class="card-body" style="padding-bottom:0">
+        <dl class="kv">
+          <dt>Interface</dt><dd class="mono">{{ config.wireguard.interface }}</dd>
+          <dt>Hub address</dt><dd class="mono">{{ config.wireguard.hub_address }}</dd>
+          <dt>Subnet</dt>
+          <dd class="mono">{{ config.wireguard.subnet }}
+            <span class="pill" style="margin-left:6px">Fixed after setup</span></dd>
+          <dt>Hub public key</dt><dd class="mono breakable">{{ config.wireguard.public_key }}</dd>
+        </dl>
+      </div>
+      <form method="post" action="/settings/wireguard" class="grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <label>Listen port (UDP)
+          <input type="number" name="listen_port" value="{{ config.wireguard.listen_port }}" min="1" max="65535">
+          <small>Must also be open in your cloud firewall.</small>
+        </label>
+        <label>Default keepalive (s)
+          <input type="number" name="persistent_keepalive" value="{{ config.wireguard.persistent_keepalive }}" min="0" max="3600">
+        </label>
+        <label>MTU
+          <input type="number" name="mtu" value="{{ config.wireguard.mtu or '' }}" min="576" max="9000" placeholder="auto">
+          <small>Leave blank unless you are debugging fragmentation.</small>
+        </label>
+        <div class="actions"><button class="primary" type="submit">Apply</button></div>
+      </form>
+      <div class="card-body">
+        <div class="flash">
+          {% include "icons/info.svg" %}
+          <div>
+            The subnet is fixed after setup — changing it would strand every peer's address.
+            To change it, edit <code>/etc/edgekit/config.yaml</code>, run
+            <code>edgekit provision</code>, and re-issue every peer config.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------- origin certificate -->
+    <div class="card" id="certificate">
+      <div class="card-head">
+        <div>
+          <h2>Origin certificate</h2>
+          <p class="card-desc">One Cloudflare origin certificate serves every subdomain for 15 years.</p>
+        </div>
+        {% if cert_id %}
+        <span class="pill ok">{% include "icons/check.svg" %} Installed</span>
+        {% else %}
+        <span class="pill warn">Not installed</span>
+        {% endif %}
+      </div>
+
+      {% if cert_id %}
+      <div class="card-body" style="padding-bottom:0">
+        <dl class="kv">
+          <dt>Name</dt><dd>{{ cert_name }}</dd>
+          <dt>NPM id</dt><dd class="mono">{{ cert_id }}</dd>
+          <dt>Expires</dt><dd>{{ cert_expiry[:10] if cert_expiry else 'unknown' }}</dd>
+        </dl>
+      </div>
+      {% else %}
+      <div class="card-body" style="padding-bottom:0">
+        <div class="flash warn">
+          {% include "icons/alert.svg" %}
+          <div>
+            No certificate installed. Cloudflare returns 525 for every host while it is set
+            to Full (strict).
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="card-body" style="padding-bottom:0;padding-top:16px">
+        <p class="card-desc">
+          Create one in Cloudflare under <strong>SSL/TLS → Origin Server → Create
+          Certificate</strong>, covering
+          <code>*.{{ config.cloudflare.zone_name or 'example.com' }}</code> and
+          <code>{{ config.cloudflare.zone_name or 'example.com' }}</code>. Paste both boxes
+          below, or use <code>edgekit cert install --cert FILE --key FILE</code>.
+        </p>
+      </div>
+
+      <form method="post" action="/settings/certificate/upload" class="grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <label style="grid-column:1/-1">Name
+          <input type="text" name="name"
+                 placeholder="Cloudflare Origin - {{ config.cloudflare.zone_name or 'example.com' }}">
+        </label>
+        <label style="grid-column:1/-1">Certificate (PEM)
+          <textarea name="certificate_pem" rows="6" required class="mono"
+                    placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+        </label>
+        <label style="grid-column:1/-1">Private key (PEM)
+          <textarea name="key_pem" rows="6" required class="mono"
+                    placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
+          <small>
+            edgekit checks that the key matches the certificate and that it has not expired
+            before installing — a mismatched pair otherwise shows up much later as a
+            Cloudflare 525.
+          </small>
+        </label>
+        <div class="actions">
+          <button class="primary" type="submit">Install into NPM</button>
+        </div>
+      </form>
+
+      {% if config.cloudflare.enabled and config.cloudflare.zone_id %}
+      <div class="card-body">
+        <form method="post" action="/settings/certificate/issue" class="inline"
+              data-confirm="A new certificate is issued from the Cloudflare API and replaces the one currently installed."
+              data-confirm-title="Issue a new certificate?"
+              data-confirm-action="Issue certificate">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+          <input type="hidden" name="force" value="true">
+          <button type="submit">Issue via Cloudflare API instead</button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- ------------------------------------------------------- cloudflare -->
+    <div class="card" id="cloudflare">
+      <div class="card-head">
+        <div>
+          <h2>Cloudflare API <span class="pill outline" style="margin-left:6px">Optional</span></h2>
+          <p class="card-desc">
+            Not required. DNS records, the SSL/TLS mode and the origin certificate are
+            one-time dashboard actions. Enable this only if you want a DNS record created
+            per proxy host automatically.
+          </p>
+        </div>
+        <span class="pill {{ 'ok' if config.cloudflare.enabled else '' }}">
+          {{ 'Enabled' if config.cloudflare.enabled else 'Off' }}
+        </span>
+      </div>
+
+      {% if not config.cloudflare.enabled %}
+      <div class="card-body" style="padding-bottom:0">
+        <div class="flash">
+          {% include "icons/info.svg" %}
+          <div>
+            Currently off. The wildcard record
+            <code>*.{{ config.cloudflare.zone_name or 'example.com' }}</code> already covers
+            every hostname, which is why this stays optional.
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      <form method="post" action="/settings/cloudflare" class="grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <label class="check" style="grid-column:1/-1">
+          <input type="checkbox" name="enabled" value="true" {{ 'checked' if config.cloudflare.enabled }}>
+          <span>Manage DNS and SSL through the Cloudflare API</span>
+        </label>
+        <label>Zone
+          <input type="text" name="zone_name" value="{{ config.cloudflare.zone_name }}" placeholder="example.com">
+          {% if config.cloudflare.zone_id %}<small class="mono">zone id {{ config.cloudflare.zone_id }}</small>{% endif %}
+        </label>
+        <label>SSL mode
+          <select name="ssl_mode">
+            {% for mode in ['strict', 'full', 'flexible', 'off'] %}
+            <option value="{{ mode }}" {{ 'selected' if config.cloudflare.ssl_mode == mode }}>
+              {{ 'Full (strict)' if mode == 'strict' else mode|title }}
+            </option>
+            {% endfor %}
+          </select>
+          <small>Full (strict) is the only mode that actually verifies the origin.</small>
+        </label>
+        <label>API token
+          <input type="password" name="api_token" autocomplete="off"
+                 placeholder="{{ '•••••• stored' if config.cloudflare.api_token else 'not set' }}">
+          <small>Needs Zone:Read, DNS:Edit, Zone Settings:Edit, and SSL and Certificates:Edit.</small>
+        </label>
+        <label>Origin CA key <span class="opt">optional</span>
+          <input type="password" name="origin_ca_key" autocomplete="off"
+                 placeholder="{{ '•••••• stored' if config.cloudflare.origin_ca_key else 'not set' }}">
+          <small>Only needed if the token cannot issue origin certificates.</small>
+        </label>
+        <label class="check" style="grid-column:1/-1">
+          <input type="checkbox" name="proxied" value="true" {{ 'checked' if config.cloudflare.proxied }}>
+          <span>Proxy records through Cloudflare (orange cloud)</span>
+        </label>
+        <div class="actions"><button class="primary" type="submit">Save and verify</button></div>
+      </form>
+    </div>
+
+    <!-- --------------------------------------------------------------- npm -->
+    <div class="card" id="npm">
+      <div class="card-head">
+        <div>
+          <h2>Nginx Proxy Manager</h2>
+          <p class="card-desc">
+            These credentials are what edgekit uses to call the NPM API. Saving does not
+            change the NPM account itself.
+          </p>
+        </div>
+        <a class="button ghost small" href="/logs">
+          {% include "icons/terminal.svg" %} Container logs
+        </a>
+      </div>
+      <div class="card-body" style="padding-bottom:0">
+        <dl class="kv">
+          <dt>Admin UI</dt>
+          <dd class="mono">http://{{ config.npm.admin_bind }}:{{ config.npm.admin_port }}
+            <span class="pill" style="margin-left:6px">Not public</span></dd>
+          <dt>Container</dt><dd class="mono">{{ config.npm.container_name }}</dd>
+        </dl>
+      </div>
+      <form method="post" action="/settings/npm" class="grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <label>Admin email
+          <input type="email" name="admin_email" value="{{ config.npm.admin_email }}" required>
+        </label>
+        <label>Admin password
+          <input type="password" name="admin_password" placeholder="•••••• stored" autocomplete="off">
+          <small>Only updates what edgekit uses to call the API.</small>
+        </label>
+        <div class="actions"><button class="primary" type="submit">Save</button></div>
+      </form>
+      <div class="card-body">
+        <div class="flash">
+          {% include "icons/info.svg" %}
+          <div>
+            The admin UI is bound to {{ config.npm.admin_bind }} so it is not exposed
+            publicly. Reach it with an SSH tunnel:
+            <code>ssh -L {{ config.npm.admin_port }}:127.0.0.1:{{ config.npm.admin_port }} {{ config.server.ssh_user }}@{{ config.server.public_ip }}</code>
+            then open <code>http://127.0.0.1:{{ config.npm.admin_port }}</code>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------------- maintenance -->
+    <div class="card" id="maintenance">
+      <div class="card-head">
+        <div>
+          <h2>Maintenance</h2>
+          <p class="card-desc">Every provisioning step checks before it acts, so re-running is safe at any time.</p>
+        </div>
+      </div>
+      <div class="card-body danger-zone">
+        <div class="danger-row">
+          <div>
+            <strong>Re-run the provisioner</strong>
+            <p class="sub" style="margin-top:4px">
+              Use after changing the public IP, the Cloudflare zone or the WireGuard port.
+              Takes about a minute.
+            </p>
+          </div>
+          <form method="post" action="/settings/reprovision"
+                data-confirm="Every step checks before it acts, so this is safe to repeat. It usually takes about a minute."
+                data-confirm-title="Re-run the provisioner?"
+                data-confirm-action="Re-run">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <button type="submit">Re-run provisioner</button>
+          </form>
+        </div>
+        <div class="rule"></div>
+        <div class="danger-row">
+          <div>
+            <strong>Change panel password</strong>
+            <p class="sub" style="margin-top:4px">
+              Forgotten it? <span class="mono">sudo edgekit user passwd admin</span> prints a
+              new one.
+            </p>
+          </div>
+          <a class="button" href="/settings/password">Change password</a>
+        </div>
+      </div>
+    </div>
+
   </div>
-  {% endif %}
-</section>
-
-<section class="card">
-  <h2>Cloudflare API <span class="pill">optional</span></h2>
-  <p class="muted">
-    Not required. DNS records, the SSL/TLS mode and the origin certificate are one-time
-    actions in the Cloudflare dashboard — the checklist is in the README. Enable this only if
-    you want edgekit to create DNS records for each new proxy host automatically.
-  </p>
-  <details>
-    <summary class="link">Configure API access</summary>
-  <form method="post" action="/settings/cloudflare" class="grid">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <label class="check">
-      <input type="checkbox" name="enabled" value="true" {{ 'checked' if config.cloudflare.enabled }}>
-      Manage DNS and SSL through the Cloudflare API
-    </label>
-    <label>Zone
-      <input type="text" name="zone_name" value="{{ config.cloudflare.zone_name }}" placeholder="example.com">
-      {% if config.cloudflare.zone_id %}<small class="mono">zone id {{ config.cloudflare.zone_id }}</small>{% endif %}
-    </label>
-    <label>API token
-      <input type="password" name="api_token" placeholder="{{ '•••••• stored' if config.cloudflare.api_token else 'not set' }}" autocomplete="off">
-      <small>Needs Zone:Read, DNS:Edit, Zone Settings:Edit, and SSL and Certificates:Edit.</small>
-    </label>
-    <label>Origin CA key <span class="muted">(optional)</span>
-      <input type="password" name="origin_ca_key" placeholder="{{ '•••••• stored' if config.cloudflare.origin_ca_key else 'not set' }}" autocomplete="off">
-      <small>Only needed if the token cannot issue origin certificates.</small>
-    </label>
-    <label>SSL mode
-      <select name="ssl_mode">
-        {% for mode in ['strict', 'full', 'flexible', 'off'] %}
-        <option value="{{ mode }}" {{ 'selected' if config.cloudflare.ssl_mode == mode }}>
-          {{ 'Full (strict)' if mode == 'strict' else mode|title }}
-        </option>
-        {% endfor %}
-      </select>
-      <small>Full (strict) is the only mode that actually verifies the origin.</small>
-    </label>
-    <label class="check">
-      <input type="checkbox" name="proxied" value="true" {{ 'checked' if config.cloudflare.proxied }}>
-      Proxy records through Cloudflare (orange cloud)
-    </label>
-    <div class="actions"><button class="primary" type="submit">Save and verify</button></div>
-  </form>
-  </details>
-</section>
-
-<section class="card">
-  <h2>Nginx Proxy Manager</h2>
-  <dl class="kv">
-    <dt>Admin UI</dt>
-    <dd class="mono">http://{{ config.npm.admin_bind }}:{{ config.npm.admin_port }}</dd>
-    <dt>Container</dt><dd class="mono">{{ config.npm.container_name }}</dd>
-  </dl>
-  <p class="muted small">
-    The admin UI is bound to {{ config.npm.admin_bind }} so it is not exposed publicly. Reach
-    it with an SSH tunnel:
-    <code>ssh -L {{ config.npm.admin_port }}:127.0.0.1:{{ config.npm.admin_port }} {{ config.server.ssh_user }}@{{ config.server.public_ip }}</code>
-    then open <code>http://127.0.0.1:{{ config.npm.admin_port }}</code>
-  </p>
-  <form method="post" action="/settings/npm" class="grid">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <label>Admin email
-      <input type="email" name="admin_email" value="{{ config.npm.admin_email }}" required>
-    </label>
-    <label>Admin password
-      <input type="password" name="admin_password" placeholder="•••••• stored" autocomplete="off">
-      <small>Only updates what edgekit uses to call the API — it does not change the NPM account.</small>
-    </label>
-    <div class="actions"><button class="primary" type="submit">Save</button></div>
-  </form>
-  <p><a class="button small" href="/logs">View container logs</a></p>
-</section>
-
-<section class="card">
-  <h2>Maintenance</h2>
-  <p class="muted">
-    Re-running the provisioner is safe at any time: every step checks before it acts. Use it
-    after changing the public IP, the Cloudflare zone, or the WireGuard port.
-  </p>
-  <form method="post" action="/settings/reprovision" class="inline"
-        data-confirm="Re-run the full provisioner now? This can take a minute.">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <button class="button" type="submit">Re-run provisioner</button>
-  </form>
-  <p><a class="button small" href="/settings/password">Change panel password</a></p>
 </section>
 {% endblock %}

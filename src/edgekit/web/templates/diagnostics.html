@@ -1,41 +1,88 @@
 {% extends "base.html" %}
 {% block title %}Diagnostics — edgekit{% endblock %}
+{% block crumb %}Diagnostics{% endblock %}
+
+{% block topbar_actions %}
+<button class="primary" type="button" id="diagnostics-rerun">
+  {% include "icons/refresh.svg" %} Re-run checks
+</button>
+{% endblock %}
 
 {% block content %}
 <div class="page-head">
-  <h1>Diagnostics</h1>
-  <button class="button small" type="button" id="diagnostics-rerun">Re-run</button>
+  <div>
+    <h1>Diagnostics</h1>
+    <p class="lede">
+      The guide's verification matrix, run live against this server. A failing check that
+      just says &ldquo;broken&rdquo; costs an hour, so every failure below names the command
+      that fixes it.
+    </p>
+  </div>
 </div>
 
 <div id="diagnostics-app" data-diagnostics-src="/api/health">
-  <div class="flash" id="diagnostics-summary">Running checks…</div>
+
+  <section class="split even" id="diagnostics-summary-wrap">
+    <div class="flash" id="diagnostics-summary">
+      {% include "icons/pulse.svg" %}
+      <div>Running checks&hellip;</div>
+    </div>
+    <div class="card pad" id="diagnostics-counts" hidden>
+      <div class="count-row">
+        <div class="count"><span class="n ok" id="count-ok">0</span><span class="l">Passed</span></div>
+        <div class="count-sep"></div>
+        <div class="count"><span class="n warn" id="count-warn">0</span><span class="l">Warnings</span></div>
+        <div class="count-sep"></div>
+        <div class="count"><span class="n bad" id="count-bad">0</span><span class="l">Failed</span></div>
+      </div>
+      <div class="segbar" id="count-bar" style="margin-top:14px"></div>
+    </div>
+  </section>
 
   <section class="card">
-    <table class="checks-table">
-      <tbody id="diagnostics-rows">
-        <tr class="check-pending">
-          <td class="status"><span class="pill pulse">…</span></td>
-          <td>
-            <strong>Running health checks</strong>
-            <div class="muted small">WireGuard, Docker, NPM reachability, public TLS.</div>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div class="card-head">
+      <div>
+        <h2>Checks</h2>
+        <p class="card-desc">Failures first, then warnings, then everything that passed</p>
+      </div>
+    </div>
+    <div class="checks-list" id="diagnostics-rows">
+      <div class="chk check-pending">
+        <span class="chk-mark">&hellip;</span>
+        <div class="chk-body">
+          <div class="chk-title"><strong>Running health checks</strong></div>
+          <p class="chk-detail">WireGuard, Docker, NPM reachability, public TLS.</p>
+        </div>
+      </div>
+    </div>
   </section>
+
 </div>
 
 <noscript>
-  <div class="flash warn">JavaScript is required to run these checks in the panel. Use <code>edgekit doctor</code> instead.</div>
+  <div class="flash warn">
+    {% include "icons/alert.svg" %}
+    <div>JavaScript is required to run these checks in the panel. Use <code>edgekit doctor</code> instead.</div>
+  </div>
 </noscript>
 
 <section class="card">
-  <h2>Commands worth knowing</h2>
-  <pre class="code">sudo wg show
+  <div class="card-head">
+    <div>
+      <h2>Commands worth knowing</h2>
+      <p class="card-desc">When the panel itself is the thing that is broken</p>
+    </div>
+    <button class="ghost small" type="button" data-copy="#diag-commands">
+      {% include "icons/copy.svg" %} Copy all
+    </button>
+  </div>
+  <div class="card-body">
+    <pre id="diag-commands" class="code">sudo wg show
 sudo systemctl status wg-quick@{{ config.wireguard.interface }} --no-pager
 sudo docker logs {{ config.npm.container_name }} --tail 100
 sudo ss -ltnp | grep -E ':{{ config.npm.http_port }}|:{{ config.npm.https_port }}|:{{ config.npm.admin_port }}'
 sudo docker exec {{ config.npm.container_name }} curl -I --connect-timeout 5 http://PEER_IP:PORT
 edgekit doctor</pre>
+  </div>
 </section>
 {% endblock %}

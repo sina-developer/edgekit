@@ -19,3 +19,9 @@ config.yaml
 secret.key
 *.db
 *.sqlite3
+
+# Local UI preview state (tools/preview.py)
+.preview/
+
+# Design working files
+.design/

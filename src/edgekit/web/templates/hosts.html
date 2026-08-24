@@ -1,44 +1,64 @@
 {% extends "base.html" %}
 {% block title %}Proxy hosts — edgekit{% endblock %}
+{% block crumb %}Proxy hosts{% endblock %}
+
+{% block topbar_actions %}
+<form method="post" action="/hosts/resync" class="inline">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+  <button class="ghost small" type="submit">{% include "icons/refresh.svg" %} Re-push all to NPM</button>
+</form>
+{% endblock %}
 
 {% block content %}
 <div class="page-head">
-  <h1>Proxy hosts</h1>
-  <form method="post" action="/hosts/resync" class="inline">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-    <button class="button small" type="submit">Re-push all to NPM</button>
-  </form>
+  <div>
+    <h1>Proxy hosts</h1>
+    <p class="lede">
+      Public hostnames routed through Nginx Proxy Manager to a service behind the tunnel.
+      No Nginx config editing, no new WireGuard peer.
+    </p>
+  </div>
 </div>
 
 {% if not certificate_id %}
 <div class="flash warn">
-  No origin certificate is installed, so hosts will be created without SSL and Cloudflare
-  will return 525 while it is set to Full (strict).
-  <a href="/settings">Issue one in Settings</a>.
+  {% include "icons/alert.svg" %}
+  <div>
+    No origin certificate is installed, so hosts will be created without SSL and Cloudflare
+    will return 525 while it is set to Full (strict).
+    <a href="/settings">Issue one in Settings</a>.
+  </div>
 </div>
 {% endif %}
 
-<section class="card">
-  <h2>Publish a service</h2>
-  <p class="muted">
-    Creates the Cloudflare A record, then the NPM proxy host with
-    {% if cert_name %}<strong>{{ cert_name }}</strong>{% else %}the installed certificate{% endif %}
-    attached. No Nginx config editing, no new WireGuard peer.
-  </p>
+<details class="card" open>
+  <summary class="disclosure">
+    <div>
+      <h2>Publish a service</h2>
+      <p class="card-desc">
+        Creates the NPM proxy host with
+        {% if cert_name %}<strong>{{ cert_name }}</strong>{% else %}the installed certificate{% endif %}
+        attached.
+      </p>
+    </div>
+    <span class="disclosure-chevron">{% include "icons/chevron-down.svg" %}</span>
+  </summary>
+
   <form method="post" action="/hosts" class="grid">
     <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
     <label>Domain
-      <input type="text" name="domain" required placeholder="retro.{{ config.cloudflare.zone_name or 'example.com' }}">
+      <input type="text" name="domain" required
+             placeholder="retro.{{ config.cloudflare.zone_name or 'example.com' }}">
     </label>
     <label>Peer
       <select name="peer_id">
-        <option value="">— explicit address —</option>
+        <option value="">&mdash; explicit address &mdash;</option>
         {% for peer in peers %}
         <option value="{{ peer.id }}">{{ peer.name }} ({{ peer.address }})</option>
         {% endfor %}
       </select>
     </label>
-    <label>Forward host <span class="muted">(if no peer)</span>
+    <label>Forward host <span class="opt">if no peer</span>
       <input type="text" name="forward_host" placeholder="10.50.0.2" class="mono">
     </label>
     <label>Forward port
@@ -50,92 +70,188 @@
         <option value="https">https</option>
       </select>
     </label>
+    <div></div>
     <div class="checks">
-      <label class="check"><input type="checkbox" name="force_ssl" value="true" checked> Force SSL</label>
-      <label class="check"><input type="checkbox" name="http2" value="true" checked> HTTP/2</label>
-      <label class="check"><input type="checkbox" name="websockets" value="true" checked> WebSockets</label>
-      <label class="check"><input type="checkbox" name="block_exploits" value="true" checked> Block common exploits</label>
-      <label class="check">
+      <label class="check"><input type="checkbox" name="force_ssl" value="true" checked>
+        <span>Force SSL<small>Redirect plain HTTP to HTTPS.</small></span></label>
+      <label class="check"><input type="checkbox" name="http2" value="true" checked>
+        <span>HTTP/2<small>Multiplexed connections to the browser.</small></span></label>
+      <label class="check"><input type="checkbox" name="websockets" value="true" checked>
+        <span>WebSockets<small>Needed for live/streaming upstreams.</small></span></label>
+      <label class="check"><input type="checkbox" name="block_exploits" value="true" checked>
+        <span>Block common exploits<small>NPM's built-in rule set.</small></span></label>
+      <label class="check wide">
         <input type="checkbox" name="manage_dns" value="true" {{ 'checked' if config.cloudflare.enabled }}
                {{ 'disabled' if not config.cloudflare.enabled }}>
-        Create the Cloudflare DNS record
+        <span>Create the Cloudflare DNS record
+          <small>
+            {% if config.cloudflare.enabled %}Adds an A record for this hostname via the Cloudflare API.
+            {% else %}Unavailable — the Cloudflare API is not enabled. The wildcard record already covers this hostname.{% endif %}
+          </small>
+        </span>
       </label>
     </div>
     <div class="actions"><button class="primary" type="submit">Publish</button></div>
   </form>
-</section>
+</details>
 
 <section class="card">
-  <h2>Published</h2>
-  <table>
-    <thead><tr><th>Domain</th><th>Target</th><th>Options</th><th>IDs</th><th></th></tr></thead>
+  <div class="card-head">
+    <div>
+      <h2>Published</h2>
+      <p class="card-desc">{{ hosts|length }} host{{ 's' if hosts|length != 1 }}</p>
+    </div>
+  </div>
+  {% if hosts %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Domain</th><th>Target</th><th>Options</th><th>IDs</th><th style="width:48px"></th></tr></thead>
     <tbody>
     {% for host in hosts %}
       <tr>
         <td>
-          <a href="https://{{ host.domain }}" target="_blank" rel="noreferrer noopener">{{ host.domain }}</a>
+          <a href="https://{{ host.domain }}" target="_blank" rel="noreferrer noopener"
+             style="display:inline-flex;align-items:center;gap:5px">
+            {{ host.domain }} {% include "icons/external.svg" %}
+          </a>
         </td>
-        <td class="mono">
-          {{ host.scheme }}://{{ host.forward_host }}:{{ host.forward_port }}
-          {% if host.peer %}<div class="muted small">via {{ host.peer.name }}</div>{% endif %}
+        <td>
+          <div class="mono">{{ host.scheme }}://{{ host.forward_host }}:{{ host.forward_port }}</div>
+          {% if host.peer %}<div class="sub">via {{ host.peer.name }}</div>{% endif %}
         </td>
-        <td class="small">
-          {% if host.force_ssl %}<span class="pill ok">SSL</span>{% endif %}
-          {% if host.http2 %}<span class="pill">h2</span>{% endif %}
-          {% if host.websockets %}<span class="pill">ws</span>{% endif %}
+        <td>
+          {% if host.force_ssl %}<span class="pill ok">SSL</span>{% else %}<span class="pill warn">No SSL</span>{% endif %}
+          {% if host.http2 %}<span class="pill outline">h2</span>{% endif %}
+          {% if host.websockets %}<span class="pill outline">ws</span>{% endif %}
         </td>
-        <td class="muted small mono">
+        <td class="mono small muted">
           npm:{{ host.npm_host_id or '—' }}<br>
           dns:{{ 'yes' if host.cloudflare_record_id else '—' }}
         </td>
-        <td class="row-actions">
-          <details>
-            <summary class="link">Edit</summary>
-            <form method="post" action="/hosts/{{ host.id }}/update" class="grid tight">
+        <td class="right">
+          <button class="ghost icon" type="button" popovertarget="host-menu-{{ host.id }}"
+                  aria-label="Actions for {{ host.domain }}">
+            {% include "icons/ellipsis.svg" %}
+          </button>
+          <div id="host-menu-{{ host.id }}" popover class="menu">
+            <button class="menu-item" type="button" data-dialog="#host-edit-{{ host.id }}">
+              {% include "icons/settings.svg" %} Edit forwarding
+            </button>
+            <a class="menu-item" href="https://{{ host.domain }}" target="_blank" rel="noreferrer noopener">
+              {% include "icons/external.svg" %} Open in browser
+            </a>
+            <div class="menu-sep"></div>
+            <button class="menu-item danger" type="button" data-dialog="#host-delete-{{ host.id }}">
+              {% include "icons/trash.svg" %} Delete host
+            </button>
+          </div>
+
+          <dialog id="host-edit-{{ host.id }}" class="modal">
+            <form method="post" action="/hosts/{{ host.id }}/update">
               <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-              <label>Peer
-                <select name="peer_id">
-                  <option value="">— explicit —</option>
-                  {% for peer in peers %}
-                  <option value="{{ peer.id }}" {{ 'selected' if host.peer_id == peer.id }}>
-                    {{ peer.name }}
-                  </option>
-                  {% endfor %}
-                </select>
-              </label>
-              <label>Forward host
-                <input type="text" name="forward_host" value="{{ host.forward_host }}" class="mono">
-              </label>
-              <label>Port
-                <input type="number" name="forward_port" value="{{ host.forward_port }}" min="1" max="65535">
-              </label>
-              <label>Scheme
-                <select name="scheme">
-                  <option value="http" {{ 'selected' if host.scheme == 'http' }}>http</option>
-                  <option value="https" {{ 'selected' if host.scheme == 'https' }}>https</option>
-                </select>
-              </label>
-              <div class="checks">
-                <label class="check"><input type="checkbox" name="force_ssl" value="true" {{ 'checked' if host.force_ssl }}> Force SSL</label>
-                <label class="check"><input type="checkbox" name="http2" value="true" {{ 'checked' if host.http2 }}> HTTP/2</label>
-                <label class="check"><input type="checkbox" name="websockets" value="true" {{ 'checked' if host.websockets }}> WebSockets</label>
-                <label class="check"><input type="checkbox" name="block_exploits" value="true" {{ 'checked' if host.block_exploits }}> Block exploits</label>
+              <div class="modal-head">
+                <div>
+                  <h2>Edit forwarding</h2>
+                  <p class="card-desc mono">{{ host.domain }}</p>
+                </div>
+                <button class="ghost icon" type="button" data-dialog-close aria-label="Close">
+                  {% include "icons/x.svg" %}
+                </button>
               </div>
-              <div class="actions"><button class="primary small" type="submit">Save</button></div>
+
+              <div class="modal-body">
+                <dl class="kv">
+                  <dt>NPM host id</dt><dd class="mono">{{ host.npm_host_id or '—' }}</dd>
+                  <dt>Certificate</dt>
+                  <dd>{% if host.npm_certificate_id %}<span class="pill ok">Attached</span>
+                      {% else %}<span class="pill warn">None</span>{% endif %}</dd>
+                  <dt>DNS record</dt>
+                  <dd>{{ 'Managed by edgekit' if host.cloudflare_record_id else 'Covered by the wildcard' }}</dd>
+                  <dt>Created</dt><dd>{{ host.created_at|relative_time }}</dd>
+                </dl>
+
+                <div class="grid" style="margin-top:20px">
+                  <label>Peer
+                    <select name="peer_id">
+                      <option value="">&mdash; explicit address &mdash;</option>
+                      {% for peer in peers %}
+                      <option value="{{ peer.id }}" {{ 'selected' if host.peer_id == peer.id }}>
+                        {{ peer.name }} ({{ peer.address }})
+                      </option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                  <label>Scheme
+                    <select name="scheme">
+                      <option value="http" {{ 'selected' if host.scheme == 'http' }}>http</option>
+                      <option value="https" {{ 'selected' if host.scheme == 'https' }}>https</option>
+                    </select>
+                  </label>
+                  <label>Forward host
+                    <input type="text" name="forward_host" value="{{ host.forward_host }}" class="mono">
+                  </label>
+                  <label>Forward port
+                    <input type="number" name="forward_port" value="{{ host.forward_port }}" min="1" max="65535">
+                  </label>
+                  <div class="checks">
+                    <label class="check"><input type="checkbox" name="force_ssl" value="true" {{ 'checked' if host.force_ssl }}>
+                      <span>Force SSL</span></label>
+                    <label class="check"><input type="checkbox" name="http2" value="true" {{ 'checked' if host.http2 }}>
+                      <span>HTTP/2</span></label>
+                    <label class="check"><input type="checkbox" name="websockets" value="true" {{ 'checked' if host.websockets }}>
+                      <span>WebSockets</span></label>
+                    <label class="check"><input type="checkbox" name="block_exploits" value="true" {{ 'checked' if host.block_exploits }}>
+                      <span>Block common exploits</span></label>
+                  </div>
+                </div>
+              </div>
+
+              <div class="modal-foot">
+                <button type="button" data-dialog-close>Cancel</button>
+                <button class="primary" type="submit">Save changes</button>
+              </div>
             </form>
-          </details>
-          <form method="post" action="/hosts/{{ host.id }}/delete" class="inline"
-                data-confirm="Remove {{ host.domain }} from NPM?">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-            <label class="check small"><input type="checkbox" name="remove_dns" value="true"> +DNS</label>
-            <button class="link danger" type="submit">Delete</button>
-          </form>
+          </dialog>
+
+          <dialog id="host-delete-{{ host.id }}" class="modal narrow">
+            <form method="post" action="/hosts/{{ host.id }}/delete">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+              <div class="modal-head">
+                <div>
+                  <h2>Delete this host?</h2>
+                  <p class="card-desc mono">{{ host.domain }}</p>
+                </div>
+                <button class="ghost icon" type="button" data-dialog-close aria-label="Close">
+                  {% include "icons/x.svg" %}
+                </button>
+              </div>
+              <div class="modal-body">
+                <p class="card-desc">
+                  Removes the proxy host from Nginx Proxy Manager. The service behind it keeps
+                  running; it just stops being reachable at this name.
+                </p>
+                <label class="check" style="margin-top:16px">
+                  <input type="checkbox" name="remove_dns" value="true">
+                  <span>Also delete the Cloudflare DNS record
+                    <small>Only applies if edgekit created one for this host.</small></span>
+                </label>
+              </div>
+              <div class="modal-foot">
+                <button type="button" data-dialog-close>Cancel</button>
+                <button class="danger" type="submit">Delete host</button>
+              </div>
+            </form>
+          </dialog>
         </td>
       </tr>
-    {% else %}
-      <tr><td class="empty" colspan="5">Nothing published yet.</td></tr>
     {% endfor %}
     </tbody>
-  </table>
+  </table></div>
+  {% else %}
+  <div class="empty-state">
+    <span class="ring">{% include "icons/globe.svg" %}</span>
+    <strong>Nothing published yet</strong>
+    <p>Add one above.</p>
+  </div>
+  {% endif %}
 </section>
 {% endblock %}

@@ -1,111 +1,278 @@
 {% extends "base.html" %}
 {% block title %}Overview — edgekit{% endblock %}
+{% block crumb %}Overview{% endblock %}
+
+{% block topbar_actions %}
+<span class="stamp">Updated just now</span>
+<a class="ghost icon button" href="/" title="Refresh" aria-label="Refresh">
+  {% include "icons/refresh.svg" %}
+</a>
+<a class="button primary" href="/peers">{% include "icons/plus.svg" %} Add peer</a>
+{% endblock %}
 
 {% block content %}
-<h1>Overview</h1>
+{% set enabled_peers = peers | selectattr('enabled') | list %}
+{% set offline = enabled_peers | length - connected_count %}
+{% set disabled = peers | length - enabled_peers | length %}
+
+{# Two failures the route already knows about, each paired with the command that fixes it —
+   the same contract /diagnostics keeps. Anything deeper needs a probe and belongs there. #}
+{% if not interface_up or not container.running %}
+<section class="flash bad problems">
+  {% include "icons/alert.svg" %}
+  <div>
+    <strong>
+      {{ 'Two things are down' if not interface_up and not container.running
+         else 'Something is down' }}
+    </strong>
+    <div class="problem-list">
+      {% if not interface_up %}
+      <div>
+        The WireGuard interface <code>{{ config.wireguard.interface }}</code> is not up, so
+        every peer is unreachable and each proxy host behind the tunnel returns 502.
+        <div class="remedy">
+          {% include "icons/terminal.svg" %}
+          <span>systemctl restart wg-quick@{{ config.wireguard.interface }}</span>
+        </div>
+      </div>
+      {% endif %}
+      {% if not container.running %}
+      <div>
+        The container <code>{{ config.npm.container_name }}</code> is
+        {{ container.status or 'absent' }}{% if container.restarts %}, after
+        {{ container.restarts }} restarts{% endif %}. Nothing is being served on 80 or 443.
+        <div class="remedy">
+          {% include "icons/terminal.svg" %}
+          <span>docker logs {{ config.npm.container_name }} --tail 100</span>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+    <a class="button small" href="/diagnostics" style="margin-top:12px">
+      {% include "icons/pulse.svg" %} Run diagnostics
+    </a>
+  </div>
+</section>
+{% endif %}
 
 <section class="tiles">
-  <div class="tile {{ 'good' if interface_up else 'bad' }}">
-    <span class="label">WireGuard</span>
-    <strong>{{ 'Up' if interface_up else 'Down' }}</strong>
-    <span class="muted">{{ config.wireguard.interface }} · {{ config.wireguard.hub_address }}</span>
+  <div class="tile {{ '' if interface_up else 'bad' }}">
+    <div class="tile-top">
+      <div>
+        <div class="label">Tunnel</div>
+        <div class="value">
+          <span class="dot {{ 'ok' if interface_up else 'bad' }}"></span>
+          {{ 'Up' if interface_up else 'Down' }}
+        </div>
+      </div>
+      <span class="icon-square">{% include "icons/network.svg" %}</span>
+    </div>
+    <div class="foot mono">
+      {{ config.wireguard.interface }} &middot; {{ config.wireguard.hub_address }} &middot;
+      UDP {{ config.wireguard.listen_port }}
+    </div>
   </div>
-  <div class="tile {{ 'good' if connected_count == peers|selectattr('enabled')|list|length and peers else 'warn' if peers else '' }}">
-    <span class="label">Peers connected</span>
-    <strong>{{ connected_count }} / {{ peers|length }}</strong>
-    <span class="muted">handshake within 3 minutes</span>
+
+  <div class="tile">
+    <div class="tile-top">
+      <div>
+        <div class="label">Peers connected</div>
+        <div class="value">{{ connected_count }} <span class="of">/ {{ peers | length }}</span></div>
+      </div>
+      <span class="icon-square">{% include "icons/peers.svg" %}</span>
+    </div>
+    {% if peers %}
+    <div class="segbar">
+      {% if connected_count %}<span class="ok" style="flex:{{ connected_count }}"></span>{% endif %}
+      {% if offline > 0 %}<span class="bad" style="flex:{{ offline }}"></span>{% endif %}
+      {% if disabled %}<span style="flex:{{ disabled }}"></span>{% endif %}
+    </div>
+    <div class="foot">
+      {{ connected_count }} connected &middot; {{ offline if offline > 0 else 0 }} offline
+      {%- if disabled %} &middot; {{ disabled }} disabled{% endif %}
+    </div>
+    {% else %}
+    <div class="segbar"><span style="flex:1"></span></div>
+    <div class="foot">No peers registered yet</div>
+    {% endif %}
   </div>
-  <div class="tile {{ 'good' if container.running else 'bad' }}">
-    <span class="label">Proxy manager</span>
-    <strong>{{ 'Running' if container.running else (container.status or 'absent')|title }}</strong>
-    <span class="muted">{{ config.npm.container_name }}</span>
+
+  <div class="tile {{ '' if container.running else 'bad' }}">
+    <div class="tile-top">
+      <div>
+        <div class="label">Proxy manager</div>
+        <div class="value">
+          <span class="dot {{ 'ok' if container.running else 'bad' }}"></span>
+          {{ 'Running' if container.running else (container.status or 'absent')|title }}
+        </div>
+      </div>
+      <span class="icon-square">{% include "icons/server.svg" %}</span>
+    </div>
+    <div class="foot mono">
+      {{ config.npm.container_name }}
+      {%- if container.restarts %} &middot; {{ container.restarts }} restarts{% endif %}
+    </div>
   </div>
-  <div class="tile {{ 'good' if cert_name else 'warn' }}">
-    <span class="label">Origin certificate</span>
-    <strong>{{ 'Installed' if cert_name else 'None' }}</strong>
-    <span class="muted">
-      {% if cert_expiry %}expires {{ cert_expiry[:10] }}{% else %}no certificate in NPM{% endif %}
-    </span>
+
+  <div class="tile {{ '' if cert_name else 'warn' }}">
+    <div class="tile-top">
+      <div>
+        <div class="label">Origin certificate</div>
+        <div class="value">
+          <span class="dot {{ 'ok' if cert_name else 'warn' }}"></span>
+          {{ 'Valid' if cert_name else 'None' }}
+        </div>
+      </div>
+      <span class="icon-square">{% include "icons/shield.svg" %}</span>
+    </div>
+    <div class="foot {{ 'mono' if cert_expiry }}">
+      {% if cert_expiry %}expires {{ cert_expiry[:10] }}
+      {% else %}Nothing can be published over HTTPS yet{% endif %}
+    </div>
   </div>
 </section>
 
-<section class="split">
+<section class="split full-height-childs">
   <div class="card">
     <div class="card-head">
-      <h2>Peers</h2>
-      <a class="button small" href="/peers">Manage</a>
+      <div>
+        <h2>Peers</h2>
+        <p class="card-desc">WireGuard clients attached to this hub</p>
+      </div>
+      <a class="button ghost small" href="/peers">Manage {% include "icons/chevron-right.svg" %}</a>
     </div>
     {% if peers %}
-    <table>
-      <thead><tr><th>Name</th><th>Address</th><th>State</th><th>Traffic</th></tr></thead>
+    <div class="table-wrap"><table>
+      <thead>
+        <tr><th>Name</th><th>Address</th><th>Status</th><th>Handshake</th><th class="right">Traffic</th></tr>
+      </thead>
       <tbody>
       {% for peer in peers %}
         {% set state = live.get(peer.public_key) %}
         <tr>
-          <td><a href="/peers/{{ peer.id }}">{{ peer.name }}</a></td>
+          <td>
+            <a href="/peers/{{ peer.id }}">{{ peer.name }}</a>
+            {% if peer.description %}<div class="sub">{{ peer.description }}</div>{% endif %}
+          </td>
           <td class="mono">{{ peer.address }}</td>
           <td>
-            {% if not peer.enabled %}<span class="pill">disabled</span>
-            {% elif state and state.connected %}<span class="pill ok">connected</span>
-            {% else %}<span class="pill bad">offline</span>{% endif %}
+            {% if not peer.enabled %}<span class="pill">Disabled</span>
+            {% elif state and state.connected %}
+              <span class="pill ok"><span class="dot ok sm"></span>Connected</span>
+            {% else %}
+              <span class="pill bad"><span class="dot bad sm"></span>Offline</span>
+            {% endif %}
           </td>
-          <td class="muted">
-            {% if state %}&darr; {{ state.rx_bytes|human_bytes }} &uarr; {{ state.tx_bytes|human_bytes }}
-            {% else %}&mdash;{% endif %}
+          <td class="muted num nowrap">
+            {{ state.latest_handshake|relative_time if state else 'never' }}
+          </td>
+          <td>
+            {% if state %}
+            <div class="traffic mono">
+              <span>{% include "icons/arrow-down.svg" %}{{ state.rx_bytes|human_bytes }}</span>
+              <span>{% include "icons/arrow-up.svg" %}{{ state.tx_bytes|human_bytes }}</span>
+            </div>
+            {% else %}<div class="right muted">&mdash;</div>{% endif %}
           </td>
         </tr>
       {% endfor %}
       </tbody>
-    </table>
+    </table></div>
     {% else %}
-    <p class="empty">No peers yet. <a href="/peers">Add the first one</a> — you get a ready
-      config and QR code back.</p>
+    <div class="empty-state">
+      <span class="ring">{% include "icons/peers.svg" %}</span>
+      <strong>No peers yet</strong>
+      <p>Add one and you get a client config plus a QR code back. Adding a peer never drops
+         the tunnels already up.</p>
+      <a class="button primary actions" href="/peers">
+        {% include "icons/plus.svg" %} Add peer
+      </a>
+    </div>
     {% endif %}
   </div>
 
   <div class="card">
     <div class="card-head">
-      <h2>Proxy hosts</h2>
-      <a class="button small" href="/hosts">Manage</a>
+      <div>
+        <h2>Proxy hosts</h2>
+        <p class="card-desc">Published through Nginx Proxy Manager</p>
+      </div>
+      <a class="button ghost small" href="/hosts">Manage {% include "icons/chevron-right.svg" %}</a>
     </div>
     {% if hosts %}
     <table>
-      <thead><tr><th>Domain</th><th>Target</th><th>SSL</th></tr></thead>
+      <thead><tr><th>Domain</th><th>Target</th><th class="right">SSL</th></tr></thead>
       <tbody>
       {% for host in hosts %}
         <tr>
-          <td><a href="https://{{ host.domain }}" rel="noreferrer noopener" target="_blank">{{ host.domain }}</a></td>
-          <td class="mono">{{ host.forward_host }}:{{ host.forward_port }}</td>
-          <td>{% if host.force_ssl %}<span class="pill ok">forced</span>{% else %}<span class="pill">off</span>{% endif %}</td>
+          <td>
+            <a href="https://{{ host.domain }}" rel="noreferrer noopener" target="_blank"
+               style="display:inline-flex;align-items:center;gap:5px">
+              {{ host.domain }} {% include "icons/external.svg" %}
+            </a>
+          </td>
+          <td>
+            <div class="mono">{{ host.forward_host }}:{{ host.forward_port }}</div>
+            {% if host.peer %}<div class="sub">{{ host.peer.name }}</div>{% endif %}
+          </td>
+          <td class="right">
+            {% if host.force_ssl %}<span class="pill ok">Forced</span>
+            {% else %}<span class="pill warn">Off</span>{% endif %}
+          </td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
     {% else %}
-    <p class="empty">No proxy hosts yet. <a href="/hosts">Publish a service</a>.</p>
+    <div class="empty-state">
+      <span class="ring">{% include "icons/globe.svg" %}</span>
+      <strong>Nothing published yet</strong>
+      <p>Publishing a service needs a peer to forward to, and a certificate to serve it
+         with.</p>
+      <a class="button actions" href="/hosts">Publish a service</a>
+    </div>
     {% endif %}
   </div>
 </section>
 
 <section class="card">
   <div class="card-head">
-    <h2>Recent activity</h2>
-    <a class="button small" href="/audit">Full log</a>
+    <div>
+      <h2>Recent activity</h2>
+      <p class="card-desc">Every state change, from the panel or the CLI</p>
+    </div>
+    <a class="button ghost small" href="/audit">Full log {% include "icons/chevron-right.svg" %}</a>
   </div>
-  <table>
-    <tbody>
-    {% for entry in recent %}
-      <tr>
-        <td class="muted nowrap">{{ entry.created_at|relative_time }}</td>
-        <td class="mono">{{ entry.action }}</td>
-        <td>{{ entry.target }}</td>
-        <td class="muted">{{ entry.detail }}</td>
-        <td>{% if not entry.success %}<span class="pill bad">failed</span>{% endif %}</td>
-      </tr>
-    {% else %}
-      <tr><td class="empty" colspan="5">Nothing recorded yet.</td></tr>
-    {% endfor %}
-    </tbody>
-  </table>
+  {% if recent %}
+  <div>
+  {% for entry in recent %}
+    {% set family = entry.action.split('.')[0] %}
+    <div class="feed-row {{ 'failed' if not entry.success }}">
+      <span class="icon-square">
+        {%- if not entry.success %}{% include "icons/alert.svg" %}
+        {%- elif family == 'peer' %}{% include "icons/peers.svg" %}
+        {%- elif family == 'host' %}{% include "icons/globe.svg" %}
+        {%- elif family == 'provision' %}{% include "icons/refresh.svg" %}
+        {%- elif family == 'cert' %}{% include "icons/shield.svg" %}
+        {%- else %}{% include "icons/settings.svg" %}{% endif -%}
+      </span>
+      <div class="feed-main">
+        <div>
+          <span class="mono" style="font-weight:500">{{ entry.action }}</span>
+          {% if entry.target %}<span class="muted">&mdash;</span> {{ entry.target }}{% endif %}
+          {% if not entry.success %}<span class="pill bad" style="margin-left:6px">Failed</span>{% endif %}
+        </div>
+        {% if entry.detail %}<div class="sub mono">{{ entry.detail }}</div>{% endif %}
+      </div>
+      <div class="feed-when">
+        <span class="pill outline">{{ entry.actor }}</span>
+        <div class="sub">{{ entry.created_at|relative_time }}</div>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-cell">Nothing recorded yet.</div>
+  {% endif %}
 </section>
 {% endblock %}
