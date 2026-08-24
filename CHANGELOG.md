@@ -24,8 +24,6 @@ The single source of truth for the number itself is `src/edgekit/__init__.py`
 - Row action menus render in the top layer, so the last row of a table is no longer
   clipped by the scroll container. Proxy host edits open a modal.
 - Small screens get a navigation drawer, and Settings swaps its section list for a select.
-- Static assets are cache-busted by file mtime instead of the package version. A CSS fix
-  shipped without a version bump previously never reached a browser holding the old file.
 - `tools/preview.py` runs the panel locally against fixtures — no root, no WireGuard, no
   Docker — with populated, healthy, empty and degraded scenarios. Developer tooling only;
   it is not part of the distributed package.

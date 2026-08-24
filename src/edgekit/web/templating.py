@@ -47,20 +47,17 @@ def _chrome(request: Request) -> dict:
     return chrome
 
 
-STATIC_DIR = Path(__file__).parent / "static"
-
-
 def static_url(name: str) -> str:
-    """Cache-busted URL for a file in /static.
+    """Cache-busted URL for a file in /static, keyed on the package version.
 
-    Keyed on the file's mtime rather than the package version: a CSS fix that ships without
-    a version bump would otherwise never reach a browser that has the old file cached.
+    The version is deliberate rather than a file mtime: mtime is reset by every
+    ``pip install`` and differs between machines, so it re-downloads assets that did not
+    change and gives two servers different URLs for identical bytes.
+
+    The trade is that a change to app.css or app.js only reaches a browser holding the old
+    file once ``__version__`` moves. CHANGELOG.md already requires that of every release.
     """
-    try:
-        stamp = int((STATIC_DIR / name).stat().st_mtime)
-    except OSError:
-        return f"/static/{name}"
-    return f"/static/{name}?v={stamp}"
+    return f"/static/{name}?v={__version__}"
 
 
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR), context_processors=[_chrome])
