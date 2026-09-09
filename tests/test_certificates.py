@@ -144,3 +144,138 @@ class TestConfigStorage:
         assert loaded.tls.certificate_key == key_pem
         assert loaded.tls.certificate == cert_pem
         assert loaded.tls.present is True
+
+
+class FakeNPMClient:
+    """Stands in for NPMClient: records uploads and pretends to hold the results."""
+
+    def __init__(self, *args, existing_ids: list[int] | None = None, **kwargs) -> None:
+        self.uploads: list[tuple[str, str]] = []
+        self.stored: list[int] = list(existing_ids or [])
+        self.next_id = 10
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def certificate_exists(self, cert_id: int) -> bool:
+        return int(cert_id) in self.stored
+
+    async def upload_custom_certificate(self, nice_name, certificate_pem, key_pem) -> int:
+        self.next_id += 1
+        self.uploads.append((nice_name, certificate_pem))
+        self.stored.append(self.next_id)
+        return self.next_id
+
+
+@pytest.fixture
+def npm(monkeypatch):
+    """One client instance for the whole test, whichever way the service constructs it."""
+    client = FakeNPMClient()
+    monkeypatch.setattr(
+        "edgekit.services.certificates.NPMClient", lambda *a, **k: client
+    )
+    return client
+
+
+class TestIdempotentInstall:
+    """NPM cannot update a certificate in place, so every install churns every proxy host."""
+
+    async def _install(self, session, config, pair, **kwargs):
+        from edgekit.services.certificates import install_manual_certificate
+
+        return await install_manual_certificate(session, config, pair[0], pair[1], **kwargs)
+
+    async def test_the_first_install_uploads(self, db_session, config, npm, wildcard_pair):
+        outcome = await self._install(db_session, config, wildcard_pair)
+
+        assert outcome["status"] == "installed"
+        assert len(npm.uploads) == 1
+
+    async def test_installing_the_same_certificate_again_changes_nothing(
+        self, db_session, config, npm, wildcard_pair
+    ):
+        first = await self._install(db_session, config, wildcard_pair)
+        second = await self._install(db_session, config, wildcard_pair)
+
+        assert second["status"] == "unchanged"
+        assert second["certificate_id"] == first["certificate_id"]
+        assert len(npm.uploads) == 1, "a re-provision must not re-upload an unchanged cert"
+
+    async def test_whitespace_differences_do_not_count_as_a_new_certificate(
+        self, db_session, config, npm, wildcard_pair
+    ):
+        await self._install(db_session, config, wildcard_pair)
+        padded = ("\n" + wildcard_pair[0].strip() + "\n\n", wildcard_pair[1])
+
+        assert (await self._install(db_session, config, padded))["status"] == "unchanged"
+        assert len(npm.uploads) == 1
+
+    async def test_a_different_certificate_is_installed(
+        self, db_session, config, npm, wildcard_pair
+    ):
+        await self._install(db_session, config, wildcard_pair)
+        replacement = make_cert(["*.example.com", "example.com"])
+
+        assert (await self._install(db_session, config, replacement))["status"] == "installed"
+        assert len(npm.uploads) == 2
+
+    async def test_a_wiped_npm_gets_the_certificate_back(
+        self, db_session, config, npm, wildcard_pair
+    ):
+        """`edgekit npm reset` destroys NPM's data without telling edgekit."""
+        await self._install(db_session, config, wildcard_pair)
+        npm.stored.clear()
+
+        assert (await self._install(db_session, config, wildcard_pair))["status"] == "installed"
+        assert len(npm.uploads) == 2
+
+    async def test_force_uploads_regardless(self, db_session, config, npm, wildcard_pair):
+        await self._install(db_session, config, wildcard_pair)
+
+        outcome = await self._install(db_session, config, wildcard_pair, force=True)
+
+        assert outcome["status"] == "installed"
+        assert len(npm.uploads) == 2
+
+
+class TestValidatePair:
+    def test_an_expired_certificate_is_refused(self):
+        from edgekit.services.certificates import validate_pair
+
+        pair = make_cert(["example.com"], days=-1)
+        with pytest.raises(CertificateError, match="expired"):
+            validate_pair(*pair)
+
+    def test_a_valid_pair_returns_its_details(self, wildcard_pair):
+        from edgekit.services.certificates import validate_pair
+
+        assert validate_pair(*wildcard_pair).hostnames == ["*.example.com", "example.com"]
+
+
+class TestCoverageWarnings:
+    def _info(self, hostnames):
+        return inspect_certificate(make_cert(hostnames)[0])
+
+    def test_a_wildcard_covering_the_zone_warns_about_nothing(self):
+        from edgekit.services.certificates import coverage_warnings
+
+        info = self._info(["*.example.com", "example.com"])
+        assert coverage_warnings(info, "example.com", ["a.example.com"]) == []
+
+    def test_hosts_outside_the_certificate_are_named(self):
+        from edgekit.services.certificates import coverage_warnings
+
+        info = self._info(["a.example.com"])
+        warnings = coverage_warnings(info, "example.com", ["a.example.com", "b.example.com"])
+
+        assert any("b.example.com" in w for w in warnings)
+        assert not any("a.example.com" in w.split(":")[-1] for w in warnings if "not covered" in w)
+
+    def test_a_single_host_certificate_warns_about_future_subdomains(self):
+        from edgekit.services.certificates import coverage_warnings
+
+        info = self._info(["a.example.com"])
+        assert any("*.example.com" in w for w in coverage_warnings(info, "example.com", []))

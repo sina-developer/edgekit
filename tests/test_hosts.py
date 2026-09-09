@@ -14,6 +14,8 @@ class FakeNPM:
     def __init__(self) -> None:
         self.upserted: list = []
         self.deleted: list[int] = []
+        self.restored: list[tuple[int, dict]] = []
+        self.existing: dict | None = None
         self.next_id = 100
 
     async def __aenter__(self):
@@ -22,10 +24,17 @@ class FakeNPM:
     async def __aexit__(self, *exc):
         return None
 
+    async def find_proxy_host(self, domain: str):
+        return self.existing
+
     async def upsert_proxy_host(self, spec):
         self.upserted.append(spec)
         self.next_id += 1
         return {"id": self.next_id}
+
+    async def restore_proxy_host(self, host_id: int, snapshot: dict):
+        self.restored.append((host_id, snapshot))
+        return snapshot
 
     async def delete_proxy_host(self, host_id: int):
         self.deleted.append(host_id)
@@ -53,6 +62,15 @@ class FakeCloudflare:
 
     async def delete_dns_record(self, zone_id, record_id):
         self.deleted.append(record_id)
+
+
+@pytest.fixture(autouse=True)
+def nginx_test_unavailable(monkeypatch):
+    """No Docker in the suite: nginx -t cannot run, and that must never look like a failure."""
+    monkeypatch.setattr(
+        "edgekit.services.hosts.dockerx.nginx_config_test",
+        lambda container, timeout=30: (None, "no docker in tests"),
+    )
 
 
 @pytest.fixture
@@ -188,3 +206,53 @@ class TestLifecycle:
         await service.repoint_peer_hosts(peer)
 
         assert service.fake_npm.upserted[-1].forward_host == "10.50.0.50"
+
+
+class TestNginxValidation:
+    """NPM answers 200 for configuration nginx then refuses to load — the 525 pathway."""
+
+    @pytest.fixture
+    def nginx_rejects(self, monkeypatch):
+        monkeypatch.setattr(
+            "edgekit.services.hosts.dockerx.nginx_config_test",
+            lambda container, timeout=30: (
+                False,
+                'nginx: [emerg] cannot load certificate "/data/custom_ssl/npm-7/fullchain.pem"',
+            ),
+        )
+
+    async def test_a_rejected_configuration_is_rolled_back_to_the_previous_host(
+        self, service, nginx_rejects
+    ):
+        service.fake_npm.existing = {"id": 42, "domain_names": ["a.example.com"],
+                                     "forward_port": 80, "certificate_id": 3}
+
+        with pytest.raises(HostError, match="nginx rejected"):
+            await service.create(domain="a.example.com", forward_port=81,
+                                 forward_host="10.50.0.2")
+
+        assert service.fake_npm.restored == [(42, service.fake_npm.existing)]
+
+    async def test_a_rejected_new_host_is_removed_rather_than_left_broken(
+        self, service, nginx_rejects
+    ):
+        with pytest.raises(HostError, match="nginx rejected"):
+            await service.create(domain="a.example.com", forward_port=80,
+                                 forward_host="10.50.0.2")
+
+        assert service.fake_npm.deleted == [101]
+        assert service.fake_npm.restored == []
+
+    async def test_the_nginx_output_reaches_the_operator(self, service, nginx_rejects):
+        with pytest.raises(HostError, match="cannot load certificate"):
+            await service.create(domain="a.example.com", forward_port=80,
+                                 forward_host="10.50.0.2")
+
+    async def test_an_unavailable_nginx_test_is_not_treated_as_a_failure(self, service):
+        """No Docker means we could not check — never a reason to undo good configuration."""
+        host = await service.create(domain="a.example.com", forward_port=80,
+                                    forward_host="10.50.0.2")
+
+        assert host.npm_host_id == 101
+        assert service.fake_npm.restored == []
+        assert service.fake_npm.deleted == []

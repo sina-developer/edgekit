@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import RedirectResponse
@@ -28,6 +29,11 @@ router = APIRouter(prefix="/hosts")
 def _redirect(message: str = "", error: str = "") -> RedirectResponse:
     query = f"?notice={message}" if message else (f"?error={error}" if error else "")
     return RedirectResponse(f"/hosts{query}", status_code=303)
+
+
+def _as_query(text: str) -> str:
+    """Fit an exception into a query string. nginx -t output arrives multi-line."""
+    return quote_plus(" ".join(str(text).split())[:300])
 
 
 @router.get("")
@@ -90,7 +96,7 @@ async def create_host(
         )
     except Exception as exc:  # noqa: BLE001 - surface validation, NPM and CF errors to the form
         log.error("creating host %s failed: %s", domain, exc)
-        return _redirect(error=str(exc)[:300])
+        return _redirect(error=_as_query(exc))
     return _redirect(message=f"{domain}+published")
 
 
@@ -124,7 +130,7 @@ async def update_host(
             actor=user.username,
         )
     except Exception as exc:  # noqa: BLE001
-        return _redirect(error=str(exc)[:300])
+        return _redirect(error=_as_query(exc))
     return _redirect(message="Host+updated")
 
 
@@ -140,7 +146,7 @@ async def delete_host(
     try:
         domain = await service.delete(host_id, remove_dns=remove_dns, actor=user.username)
     except Exception as exc:  # noqa: BLE001
-        return _redirect(error=str(exc)[:300])
+        return _redirect(error=_as_query(exc))
     return _redirect(message=f"Removed+{domain}")
 
 

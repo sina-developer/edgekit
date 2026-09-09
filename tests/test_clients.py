@@ -657,3 +657,175 @@ async def test_origin_certificate_without_a_ca_key_explains_the_permission():
     async with CloudflareClient("token") as client:
         with pytest.raises(CloudflareError, match="SSL and Certificates"):
             await client.create_origin_certificate(["example.com"])
+
+
+class TestCertificateReplacement:
+    """Replacing a certificate must never leave a vhost pointing at a deleted one.
+
+    NPM reports no error for that state: nginx simply refuses the vhost, the handshake for
+    that hostname fails, and Cloudflare shows a 525 with no obvious cause.
+    """
+
+    @staticmethod
+    def _login():
+        respx.post(f"{NPM_BASE}/tokens").mock(
+            return_value=httpx.Response(200, json={"token": "t0ken"})
+        )
+
+    @respx.mock
+    async def test_every_duplicate_under_the_label_is_swept_not_just_the_newest(self):
+        """A replace that failed half way through leaves more than one record behind."""
+        self._login()
+        respx.get(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"id": 3, "nice_name": "Origin"},
+                    {"id": 4, "nice_name": "Origin"},
+                    {"id": 5, "nice_name": "Other"},
+                ],
+            )
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(200, json={"id": 9})
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates/9/upload").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        respx.get(f"{NPM_BASE}/nginx/proxy-hosts").mock(return_value=httpx.Response(200, json=[]))
+        deleted = []
+        respx.delete(url__regex=rf"{NPM_BASE}/nginx/certificates/(?P<cid>\d+)").mock(
+            side_effect=lambda request, cid: deleted.append(int(cid))
+            or httpx.Response(200, json={})
+        )
+
+        async with NPMClient(NPM_BASE, "a@b.c", "pw") as client:
+            new_id = await client.upload_custom_certificate("Origin", "cert", "key")
+
+        assert new_id == 9
+        assert sorted(deleted) == [3, 4], "the other label must be left alone"
+
+    @respx.mock
+    async def test_hosts_are_moved_onto_the_new_certificate_before_the_old_one_goes(self):
+        self._login()
+        respx.get(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(200, json=[{"id": 3, "nice_name": "Origin"}])
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(200, json={"id": 9})
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates/9/upload").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        moved: list[int] = []
+        hosts = [{"id": 1, "certificate_id": 3, "domain_names": ["a.example.com"]}]
+
+        def list_hosts(request):
+            return httpx.Response(200, json=hosts)
+
+        def move(request, hid):
+            moved.append(int(hid))
+            hosts[0]["certificate_id"] = json.loads(request.content)["certificate_id"]
+            return httpx.Response(200, json=hosts[0])
+
+        respx.get(f"{NPM_BASE}/nginx/proxy-hosts").mock(side_effect=list_hosts)
+        respx.put(url__regex=rf"{NPM_BASE}/nginx/proxy-hosts/(?P<hid>\d+)").mock(side_effect=move)
+        deleted = []
+        respx.delete(url__regex=rf"{NPM_BASE}/nginx/certificates/(?P<cid>\d+)").mock(
+            side_effect=lambda request, cid: deleted.append(int(cid))
+            or httpx.Response(200, json={})
+        )
+
+        async with NPMClient(NPM_BASE, "a@b.c", "pw") as client:
+            await client.upload_custom_certificate("Origin", "cert", "key")
+
+        assert moved == [1]
+        assert deleted == [3]
+
+    @respx.mock
+    async def test_an_old_certificate_still_in_use_is_kept(self):
+        """If a host could not be moved, deleting its certificate would break TLS for it."""
+        self._login()
+        respx.get(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(200, json=[{"id": 3, "nice_name": "Origin"}])
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(200, json={"id": 9})
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates/9/upload").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        # The host list never changes: the PUT "succeeds" but the host stays on cert 3.
+        respx.get(f"{NPM_BASE}/nginx/proxy-hosts").mock(
+            return_value=httpx.Response(
+                200, json=[{"id": 1, "certificate_id": 3, "domain_names": ["a.example.com"]}]
+            )
+        )
+        respx.put(url__regex=rf"{NPM_BASE}/nginx/proxy-hosts/(?P<hid>\d+)").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        delete = respx.delete(url__regex=rf"{NPM_BASE}/nginx/certificates/(?P<cid>\d+)").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        async with NPMClient(NPM_BASE, "a@b.c", "pw") as client:
+            await client.upload_custom_certificate("Origin", "cert", "key")
+
+        assert delete.call_count == 0
+
+    @respx.mock
+    async def test_a_failed_upload_removes_the_half_made_record(self):
+        self._login()
+        respx.get(f"{NPM_BASE}/nginx/certificates").mock(return_value=httpx.Response(200, json=[]))
+        respx.post(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(200, json={"id": 9})
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates/9/upload").mock(
+            return_value=httpx.Response(400, text="bad key")
+        )
+        delete = respx.delete(f"{NPM_BASE}/nginx/certificates/9").mock(
+            return_value=httpx.Response(200, json={})
+        )
+
+        async with NPMClient(NPM_BASE, "a@b.c", "pw") as client:
+            with pytest.raises(NPMError):
+                await client.upload_custom_certificate("Origin", "cert", "key")
+
+        assert delete.call_count == 1
+
+    @respx.mock
+    async def test_one_host_that_will_not_move_does_not_strand_the_others(self):
+        self._login()
+        respx.get(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(200, json=[{"id": 3, "nice_name": "Origin"}])
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates").mock(
+            return_value=httpx.Response(200, json={"id": 9})
+        )
+        respx.post(f"{NPM_BASE}/nginx/certificates/9/upload").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        respx.get(f"{NPM_BASE}/nginx/proxy-hosts").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"id": 1, "certificate_id": 3, "domain_names": ["a.example.com"]},
+                    {"id": 2, "certificate_id": 3, "domain_names": ["b.example.com"]},
+                ],
+            )
+        )
+        attempted: list[int] = []
+
+        def move(request, hid):
+            attempted.append(int(hid))
+            if int(hid) == 1:
+                return httpx.Response(500, text="nope")
+            return httpx.Response(200, json={})
+
+        respx.put(url__regex=rf"{NPM_BASE}/nginx/proxy-hosts/(?P<hid>\d+)").mock(side_effect=move)
+
+        async with NPMClient(NPM_BASE, "a@b.c", "pw") as client:
+            with pytest.raises(NPMError, match="a.example.com"):
+                await client.upload_custom_certificate("Origin", "cert", "key")
+
+        assert attempted == [1, 2], "the second host must still be attempted"

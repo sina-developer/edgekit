@@ -78,6 +78,32 @@ sudo EDGEKIT_REPO=https://github.com/you/edgekit.git ./install.sh
 sudo EDGEKIT_ARCHIVE=https://example.com/edgekit.tar.gz ./install.sh
 ```
 
+### When the server is busy or the network is slow
+
+Two things go wrong on a freshly provisioned VPS, and neither is edgekit's fault:
+
+- **`Could not get lock /var/lib/dpkg/lock-frontend`.** `unattended-upgrades` runs on first
+  boot and holds apt for a few minutes. The installer now names the process holding the lock
+  and waits for it (15 minutes by default) instead of failing. Nothing to do but let it run.
+- **`ReadTimeoutError … pypi.org`.** pip's default 15-second timeout is not enough on a
+  congested or filtered link. The installer uses a 60-second timeout, five retries per
+  request, and three attempts per command. If PyPI is unreachable from your server, point it
+  at a mirror.
+
+```bash
+sudo EDGEKIT_PIP_INDEX_URL=https://mirror.example.org/pypi/simple ./install.sh
+```
+
+| Variable | Meaning |
+|---|---|
+| `EDGEKIT_APT_LOCK_WAIT` | Seconds to wait for a busy apt (default `900`) |
+| `EDGEKIT_PIP_INDEX_URL` / `EDGEKIT_PIP_EXTRA_INDEX_URL` | PyPI mirror to install from |
+| `EDGEKIT_PIP_TIMEOUT` / `EDGEKIT_PIP_RETRIES` | Per-request pip timeout and retries (`60`, `5`) |
+| `EDGEKIT_PIP_ATTEMPTS` | Times to retry the whole pip command (default `3`) |
+
+The same variables apply to `edgekit setup` and `edgekit update`, which install WireGuard,
+Docker, and Python packages the same way.
+
 ### Cloudflare: three one-time clicks
 
 edgekit does not need Cloudflare API credentials. These are one-time dashboard actions, and
@@ -105,11 +131,32 @@ sudo edgekit cert install --cert /root/origin.pem --key /root/origin.key
 ```
 
 One certificate serves every subdomain for 15 years. edgekit checks that the key matches the
-certificate and that it has not expired before installing — a mismatched pair otherwise shows
-up much later as a Cloudflare 525.
+certificate, that it has not expired, and that it covers the hostnames this edge serves before
+installing — a mismatched pair otherwise shows up much later as a Cloudflare 525. Installing
+the certificate that is already installed is a no-op: NPM cannot update one in place, so a
+re-upload would rewrite every proxy host's SSL configuration for nothing.
 
 After that, adding a service needs no Cloudflare work at all: the wildcard DNS record and the
 wildcard certificate already cover it.
+
+### Diagnosing a 525 or 526
+
+`edgekit doctor` walks the TLS path one layer at a time, in the order the request travels, so
+a failure names the layer that broke instead of leaving four symptoms to correlate:
+
+| Check | What it proves |
+|---|---|
+| `origin_cert`, `cert_expiry`, `cert_coverage` | a certificate is installed, still valid, and names every host you serve |
+| `nginx_config` | `nginx -t` inside the NPM container — a vhost it refuses cannot complete a handshake |
+| `local_tls_<host>` | TLS to `127.0.0.1:443` with the vhost as SNI |
+| `origin_tls_<host>` | the same TLS to your public IP — the hop Cloudflare makes |
+| `public_<host>` | the full path through Cloudflare |
+
+Read it as: local TLS good but origin TLS bad means port 443 is not reaching the host — a
+cloud-firewall problem, not a certificate one. Both good but Cloudflare reporting **525**
+means the handshake failed with Cloudflare specifically; **526** means the handshake worked
+and Cloudflare would not accept the certificate (expired, wrong hostname, or a CA it does not
+trust under Full (strict)).
 
 <details>
 <summary>Optional: automating DNS through the Cloudflare API</summary>
@@ -300,6 +347,13 @@ peer table on every change. The file and the running interface cannot drift.
 or an already-expired certificate, is rejected at the point of entry rather than surfacing
 later as a Cloudflare 525. When the optional API path is used, the private key is generated
 locally and only a CSR is sent.
+
+*SSL changes are verified, and undone if nginx refuses them.* NPM's API answers 200 for a
+proxy host nginx will not serve — a certificate id that is no longer on disk being the usual
+way in. After every host change edgekit runs `nginx -t` inside the container and, if it
+fails, restores what was there before rather than leaving a vhost that cannot complete a
+handshake. When `nginx -t` cannot be run at all, that is reported as unknown, never as a
+failure.
 
 *Firewall rules are a script, not `iptables -A`.* The guide's commands are neither idempotent
 nor reboot-safe. edgekit writes `/usr/local/lib/edgekit/firewall.sh` — each rule added only if

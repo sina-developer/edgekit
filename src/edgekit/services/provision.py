@@ -387,14 +387,30 @@ class Provisioner:
 
         tls = self.config.tls
         if tls.present:
-            info = certificates.inspect_certificate(tls.certificate)
+            # The stored pair is validated on the way in, but config.yaml can be edited by
+            # hand and a certificate that was valid at setup expires on its own schedule.
+            # Installing a bad one here is silent until Cloudflare answers 525.
+            info = certificates.validate_pair(tls.certificate, tls.certificate_key)
             with session_scope() as session:
+                domains = [h.domain for h in session.scalars(select(ProxyHost))]
+                warnings = certificates.coverage_warnings(
+                    info, self.config.cloudflare.zone_name, domains
+                )
                 outcome = await certificates.install_manual_certificate(
                     session, self.config, tls.certificate, tls.certificate_key, name=tls.name
                 )
-            return (
-                f"installed {', '.join(info.hostnames)} as NPM id "
-                f"{outcome['certificate_id']}, expires {info.not_after.date()}"
+            for warning in warnings:
+                log.warning("origin certificate: %s", warning)
+            detail = (
+                f"unchanged, NPM id {outcome['certificate_id']}"
+                if outcome["status"] == "unchanged"
+                else (
+                    f"installed {', '.join(info.hostnames)} as NPM id "
+                    f"{outcome['certificate_id']}"
+                )
+            )
+            return f"{detail}, expires {info.not_after.date()}" + (
+                " — " + "; ".join(warnings) if warnings else ""
             )
 
         cf = self.config.cloudflare

@@ -6,6 +6,38 @@ All notable changes to edgekit are recorded here. Version numbers follow
 The single source of truth for the number itself is `src/edgekit/__init__.py`
 (`__version__`). Keep this file in lockstep with that string.
 
+## [Unreleased]
+
+- Installing an origin certificate is idempotent. NPM cannot update a certificate in place,
+  so every install created a new record, moved every proxy host onto it and deleted the old
+  one — and `edgekit provision` did that on every run. Re-installing an unchanged certificate
+  now changes nothing (`--force` still re-uploads). Superseded records are swept by label
+  rather than one at a time, and one is deleted only once no proxy host references it: a
+  vhost left pointing at a deleted certificate is not an NPM error, it is a handshake nginx
+  cannot complete, reported by Cloudflare as a 525 that looks nothing like its cause.
+- Proxy host changes are verified with `nginx -t` inside the NPM container and rolled back if
+  nginx refuses them. An unrunnable check (no Docker, container down) is reported as unknown,
+  never as a failure.
+- `edgekit provision` validates the stored certificate before installing it — key match,
+  expiry, and hostname coverage — instead of only parsing it. config.yaml can be edited by
+  hand, and a certificate that was valid at setup expires on its own schedule.
+- `edgekit doctor` walks the TLS path in order: certificate validity and coverage, `nginx -t`,
+  local TLS, TLS to the public IP (the hop Cloudflare makes), then the public path. It also
+  warns as the certificate nears expiry at 30 and 7 days — Cloudflare sends no expiry notice
+  for Origin CA certificates — and tells 525 (handshake failed) apart from 526 (certificate
+  rejected), which have different causes and different fixes.
+- Installation survives a busy or slow server. apt calls wait for whoever holds the dpkg
+  lock — on a fresh VPS that is `unattended-upgrades`, for a few minutes — naming the
+  process instead of failing with `Could not get lock`, and retrying if something takes the
+  lock mid-run. This covers the installer, `edgekit setup`, and `edgekit update`.
+- pip no longer gives up on a congested link to PyPI: a 60-second timeout (was pip's
+  default 15), five retries per request, and three attempts per command, with
+  `EDGEKIT_PIP_INDEX_URL` to install from a mirror where PyPI is unreachable. Downloads of
+  the source archive, the git clone, and Docker's signing key retry too.
+- Failures now say what to do next — which process holds apt, how to check PyPI
+  reachability, which variable to raise — and Ctrl-C reports as an interruption rather than
+  as a failure at a line number.
+
 ## [1.2.0] — 2026-08-24
 
 - The panel is redesigned. The top navigation becomes a sidebar with per-section counts;

@@ -9,12 +9,19 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from .system.shell import CommandError, has, run
 
 DEFAULT_REPO = "https://github.com/sina-developer/edgekit.git"
 DEFAULT_REF = "master"
+
+#: pip's 15s default read timeout gives up mid-download on a congested link to PyPI, and a
+#: half-finished update is worse than a slow one — so wait longer and try again.
+PIP_TIMEOUT = os.environ.get("EDGEKIT_PIP_TIMEOUT", "60")
+PIP_RETRIES = os.environ.get("EDGEKIT_PIP_RETRIES", "5")
+PIP_ATTEMPTS = int(os.environ.get("EDGEKIT_PIP_ATTEMPTS", "3"))
 
 
 def default_repo() -> str:
@@ -68,19 +75,37 @@ def fetch_source(repo: str, ref: str, dest: Path) -> str:
     return _head_sha(dest)
 
 
+def pip_options() -> list[str]:
+    options = [
+        "--disable-pip-version-check",
+        "--timeout",
+        PIP_TIMEOUT,
+        "--retries",
+        PIP_RETRIES,
+    ]
+    index = os.environ.get("EDGEKIT_PIP_INDEX_URL", "").strip()
+    if index:
+        host = index.split("://", 1)[-1].split("/", 1)[0]
+        options += ["--index-url", index, "--trusted-host", host]
+    extra = os.environ.get("EDGEKIT_PIP_EXTRA_INDEX_URL", "").strip()
+    if extra:
+        options += ["--extra-index-url", extra]
+    return options
+
+
 def install_package(source: Path) -> None:
     """Reinstall this tree into the virtualenv that is running ``edgekit``."""
     source = Path(source)
     if not (source / "pyproject.toml").is_file():
         raise FileNotFoundError(f"{source} has no pyproject.toml")
-    try:
-        run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", str(source)],
-            check=True,
-            timeout=600,
-        )
-    except CommandError as exc:
-        raise RuntimeError(str(exc)) from exc
+    argv = [sys.executable, "-m", "pip", "install", *pip_options(), "--upgrade", str(source)]
+    for attempt in range(1, PIP_ATTEMPTS + 1):
+        result = run(argv, timeout=900)
+        if result.ok:
+            return
+        if attempt == PIP_ATTEMPTS:
+            raise RuntimeError(str(CommandError(result)))
+        time.sleep(attempt * 10)
 
 
 def _head_sha(dest: Path) -> str:

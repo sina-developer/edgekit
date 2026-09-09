@@ -8,6 +8,7 @@ updates rather than duplicates.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -16,8 +17,9 @@ from sqlalchemy.orm import Session
 
 from ..config import Config
 from ..models import AuditLog, Peer, ProxyHost, Setting
+from ..system import dockerx
 from .cloudflare import CloudflareClient, CloudflareError
-from .npm import NPMClient, ProxyHostSpec
+from .npm import NPMClient, NPMError, ProxyHostSpec
 
 log = logging.getLogger("edgekit.hosts")
 
@@ -28,6 +30,10 @@ DOMAIN_RE = re.compile(
 SETTING_CERT_ID = "npm_certificate_id"
 SETTING_CERT_NAME = "npm_certificate_name"
 SETTING_CERT_EXPIRY = "npm_certificate_expiry"
+#: SHA-256 of the installed certificate, so a re-provision can tell "same certificate" from
+#: "new certificate" and skip the upload. NPM has no update-in-place, so every upload means
+#: a new record, re-pointed hosts, and a deleted old one — churn worth avoiding.
+SETTING_CERT_FINGERPRINT = "npm_certificate_fingerprint"
 
 
 class HostError(RuntimeError):
@@ -265,10 +271,52 @@ class HostService:
             block_exploits=host.block_exploits,
         )
         async with self._npm_client() as npm:
+            previous = await npm.find_proxy_host(spec.domain)
             result = await npm.upsert_proxy_host(spec)
+            await self._verify_or_rollback(npm, spec.domain, previous, result)
         host.npm_host_id = result.get("id")
         host.npm_certificate_id = spec.certificate_id
         self.session.flush()
+
+    async def _verify_or_rollback(
+        self,
+        npm: NPMClient,
+        domain: str,
+        previous: dict | None,
+        result: dict,
+    ) -> None:
+        """Confirm nginx accepts the configuration this push produced, or undo it.
+
+        NPM's API returns 200 for a host it cannot actually serve — a certificate id that no
+        longer exists on disk being the usual way in. Nginx then refuses to load the vhost,
+        the TLS handshake for that name fails, and Cloudflare reports 525. Leaving that in
+        place is worse than not having applied the change at all.
+        """
+        ok, output = await asyncio.to_thread(
+            dockerx.nginx_config_test, self.config.npm.container_name
+        )
+        if ok is not False:
+            if ok is None:
+                log.debug("skipped nginx -t for %s: %s", domain, output)
+            return
+
+        log.error("nginx rejected the configuration for %s: %s", domain, output)
+        host_id = result.get("id")
+        try:
+            if previous:
+                await npm.restore_proxy_host(int(previous["id"]), previous)
+            elif host_id:
+                await npm.delete_proxy_host(int(host_id))
+        except NPMError as exc:
+            raise HostError(
+                f"nginx rejected the configuration for {domain} and it could not be rolled "
+                f"back: {exc}\n{output}"
+            ) from exc
+
+        raise HostError(
+            f"nginx rejected the configuration for {domain}; the previous configuration was "
+            f"restored.\n{output}"
+        )
 
     async def resync_all(self) -> dict[str, str]:
         """Re-push every host. Used after a certificate rotation or an NPM data loss."""

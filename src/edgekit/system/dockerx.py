@@ -84,6 +84,26 @@ def exec_in(container: str, argv: list[str], timeout: int = 30):
     return run(["docker", "exec", container, *argv], check=False, timeout=timeout)
 
 
+def nginx_config_test(container: str, timeout: int = 30) -> tuple[bool | None, str]:
+    """Ask NPM's nginx whether the configuration it just wrote is loadable.
+
+    A proxy host referencing a certificate that is no longer on disk is not an API error —
+    it is a configuration nginx refuses, which shows up as a failed TLS handshake and, from
+    the outside, as a Cloudflare 525. This is the cheapest way to catch that immediately.
+
+    Returns ``(True | False | None, output)``. ``None`` means the test could not be run at
+    all — no Docker, or the container is not up — which must never be read as a failure:
+    callers would roll back good configuration because they could not check it.
+    """
+    if not container_state(container).get("running"):
+        return None, f"{container} is not running; nginx -t not attempted"
+    result = exec_in(container, ["nginx", "-t"], timeout=timeout)
+    output = (result.stderr or result.stdout).strip()
+    if result.returncode in (124, 125, 126, 127) or "No such container" in output:
+        return None, output or "could not run nginx -t"
+    return result.ok, output
+
+
 def curl_from_container(container: str, url: str, timeout: int = 8):
     """Guide §17's container-side reachability probe."""
     return exec_in(

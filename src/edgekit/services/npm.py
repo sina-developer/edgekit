@@ -20,6 +20,25 @@ log = logging.getLogger("edgekit.npm")
 DEFAULT_EMAIL = "admin@example.com"
 DEFAULT_PASSWORD = "changeme"
 
+#: The fields NPM accepts on a proxy-host update — used to replay a snapshot on rollback.
+WRITABLE_HOST_FIELDS = (
+    "domain_names",
+    "forward_scheme",
+    "forward_host",
+    "forward_port",
+    "certificate_id",
+    "ssl_forced",
+    "http2_support",
+    "hsts_enabled",
+    "hsts_subdomains",
+    "block_exploits",
+    "caching_enabled",
+    "allow_websocket_upgrade",
+    "access_list_id",
+    "advanced_config",
+    "locations",
+)
+
 
 class NPMError(RuntimeError):
     """An NPM API call failed."""
@@ -325,10 +344,16 @@ class NPMClient:
         return await self._request("GET", "/nginx/certificates") or []
 
     async def find_certificate(self, nice_name: str) -> dict[str, Any] | None:
-        for cert in await self.list_certificates():
-            if cert.get("nice_name") == nice_name:
-                return cert
-        return None
+        certificates = await self.find_certificates(nice_name)
+        return certificates[0] if certificates else None
+
+    async def find_certificates(self, nice_name: str) -> list[dict[str, Any]]:
+        """Every record under this label. More than one means an earlier replace half-failed."""
+        return [c for c in await self.list_certificates() if c.get("nice_name") == nice_name]
+
+    async def certificate_exists(self, cert_id: int) -> bool:
+        """Whether NPM still holds this record — false after an `npm reset` wiped its data."""
+        return any(int(c.get("id", 0)) == int(cert_id) for c in await self.list_certificates())
 
     async def upload_custom_certificate(
         self, nice_name: str, certificate_pem: str, key_pem: str
@@ -338,8 +363,13 @@ class NPMClient:
         NPM has no update-in-place for uploaded certificates, so replacing means creating the
         new record first and deleting the old one only after the upload succeeds — a failed
         upload must never leave the hosts without a certificate.
+
+        Superseded records are removed only once nothing points at them any more. A vhost
+        left referencing a deleted certificate is not a visible NPM error: nginx keeps a
+        configuration naming a file that is gone, the TLS handshake for that hostname aborts,
+        and Cloudflare reports it as a 525 that looks nothing like its cause.
         """
-        existing = await self.find_certificate(nice_name)
+        superseded = await self.find_certificates(nice_name)
 
         created = await self._request(
             "POST", "/nginx/certificates", json={"provider": "other", "nice_name": nice_name}
@@ -356,21 +386,55 @@ class NPMClient:
             await self.delete_certificate(cert_id)
             raise
 
-        if existing and existing["id"] != cert_id:
-            # Re-point every host on the old certificate before removing it.
-            await self._repoint_hosts(existing["id"], cert_id)
-            await self.delete_certificate(existing["id"])
+        # Sweep every record under this label, not just the newest: a replace that failed
+        # half way through leaves duplicates behind, and each one is a certificate some host
+        # may still be pointing at.
+        for old in superseded:
+            old_id = int(old["id"])
+            if old_id == cert_id:
+                continue
+            await self._repoint_hosts(old_id, cert_id)
+
+        for old in superseded:
+            old_id = int(old["id"])
+            if old_id == cert_id:
+                continue
+            if await self._hosts_using(old_id):
+                log.warning(
+                    "leaving NPM certificate %s in place: proxy hosts still reference it",
+                    old_id,
+                )
+                continue
+            await self.delete_certificate(old_id)
 
         return cert_id
 
+    async def _hosts_using(self, cert_id: int) -> list[dict[str, Any]]:
+        return [
+            host
+            for host in await self.list_proxy_hosts()
+            if int(host.get("certificate_id") or 0) == int(cert_id)
+        ]
+
     async def _repoint_hosts(self, old_id: int, new_id: int) -> None:
-        for host in await self.list_proxy_hosts():
-            if host.get("certificate_id") == old_id:
+        """Move every host off ``old_id``. One failure must not abandon the rest."""
+        failures: list[str] = []
+        for host in await self._hosts_using(old_id):
+            try:
                 await self._request(
                     "PUT",
                     f"/nginx/proxy-hosts/{host['id']}",
                     json={"certificate_id": new_id},
                 )
+            except NPMError as exc:
+                domain = (host.get("domain_names") or ["?"])[0]
+                failures.append(f"{domain}: {exc}")
+                log.error("could not re-point %s onto certificate %s: %s", domain, new_id, exc)
+        if failures:
+            raise NPMError(
+                "Some proxy hosts could not be moved onto the new certificate: "
+                + "; ".join(failures)
+            )
 
     async def delete_certificate(self, cert_id: int) -> None:
         await self._request("DELETE", f"/nginx/certificates/{cert_id}")
@@ -397,6 +461,15 @@ class NPMClient:
         log.info("creating NPM proxy host for %s -> %s:%s", spec.domain, spec.forward_host,
                  spec.forward_port)
         return await self._request("POST", "/nginx/proxy-hosts", json=spec.payload())
+
+    async def restore_proxy_host(self, host_id: int, snapshot: dict[str, Any]) -> Any:
+        """Put a proxy host back the way ``snapshot`` found it.
+
+        Only the writable fields are sent: a GET body also carries ids and timestamps NPM
+        rejects on the way back in.
+        """
+        payload = {k: snapshot[k] for k in WRITABLE_HOST_FIELDS if k in snapshot}
+        return await self._request("PUT", f"/nginx/proxy-hosts/{host_id}", json=payload)
 
     async def delete_proxy_host(self, host_id: int) -> None:
         await self._request("DELETE", f"/nginx/proxy-hosts/{host_id}")

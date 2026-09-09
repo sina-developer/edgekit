@@ -7,16 +7,36 @@ distro package, because the distro build often lacks the Compose v2 plugin the g
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
-from .shell import CommandError, has, run
+from .shell import CommandError, Result, has, run
 
 log = logging.getLogger("edgekit.packages")
 
 DOCKER_GPG = Path("/etc/apt/keyrings/docker.asc")
 DOCKER_LIST = Path("/etc/apt/sources.list.d/docker.list")
+
+#: A freshly booted VPS is usually mid-`unattended-upgrade`, which holds the dpkg lock for
+#: minutes. Setup waits it out rather than failing halfway through provisioning.
+APT_LOCK_WAIT = int(os.environ.get("EDGEKIT_APT_LOCK_WAIT", "900"))
+APT_LOCK_POLL = 5
+APT_LOCK_FILES = (
+    "/var/lib/dpkg/lock-frontend",
+    "/var/lib/dpkg/lock",
+    "/var/cache/apt/archives/lock",
+    "/var/lib/apt/lists/lock",
+)
+_LOCK_MARKERS = (
+    "could not get lock",
+    "frontend lock",
+    "another process using it",
+    "unable to lock",
+)
 
 BASE_PACKAGES = ("ca-certificates", "curl", "gnupg", "iproute2", "iptables")
 WIREGUARD_PACKAGES = ("wireguard", "wireguard-tools")
@@ -31,6 +51,92 @@ DOCKER_PACKAGES = (
 
 class UnsupportedPlatform(RuntimeError):
     pass
+
+
+def apt_lock_holder() -> str | None:
+    """PID holding an apt/dpkg lock, or None. Best effort — detection is only advisory."""
+    if has("fuser"):
+        for path in APT_LOCK_FILES:
+            if not Path(path).exists():
+                continue
+            output = run(["fuser", path], timeout=30).stdout
+            pids = [token for token in output.split() if token.isdigit()]
+            if pids:
+                return pids[0]
+        return None
+    if has("pgrep"):
+        patterns = (
+            ["-x", "apt|apt-get|aptitude|dpkg|unattended-upgrade"],
+            ["-f", "unattended-upgrade"],
+        )
+        for pattern in patterns:
+            output = run(["pgrep", *pattern], timeout=30).stdout
+            pids = [token for token in output.split() if token.isdigit()]
+            if pids:
+                return pids[0]
+    return None
+
+
+def wait_for_apt_lock(deadline: float) -> None:
+    """Block until no other process holds the apt lock, or ``deadline`` passes."""
+    pid = apt_lock_holder()
+    if pid is None:
+        return
+    name = _process_name(pid)
+    log.warning("apt: %s (pid %s) holds the dpkg lock — waiting for it to finish", name, pid)
+    while time.monotonic() < deadline:
+        time.sleep(APT_LOCK_POLL)
+        if apt_lock_holder() is None:
+            log.info("apt: lock released")
+            return
+    log.warning("apt: still locked after %ss — trying anyway", APT_LOCK_WAIT)
+
+
+def _process_name(pid: str) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip() or "process"
+    except OSError:
+        return "process"
+
+
+def apt_argv(args: Sequence[str]) -> list[str]:
+    argv = ["apt-get", "-o", "Acquire::Retries=3"]
+    if _apt_has_lock_timeout():
+        # apt 2.0+ (Debian 11, Ubuntu 20.04) waits for the lock itself, which closes the race
+        # between wait_for_apt_lock and the command that follows it.
+        argv += ["-o", f"DPkg::Lock::Timeout={APT_LOCK_WAIT}"]
+    return [*argv, *args]
+
+
+@functools.lru_cache(maxsize=1)
+def _apt_has_lock_timeout() -> bool:
+    version = run(["dpkg-query", "-W", "-f=${Version}", "apt"]).stdout.strip()
+    if not version:
+        return False
+    return run(["dpkg", "--compare-versions", version, "ge", "2.0"]).ok
+
+
+def apt(args: Sequence[str], *, timeout: int) -> Result:
+    """Run apt-get, waiting out whoever holds the lock and retrying if one takes it mid-run."""
+    deadline = time.monotonic() + APT_LOCK_WAIT
+    attempt = 0
+    while True:
+        wait_for_apt_lock(deadline)
+        result = run(apt_argv(args), timeout=timeout)
+        if result.ok:
+            return result
+        if not _is_lock_error(result) or time.monotonic() >= deadline:
+            raise CommandError(result)
+        attempt += 1
+        log.warning(
+            "apt: lock taken by another process — retry %s in %ss", attempt, APT_LOCK_POLL
+        )
+        time.sleep(APT_LOCK_POLL)
+
+
+def _is_lock_error(result: Result) -> bool:
+    text = f"{result.stderr}\n{result.stdout}".lower()
+    return any(marker in text for marker in _LOCK_MARKERS)
 
 
 def os_release() -> dict[str, str]:
@@ -69,7 +175,7 @@ def apt_update(max_age_seconds: int = 3600) -> None:
         log.info("apt: package index is fresh — skipping update")
         return
     log.info("apt: refreshing package index")
-    run(["apt-get", "update", "-qq"], check=True, timeout=600)
+    apt(["update", "-qq"], timeout=600)
     log.info("apt: package index updated")
 
 
@@ -82,11 +188,7 @@ def apt_install(packages: tuple[str, ...]) -> None:
     if present:
         log.info("apt: already installed — %s", ", ".join(present))
     log.info("apt: installing — %s", ", ".join(missing))
-    run(
-        ["apt-get", "install", "-y", "-qq", "--no-install-recommends", *missing],
-        check=True,
-        timeout=900,
-    )
+    apt(["install", "-y", "-qq", "--no-install-recommends", *missing], timeout=900)
     log.info("apt: installed — %s", ", ".join(missing))
 
 
@@ -149,9 +251,19 @@ def install_docker() -> None:
     if not DOCKER_GPG.exists():
         log.info("docker: downloading APT signing key (%s)", distro)
         result = run(
-            ["curl", "-fsSL", f"https://download.docker.com/linux/{distro}/gpg"],
+            [
+                "curl",
+                "-fsSL",
+                "--connect-timeout",
+                "20",
+                "--retry",
+                "3",
+                "--retry-delay",
+                "5",
+                f"https://download.docker.com/linux/{distro}/gpg",
+            ],
             check=True,
-            timeout=120,
+            timeout=180,
         )
         DOCKER_GPG.write_text(result.stdout)
         DOCKER_GPG.chmod(0o644)
@@ -171,7 +283,7 @@ def install_docker() -> None:
         log.info("docker: APT repository already configured")
 
     log.info("docker: refreshing package index for Docker repo")
-    run(["apt-get", "update", "-qq"], check=True, timeout=600)
+    apt(["update", "-qq"], timeout=600)
     apt_install(DOCKER_PACKAGES)
     log.info("docker: enabling and starting docker.service")
     run(["systemctl", "enable", "--now", "docker"], check=True)

@@ -7,6 +7,7 @@ A failing check that just says "broken" costs an hour; one that names the fix co
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import socket
 import ssl
@@ -107,12 +108,16 @@ async def run_all(config: Config, peers: list | None = None) -> HealthReport:
         )
         for p in peer_list
     ]
-    local, npm, public = await asyncio.gather(
+    local, tls, npm, public = await asyncio.gather(
         asyncio.to_thread(_local_checks, config, peer_views),
+        _check_certificate(config),
         _check_npm(config),
         _check_public(config),
     )
-    return HealthReport([*local, *npm, *public])
+    # Ordered the way the request travels: this host, then its certificate and nginx, then
+    # what nginx can reach, then the public path. A failure reads as the first layer that
+    # broke rather than as a list to correlate by hand.
+    return HealthReport([*local, *tls, *npm, *public])
 
 
 # ---------------------------------------------------------------------- WireGuard
@@ -364,12 +369,12 @@ async def _reach_from_container(config: Config, target: tuple) -> Check:
     )
 
 
-def _https_localhost_sni(domain: str, port: int) -> int:
-    """TLS to 127.0.0.1 using the vhost SNI. Host header alone is not enough."""
+def _https_sni(address: str, domain: str, port: int) -> int:
+    """TLS to ``address`` using ``domain`` as SNI. A Host header alone is not enough."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with socket.create_connection(("127.0.0.1", port), timeout=PROBE_TIMEOUT) as sock:
+    with socket.create_connection((address, port), timeout=PROBE_TIMEOUT) as sock:
         with ctx.wrap_socket(sock, server_hostname=domain) as tls:
             tls.settimeout(PROBE_TIMEOUT)
             tls.sendall(
@@ -386,15 +391,26 @@ def _https_localhost_sni(domain: str, port: int) -> int:
 
 
 async def _probe_all_local(config: Config, domains: list[str]) -> list[Check]:
+    """Two of the three TLS layers: nginx itself, then the same nginx over the public IP.
+
+    Separating them is what turns "525" into an answer. Local TLS good and origin TLS bad
+    means nothing is wrong with the certificate — port 443 is not reaching this host.
+    """
     port = config.npm.https_port
-    return list(await asyncio.gather(*(_probe_local_proxy(d, port) for d in domains)))
+    checks = list(await asyncio.gather(*(_probe_local_proxy(d, port) for d in domains)))
+    public_ip = (config.server.public_ip or "").strip()
+    if public_ip:
+        checks.extend(
+            await asyncio.gather(*(_probe_origin(public_ip, d, port) for d in domains))
+        )
+    return checks
 
 
 async def _probe_local_proxy(domain: str, port: int) -> Check:
     try:
         # SNI must be the vhost name. Connecting to 127.0.0.1 with only a Host header
         # makes OpenResty return TLSV1_UNRECOGNIZED_NAME even when the origin cert is fine.
-        status = await asyncio.to_thread(_https_localhost_sni, domain, port)
+        status = await asyncio.to_thread(_https_sni, "127.0.0.1", domain, port)
     except OSError as exc:
         return Check(
             f"local_tls_{domain}",
@@ -409,6 +425,150 @@ async def _probe_local_proxy(domain: str, port: int) -> Check:
         f"Local TLS for {domain}",
         Level.OK if status < 500 else Level.WARN,
         f"HTTP {status}",
+    )
+
+
+async def _probe_origin(public_ip: str, domain: str, port: int) -> Check:
+    """The hop Cloudflare makes: TLS to the public IP with this hostname as SNI."""
+    try:
+        status = await asyncio.to_thread(_https_sni, public_ip, domain, port)
+    except OSError as exc:
+        return Check(
+            f"origin_tls_{domain}",
+            f"Origin TLS for {domain} on {public_ip}",
+            Level.WARN,
+            str(exc)[:200],
+            "Nginx answered on 127.0.0.1 but not on the public address. That is a network "
+            f"path problem, not a certificate one: check that TCP {port} is open in the "
+            "cloud firewall (security group, provider firewall) and reachable from "
+            "outside. Some hosts also block hairpin connections to their own public IP, "
+            "which makes this check fail even when Cloudflare succeeds.",
+        )
+    return Check(
+        f"origin_tls_{domain}",
+        f"Origin TLS for {domain} on {public_ip}",
+        Level.OK if status < 500 else Level.WARN,
+        f"HTTP {status}",
+    )
+
+
+# ---------------------------------------------------------------------- certificate
+
+#: Cloudflare sends no expiry notice for Origin CA certificates, so this is the only warning
+#: the operator gets. Escalating thresholds rather than one, so a missed week still nags.
+EXPIRY_WARN_DAYS = 30
+EXPIRY_URGENT_DAYS = 7
+
+
+async def _check_certificate(config: Config) -> list[Check]:
+    from ..db import session_scope
+    from ..models import ProxyHost
+    from .certificates import CertificateError, inspect_certificate
+    from .hosts import SETTING_CERT_EXPIRY, SETTING_CERT_ID, get_setting
+
+    with session_scope() as session:
+        cert_id = get_setting(session, SETTING_CERT_ID)
+        expiry_raw = get_setting(session, SETTING_CERT_EXPIRY)
+        domains = [h.domain for h in session.scalars(select(ProxyHost))]
+
+    if not cert_id:
+        return [
+            Check(
+                "origin_cert",
+                "Origin certificate installed",
+                Level.FAIL,
+                "no origin certificate is recorded",
+                "Cloudflare answers 525 for every hostname while it is set to Full (strict) "
+                "and the origin has no certificate. Install one with "
+                "`edgekit cert install --cert FILE --key FILE`.",
+            )
+        ]
+
+    checks = [
+        Check("origin_cert", "Origin certificate installed", Level.OK, f"NPM id {cert_id}")
+    ]
+    checks.extend(_expiry_checks(expiry_raw))
+
+    # Coverage can only be judged against the certificate itself, which is stored only when
+    # the operator supplied it. The Cloudflare-issued path always covers *.zone by design.
+    if config.tls.certificate and domains:
+        try:
+            info = inspect_certificate(config.tls.certificate)
+        except CertificateError as exc:
+            checks.append(
+                Check(
+                    "cert_readable",
+                    "Origin certificate readable",
+                    Level.FAIL,
+                    str(exc)[:200],
+                    "Reinstall it with `edgekit cert install --cert FILE --key FILE`.",
+                )
+            )
+        else:
+            uncovered = [d for d in domains if not info.covers(d)]
+            zone = config.cloudflare.zone_name or "yourzone"
+            remedy = (
+                "Cloudflare answers 526 for a hostname the origin certificate does not "
+                f"name: the handshake succeeds and the certificate is then refused. Issue "
+                f"one covering *.{zone}, install it with `edgekit cert install`, then run "
+                "`edgekit host resync`."
+            )
+            checks.append(
+                Check(
+                    "cert_coverage",
+                    "Certificate covers every host",
+                    Level.FAIL if uncovered else Level.OK,
+                    ", ".join(uncovered) if uncovered else ", ".join(info.hostnames),
+                    remedy if uncovered else "",
+                )
+            )
+
+    checks.append(await _check_nginx_config(config))
+    return checks
+
+
+def _expiry_checks(expiry_raw: str) -> list[Check]:
+    if not expiry_raw:
+        return []
+    try:
+        expires = dt.datetime.fromisoformat(expiry_raw)
+    except ValueError:
+        return []
+    days = (expires - dt.datetime.now(dt.timezone.utc)).days
+    if days < 0:
+        level, remedy = Level.FAIL, "Issue a new origin certificate and install it."
+    elif days <= EXPIRY_URGENT_DAYS:
+        level, remedy = Level.FAIL, "Replace it now — Full (strict) fails the moment it lapses."
+    elif days <= EXPIRY_WARN_DAYS:
+        level, remedy = Level.WARN, "Plan the replacement; Cloudflare sends no expiry notice."
+    else:
+        level, remedy = Level.OK, ""
+    detail = f"expired {-days} days ago" if days < 0 else f"{days} days remaining"
+    return [
+        Check(
+            "cert_expiry",
+            "Origin certificate validity",
+            level,
+            f"{detail} ({expires.date()})",
+            remedy,
+        )
+    ]
+
+
+async def _check_nginx_config(config: Config) -> Check:
+    ok, output = await asyncio.to_thread(dockerx.nginx_config_test, config.npm.container_name)
+    if ok is None:
+        return Check("nginx_config", "Nginx configuration valid", Level.SKIP, output[:200])
+    if ok:
+        return Check("nginx_config", "Nginx configuration valid", Level.OK, "nginx -t passed")
+    return Check(
+        "nginx_config",
+        "Nginx configuration valid",
+        Level.FAIL,
+        output[-300:],
+        "Nginx will not load this configuration, so TLS fails and Cloudflare reports 525. "
+        "A vhost pointing at a certificate that is no longer on disk is the usual cause: "
+        "run `edgekit cert install` again, then `edgekit host resync`.",
     )
 
 
@@ -444,9 +604,23 @@ async def _check_public(config: Config) -> list[Check]:
                 f"public_{domain}",
                 f"Public https://{domain}",
                 Level.FAIL,
-                "HTTP 525 — Cloudflare could not complete TLS with this origin",
-                "Cloudflare is set to Full (strict) but the origin certificate is missing "
-                "or does not cover this hostname. Run `edgekit cert issue --force`.",
+                "HTTP 525 — the Cloudflare-to-origin TLS handshake failed",
+                "Cloudflare reached port 443 but could not complete TLS. It never saw a "
+                "usable certificate, so this is a handshake problem, not a trust one: a "
+                "vhost nginx refused to load, an SNI with no matching proxy host, or 443 "
+                "answered by something else. Check the nginx and local TLS results above.",
+            )
+        if response.status_code == 526:
+            return Check(
+                f"public_{domain}",
+                f"Public https://{domain}",
+                Level.FAIL,
+                "HTTP 526 — Cloudflare rejected this origin's certificate",
+                "The handshake worked, so nginx and the vhost are fine. Cloudflare would "
+                "not accept the certificate itself: expired, not covering this hostname, "
+                "or not issued by a CA it trusts. A Cloudflare Origin CA certificate "
+                "covering *." + (config.cloudflare.zone_name or "yourzone") + " is what "
+                "Full (strict) expects — check `edgekit cert status`.",
             )
         level = Level.OK if response.status_code < 500 else Level.WARN
         return Check(

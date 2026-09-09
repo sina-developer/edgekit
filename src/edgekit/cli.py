@@ -20,11 +20,12 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.table import Table
+from sqlalchemy import select
 
 from . import __version__, service_unit
 from .config import Config, load_config
 from .db import init_db, session_scope
-from .models import User
+from .models import ProxyHost, User
 from .paths import CONFIG_FILE, LOG_FILE, ensure_dirs
 from .security import check_password_strength, generate_password, hash_password
 from .services import certificates, health
@@ -866,6 +867,9 @@ def cert_install(
     cert: str = typer.Option(..., "--cert", help="Path to the origin certificate (PEM)."),
     key: str = typer.Option(..., "--key", help="Path to its private key (PEM)."),
     name: str = typer.Option("", "--name", help="Label to show in NPM."),
+    force: bool = typer.Option(
+        False, "--force", help="Re-upload even when this certificate is already installed."
+    ),
 ) -> None:
     """Install an origin certificate into Nginx Proxy Manager.
 
@@ -880,34 +884,32 @@ def cert_install(
     from .services.certificates import (
         CertificateError,
         certificate_name,
-        inspect_certificate,
+        coverage_warnings,
         install_manual_certificate,
-        validate_key_matches,
+        validate_pair,
     )
 
     try:
         certificate_pem = Path(cert).expanduser().read_text().strip() + "\n"
         key_pem = Path(key).expanduser().read_text().strip() + "\n"
-        validate_key_matches(certificate_pem, key_pem)
-        info = inspect_certificate(certificate_pem)
+        info = validate_pair(certificate_pem, key_pem)
     except (OSError, CertificateError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
 
-    if info.expired:
-        console.print(f"[red]That certificate expired on {info.not_after.date()}.[/red]")
-        raise typer.Exit(1)
-
     label = name or certificate_name(config.cloudflare.zone_name or config.server.hostname)
 
-    async def run() -> dict:
+    async def run() -> tuple[dict, list[str]]:
         with session_scope() as session:
-            return await install_manual_certificate(
-                session, config, certificate_pem, key_pem, name=label, actor="cli"
+            domains = [h.domain for h in session.scalars(select(ProxyHost))]
+            warnings = coverage_warnings(info, config.cloudflare.zone_name, domains)
+            outcome = await install_manual_certificate(
+                session, config, certificate_pem, key_pem, name=label, actor="cli", force=force
             )
+            return outcome, warnings
 
     try:
-        outcome = asyncio.run(run())
+        outcome, warnings = asyncio.run(run())
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
@@ -918,12 +920,22 @@ def cert_install(
     config.tls.name = label
     config.save()
 
-    console.print(
-        f"[green]✓[/green] installed as NPM id {outcome['certificate_id']}\n"
-        f"  covers:  {', '.join(info.hostnames)}\n"
-        f"  expires: {info.not_after.date()} ({info.days_remaining} days)\n"
-        "  Existing proxy hosts: run [bold]edgekit host resync[/bold] to attach it."
-    )
+    if outcome["status"] == "unchanged":
+        console.print(
+            f"[green]✓[/green] already installed as NPM id {outcome['certificate_id']} — "
+            "nothing changed.\n"
+            f"  expires: {info.not_after.date()} ({info.days_remaining} days)\n"
+            "  [dim]Re-upload anyway with --force.[/dim]"
+        )
+    else:
+        console.print(
+            f"[green]✓[/green] installed as NPM id {outcome['certificate_id']}\n"
+            f"  covers:  {', '.join(info.hostnames)}\n"
+            f"  expires: {info.not_after.date()} ({info.days_remaining} days)\n"
+            "  Existing proxy hosts: run [bold]edgekit host resync[/bold] to attach it."
+        )
+    for warning in warnings:
+        console.print(f"  [yellow]![/yellow] {warning}")
 
 
 @cert_app.command("status")

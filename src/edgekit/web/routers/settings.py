@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import RedirectResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ...config import Config
-from ...models import AuditLog, User
+from ...models import AuditLog, ProxyHost, User
 from ...services import certificates
 from ...services.cloudflare import CloudflareClient, CloudflareError
 from ...services.hosts import SETTING_CERT_EXPIRY, SETTING_CERT_ID, SETTING_CERT_NAME, get_setting
@@ -26,6 +28,11 @@ router = APIRouter(prefix="/settings")
 def _redirect(message: str = "", error: str = "") -> RedirectResponse:
     query = f"?notice={message}" if message else (f"?error={error}" if error else "")
     return RedirectResponse(f"/settings{query}", status_code=303)
+
+
+def _as_query(text: str) -> str:
+    """Fit an exception into a query string; certificate errors carry punctuation."""
+    return quote_plus(" ".join(str(text).split())[:400])
 
 
 @router.get("")
@@ -82,7 +89,7 @@ async def update_wireguard(
         config.wireguard.persistent_keepalive = int(persistent_keepalive)
         config.wireguard.mtu = int(mtu) if mtu.strip() else None
     except ValueError as exc:
-        return _redirect(error=str(exc))
+        return _redirect(error=_as_query(exc))
 
     config.save()
     PeerService(db, config).sync()
@@ -160,7 +167,7 @@ async def issue_certificate(
         )
     except Exception as exc:  # noqa: BLE001 - Cloudflare and NPM errors both land here
         log.error("certificate issuance failed: %s", exc)
-        return _redirect(error=str(exc)[:400])
+        return _redirect(error=_as_query(exc))
     return _redirect(
         message=f"Certificate+{outcome['status']}+(NPM+id+{outcome['certificate_id']})"
     )
@@ -181,12 +188,12 @@ async def upload_certificate(
     # Validate before touching NPM: a mismatched pair installs cleanly and then fails as a
     # Cloudflare 525, which is a far harder problem to trace back to this form.
     try:
-        certificates.validate_key_matches(certificate_pem, key_pem)
-        info = certificates.inspect_certificate(certificate_pem)
+        info = certificates.validate_pair(certificate_pem, key_pem)
     except certificates.CertificateError as exc:
-        return _redirect(error=str(exc)[:400])
-    if info.expired:
-        return _redirect(error=f"That+certificate+expired+on+{info.not_after.date()}")
+        return _redirect(error=_as_query(exc))
+
+    domains = [h.domain for h in db.scalars(select(ProxyHost))]
+    warnings = certificates.coverage_warnings(info, config.cloudflare.zone_name, domains)
 
     label = name.strip() or certificates.certificate_name(
         config.cloudflare.zone_name or config.server.hostname
@@ -196,7 +203,7 @@ async def upload_certificate(
             db, config, certificate_pem, key_pem, name=label, actor=user.username
         )
     except Exception as exc:  # noqa: BLE001
-        return _redirect(error=str(exc)[:400])
+        return _redirect(error=_as_query(exc))
 
     # Remember it so `edgekit provision` can repopulate a rebuilt NPM.
     config.tls.certificate = certificate_pem
@@ -205,10 +212,17 @@ async def upload_certificate(
     config.save()
     reload_config()
 
-    return _redirect(
-        message=f"Installed+{'+'.join(info.hostnames)}+(NPM+id+{outcome['certificate_id']}),"
-                f"+expires+{info.not_after.date()}"
-    )
+    if outcome["status"] == "unchanged":
+        summary = (
+            f"That certificate is already installed as NPM id {outcome['certificate_id']}; "
+            "nothing changed."
+        )
+    else:
+        summary = (
+            f"Installed {', '.join(info.hostnames)} (NPM id {outcome['certificate_id']}), "
+            f"expires {info.not_after.date()}"
+        )
+    return _redirect(message=quote_plus(". ".join([summary, *warnings])))
 
 
 @router.post("/reprovision", dependencies=[Depends(verify_csrf)])
