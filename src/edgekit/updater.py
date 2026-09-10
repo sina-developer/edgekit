@@ -93,6 +93,20 @@ def pip_options() -> list[str]:
     return options
 
 
+#: pip's wording when the index has no build of something for this interpreter. Retrying
+#: that is pointless — the answer is deterministic — and it costs minutes to learn nothing.
+_RESOLUTION_MARKERS = (
+    "resolutionimpossible",
+    "no matching distribution",
+    "no matching distributions",
+)
+
+
+def _is_resolution_failure(result) -> bool:
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in text for marker in _RESOLUTION_MARKERS)
+
+
 def install_package(source: Path) -> None:
     """Reinstall this tree into the virtualenv that is running ``edgekit``."""
     source = Path(source)
@@ -103,6 +117,15 @@ def install_package(source: Path) -> None:
         result = run(argv, timeout=900)
         if result.ok:
             return
+        if _is_resolution_failure(result):
+            raise RuntimeError(
+                f"pip found no usable build of a dependency for Python "
+                f"{sys.version_info.major}.{sys.version_info.minor} on this machine. "
+                "This is not a network problem, so retrying will not help. Reinstall "
+                "edgekit against a Python the dependencies publish wheels for, or install "
+                "build-essential, python3-dev and libffi-dev so pip can build them.\n\n"
+                + (result.stderr or result.stdout).strip()[-800:]
+            )
         if attempt == PIP_ATTEMPTS:
             raise RuntimeError(str(CommandError(result)))
         time.sleep(attempt * 10)

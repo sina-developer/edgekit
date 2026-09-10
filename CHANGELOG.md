@@ -8,6 +8,19 @@ The single source of truth for the number itself is `src/edgekit/__init__.py`
 
 ## [Unreleased]
 
+- A missing wheel no longer reads as a network failure. `ResolutionImpossible` and "no
+  matching distributions available for your environment" are deterministic — the index has
+  no build of that package for this interpreter — so the installer stops retrying them
+  (three attempts with backoff bought nothing but minutes) and recovers instead: it retries
+  against PyPI when a mirror is configured, then installs a compiler toolchain so pip can
+  build from source. If both fail it names the package, the Python version, and the platform,
+  and lists only the routes that still apply. `edgekit update` classifies the same failure
+  the same way.
+- `EDGEKIT_PYTHON` selects the interpreter the virtualenv is built from — the fix when the
+  system Python is newer than the compiled dependencies publish wheels for. The installer
+  installs that interpreter's `-venv` package, and rebuilds an existing virtualenv that was
+  made with a different version.
+
 - Installing an origin certificate is idempotent. NPM cannot update a certificate in place,
   so every install created a new record, moved every proxy host onto it and deleted the old
   one — and `edgekit provision` did that on every run. Re-installing an unchanged certificate

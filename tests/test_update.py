@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 
+import pytest
 from typer.testing import CliRunner
 
 from edgekit.cli import app
@@ -180,3 +181,48 @@ def test_update_skip_provision_does_not_reprovision(monkeypatch, config):
     result = runner.invoke(app, ["update", "--resume", "--skip-provision"])
     assert result.exit_code == 0
     assert provisioned == []
+
+
+class TestResolutionFailures:
+    """A missing wheel is deterministic: retrying it just spends minutes on the same answer."""
+
+    def _source(self, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "pyproject.toml").write_text("[project]\nname='edgekit'\n")
+        return source
+
+    def test_a_missing_wheel_fails_immediately_rather_than_retrying(self, tmp_path, monkeypatch):
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append([str(a) for a in argv])
+            return Result(
+                tuple(str(a) for a in argv),
+                1,
+                "",
+                "ERROR: ResolutionImpossible: cffi has no matching distributions available",
+            )
+
+        monkeypatch.setattr("edgekit.updater.run", fake_run)
+        monkeypatch.setattr("edgekit.updater.time.sleep", lambda _s: None)
+
+        with pytest.raises(RuntimeError, match="not a network problem"):
+            install_package(self._source(tmp_path))
+
+        assert len(calls) == 1
+
+    def test_a_network_failure_is_still_retried(self, tmp_path, monkeypatch):
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append([str(a) for a in argv])
+            return Result(tuple(str(a) for a in argv), 1, "", "ReadTimeoutError: pypi.org")
+
+        monkeypatch.setattr("edgekit.updater.run", fake_run)
+        monkeypatch.setattr("edgekit.updater.time.sleep", lambda _s: None)
+
+        with pytest.raises(RuntimeError):
+            install_package(self._source(tmp_path))
+
+        assert len(calls) == 3

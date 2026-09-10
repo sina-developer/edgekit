@@ -94,12 +94,26 @@ Two things go wrong on a freshly provisioned VPS, and neither is edgekit's fault
 sudo EDGEKIT_PIP_INDEX_URL=https://mirror.example.org/pypi/simple ./install.sh
 ```
 
+- **`ResolutionImpossible`, or `no matching distributions available for your environment`.**
+  Not a network problem: the index answered, but has no build of something (usually `cffi`)
+  for this Python on this machine. Either the system Python is newer than the packages
+  publish wheels for, or the index is a mirror carrying only part of PyPI. The installer
+  retries against PyPI, then installs a compiler toolchain so pip can build from source, and
+  if both fail it says which package and which Python. The direct fix is to build the
+  virtualenv from a Python the dependencies support:
+
+```bash
+sudo apt install python3.12 python3.12-venv
+sudo EDGEKIT_PYTHON=python3.12 ./install.sh
+```
+
 | Variable | Meaning |
 |---|---|
 | `EDGEKIT_APT_LOCK_WAIT` | Seconds to wait for a busy apt (default `900`) |
 | `EDGEKIT_PIP_INDEX_URL` / `EDGEKIT_PIP_EXTRA_INDEX_URL` | PyPI mirror to install from |
 | `EDGEKIT_PIP_TIMEOUT` / `EDGEKIT_PIP_RETRIES` | Per-request pip timeout and retries (`60`, `5`) |
 | `EDGEKIT_PIP_ATTEMPTS` | Times to retry the whole pip command (default `3`) |
+| `EDGEKIT_PYTHON` | Interpreter to build the virtualenv from (default `python3`) |
 
 The same variables apply to `edgekit setup` and `edgekit update`, which install WireGuard,
 Docker, and Python packages the same way.

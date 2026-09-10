@@ -27,6 +27,7 @@
 #     EDGEKIT_PIP_TIMEOUT     per-request pip timeout in seconds (default 60)
 #     EDGEKIT_PIP_RETRIES     pip's own per-request retries (default 5)
 #     EDGEKIT_PIP_ATTEMPTS    whole-command pip attempts (default 3)
+#     EDGEKIT_PYTHON          interpreter to build the venv from (default python3)
 #
 set -Eeuo pipefail
 
@@ -57,6 +58,11 @@ APT_RETRIES="${EDGEKIT_APT_RETRIES:-5}"
 PIP_TIMEOUT="${EDGEKIT_PIP_TIMEOUT:-60}"
 PIP_RETRIES="${EDGEKIT_PIP_RETRIES:-5}"
 PIP_ATTEMPTS="${EDGEKIT_PIP_ATTEMPTS:-3}"
+#: The interpreter the venv is built from. Worth overriding when the system Python is newer
+#: than the compiled dependencies have wheels for.
+PYTHON_BIN="${EDGEKIT_PYTHON:-python3}"
+#: Last pip run's output, kept so a failure can be classified rather than guessed at.
+PIP_LOG=""
 INTERRUPTED=""
 
 # ------------------------------------------------------------------ output helpers
@@ -77,6 +83,9 @@ die()  { printf '%s✗ %s%s\n' "$C_RED" "$1" "$C_RESET" >&2; exit 1; }
 cleanup() {
     if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
         rm -rf -- "$WORKDIR"
+    fi
+    if [ -n "$PIP_LOG" ] && [ -f "$PIP_LOG" ]; then
+        rm -f -- "$PIP_LOG"
     fi
 }
 trap cleanup EXIT
@@ -218,13 +227,20 @@ pip_options() {
 
 pip_install() {
     local attempt=1 rc delay
+    [ -n "$PIP_LOG" ] || PIP_LOG="$(mktemp)"
     while :; do
         set +e
-        "${VENV}/bin/pip" install "${PIP_OPTS[@]}" "$@"
-        rc=$?
+        "${VENV}/bin/pip" install "${PIP_OPTS[@]}" "$@" 2>&1 | tee "$PIP_LOG"
+        rc=${PIPESTATUS[0]}
         set -e
         if [ "$rc" -eq 0 ]; then
             return 0
+        fi
+        # A resolution failure is deterministic: the index either has a usable build for
+        # this interpreter or it does not. Retrying just spends minutes reaching the same
+        # answer, so hand it straight to the recovery path.
+        if pip_resolution_failed; then
+            return "$rc"
         fi
         if [ "$attempt" -ge "$PIP_ATTEMPTS" ]; then
             return "$rc"
@@ -236,8 +252,74 @@ pip_install() {
     done
 }
 
+#: True when pip could not find a usable build, as opposed to failing to reach the index.
+pip_resolution_failed() {
+    [ -n "$PIP_LOG" ] && [ -f "$PIP_LOG" ] || return 1
+    grep -qiE 'resolutionimpossible|no matching distribution|no matching distributions' \
+        "$PIP_LOG"
+}
+
+#: The package names pip named as unavailable, on one line.
+pip_missing_packages() {
+    [ -n "$PIP_LOG" ] && [ -f "$PIP_LOG" ] || return 0
+    {
+        # "ERROR: No matching distribution found for cffi>=1.12"
+        sed -n 's/.*[Nn]o matching distribution found for \([A-Za-z0-9._-]*\).*/\1/p' "$PIP_LOG"
+        # A resolver conflict lists them under a trailing "...for your environment:" block.
+        sed -n '/no matching distributions available/,$ s/^ *\([A-Za-z][A-Za-z0-9._-]*\) *$/\1/p' \
+            "$PIP_LOG"
+    } | sort -u | tr '\n' ' ' | sed 's/ *$//'
+}
+
+python_report() {
+    "${VENV}/bin/python" - <<'PYEOF' 2>/dev/null || true
+import platform, sysconfig
+print(f"  Python:   {platform.python_version()} ({sysconfig.get_platform()})")
+print(f"  Machine:  {platform.machine()} / {platform.libc_ver()[0] or 'unknown libc'}")
+PYEOF
+}
+
 pip_failed() {
     local index="${EDGEKIT_PIP_INDEX_URL:-https://pypi.org/simple}"
+
+    if pip_resolution_failed; then
+        local missing option=1
+        missing="$(pip_missing_packages)"
+        printf '\n%s✗ No usable build of %s for this system.%s\n' \
+            "$C_RED" "${missing:-a dependency}" "$C_RESET" >&2
+        python_report >&2
+        printf '  Index:    %s\n\n' "$index" >&2
+        printf '  The index answered — it simply has no build of that for this Python on this\n' >&2
+        printf '  machine, and building it from source did not work either. What is left:\n\n' >&2
+
+        printf '   %d. Use a Python the packages publish wheels for. %s is the safe choice\n' \
+            "$option" "python3.12" >&2
+        printf '      on Debian and Ubuntu:\n' >&2
+        printf '         sudo apt install python3.12 python3.12-venv\n' >&2
+        printf '         sudo EDGEKIT_PYTHON=python3.12 %s\n\n' "$SELF" >&2
+        option=$((option + 1))
+
+        if [ -n "${EDGEKIT_PIP_INDEX_URL:-}" ]; then
+            printf '   %d. %s is a mirror, and mirrors carry only part of PyPI.\n' \
+                "$option" "${EDGEKIT_PIP_INDEX_URL}" >&2
+            printf '      PyPI itself was tried as a fallback and did not work either, so this\n' >&2
+            printf '      is unlikely to be the cause — but you can force it:\n' >&2
+            printf '         sudo EDGEKIT_PIP_INDEX_URL=https://pypi.org/simple %s\n\n' \
+                "$SELF" >&2
+            option=$((option + 1))
+        fi
+
+        printf '   %d. Install the build toolchain by hand and re-run — the automatic attempt\n' \
+            "$option" >&2
+        printf '      above may have failed for its own reasons:\n' >&2
+        printf '         sudo apt install build-essential python3-dev libffi-dev libssl-dev\n' >&2
+        printf '         sudo %s\n\n' "$SELF" >&2
+        printf '  Full pip output: %s\n' "$PIP_LOG" >&2
+        # Keep the log this time: it is the evidence for whichever route comes next.
+        PIP_LOG=""
+        exit 1
+    fi
+
     die "pip could not install $1 from ${index}.
 
   Usually this is the network, not the package. Check reachability:
@@ -246,6 +328,68 @@ pip_failed() {
       sudo EDGEKIT_PIP_INDEX_URL=https://mirror.example.org/pypi/simple ${SELF}
   Or just give it longer:
       sudo EDGEKIT_PIP_TIMEOUT=120 EDGEKIT_PIP_ATTEMPTS=5 ${SELF}"
+}
+
+#: Everything needed to build a small C extension (cffi is the one that usually needs it).
+install_build_toolchain() {
+    local packages=(build-essential libffi-dev libssl-dev pkg-config)
+    local headers
+    headers="$(python_dev_package)"
+    apt_options
+    # The versioned -dev package matches the interpreter the venv was built from; the
+    # unversioned one is right when that is the distro's own python3.
+    if [ -n "$headers" ] && apt_get install -y --no-install-recommends "$headers"; then
+        packages+=()
+    else
+        packages+=(python3-dev)
+    fi
+    apt_get install -y --no-install-recommends "${packages[@]}"
+}
+
+python_dev_package() {
+    local version
+    version="$("${VENV}/bin/python" -c \
+        'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+    [ -n "$version" ] && printf 'python%s-dev' "$version"
+}
+
+#: Second chances for a resolution failure, cheapest and most likely first.
+recover_pip_resolution() {
+    pip_resolution_failed || return 1
+
+    local missing
+    missing="$(pip_missing_packages)"
+    warn "no usable build of ${missing:-a dependency} in this index"
+
+    # 1. A mirror carrying only part of PyPI is the common cause, and costs nothing to rule
+    #    out. PyPI itself has every wheel every package ever published.
+    if [ -n "${EDGEKIT_PIP_INDEX_URL:-}" ]; then
+        local mirror="${EDGEKIT_PIP_INDEX_URL}"
+        info "retrying against PyPI instead of ${mirror}"
+        unset EDGEKIT_PIP_INDEX_URL
+        pip_options
+        if pip_install "$@"; then
+            ok "installed from PyPI — ${mirror} is missing builds for this system"
+            return 0
+        fi
+        export EDGEKIT_PIP_INDEX_URL="$mirror"
+        pip_options
+        pip_resolution_failed || return 1
+    fi
+
+    # 2. No wheel for this Python or this architecture. pip can build from source, given a
+    #    compiler and the development headers.
+    info "installing a compiler toolchain so pip can build ${missing:-them} from source"
+    if ! install_build_toolchain; then
+        warn "could not install the build toolchain"
+        return 1
+    fi
+    ok "build toolchain installed"
+    if pip_install "$@"; then
+        ok "built ${missing:-the missing dependencies} from source"
+        return 0
+    fi
+    return 1
 }
 
 # ------------------------------------------------------------------ preflight
@@ -295,17 +439,23 @@ install_dependencies() {
     if [ -n "${EDGEKIT_REPO:-}" ]; then
         packages+=(git)
     fi
+    # A requested interpreter needs its own venv module; the distro splits them.
+    if [ -n "${EDGEKIT_PYTHON:-}" ] && [ "${PYTHON_BIN}" != "python3" ]; then
+        packages+=("${PYTHON_BIN}" "${PYTHON_BIN}-venv")
+    fi
 
     info "[2/3] installing packages: ${packages[*]}"
     apt_get install -y --no-install-recommends "${packages[@]}" || apt_failed install
     ok "system packages installed"
 
     info "[3/3] verifying Python"
+    command -v "$PYTHON_BIN" >/dev/null 2>&1 \
+        || die "EDGEKIT_PYTHON=${PYTHON_BIN} is not on PATH after installing packages."
     local python_version
-    python_version="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+    python_version="$("$PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
     case "$python_version" in
-        3.1[0-9]|3.[2-9][0-9]) ok "Python $python_version" ;;
-        *) die "Python 3.10 or newer is required; this system has $python_version." ;;
+        3.1[0-9]|3.[2-9][0-9]) ok "Python $python_version ($PYTHON_BIN)" ;;
+        *) die "Python 3.10 or newer is required; ${PYTHON_BIN} is $python_version." ;;
     esac
 }
 
@@ -380,13 +530,21 @@ install_edgekit() {
     step "Installing edgekit into ${VENV}"
 
     mkdir -p "${PREFIX}"
+    if [ -x "${VENV}/bin/python" ] && ! venv_matches_interpreter; then
+        # Only reachable when EDGEKIT_PYTHON asks for an interpreter the venv was not built
+        # from. The venv is a build artifact — config and data live outside it.
+        warn "rebuilding the virtualenv with ${PYTHON_BIN}"
+        rm -rf -- "${VENV}"
+    fi
     if [ ! -x "${VENV}/bin/python" ]; then
         info "[1/4] creating virtualenv at ${VENV}"
-        python3 -m venv "${VENV}"
-        ok "virtualenv created"
+        "${PYTHON_BIN}" -m venv "${VENV}" \
+            || die "Could not create a virtualenv with ${PYTHON_BIN}.
+  Install it first:  sudo apt install ${PYTHON_BIN} ${PYTHON_BIN}-venv"
+        ok "virtualenv created ($("${VENV}/bin/python" -V 2>&1))"
     else
         info "[1/4] reusing existing virtualenv at ${VENV}"
-        ok "virtualenv ready"
+        ok "virtualenv ready ($("${VENV}/bin/python" -V 2>&1))"
     fi
 
     pip_options
@@ -395,13 +553,28 @@ install_edgekit() {
     ok "pip tooling upgraded"
 
     info "[3/4] installing edgekit and Python dependencies (this takes a minute)"
-    pip_install "${SOURCE_DIR}" || pip_failed "edgekit and its dependencies"
+    if ! pip_install "${SOURCE_DIR}"; then
+        recover_pip_resolution "${SOURCE_DIR}" || pip_failed "edgekit and its dependencies"
+    fi
     ok "Python package installed"
 
     info "[4/4] linking edgekit onto PATH"
     # A stable path on PATH means `edgekit` works for the operator and in the systemd unit.
     ln -sf "${BIN}" /usr/local/bin/edgekit
     ok "$("${BIN}" version) → /usr/local/bin/edgekit"
+}
+
+#: False when EDGEKIT_PYTHON names a different interpreter than the venv was built from.
+venv_matches_interpreter() {
+    [ -n "${EDGEKIT_PYTHON:-}" ] || return 0
+    command -v "$PYTHON_BIN" >/dev/null 2>&1 || return 0
+
+    local wanted current
+    wanted="$("$PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
+    current="$("${VENV}/bin/python" -c \
+        'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
+    [ -n "$wanted" ] && [ -n "$current" ] && [ "$wanted" != "$current" ] && return 1
+    return 0
 }
 
 # ------------------------------------------------------------------ handover
