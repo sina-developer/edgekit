@@ -595,7 +595,12 @@ class Provisioner:
                     retry.append(probe.domain)
             if not retry or loop.time() + self.VERIFY_INTERVAL > deadline:
                 break
-            log.info("waiting for DNS to settle on %s", ", ".join(retry))
+            log.info(
+                "not settled yet — checking again in %ds, giving up in %ds: %s",
+                self.VERIFY_INTERVAL,
+                max(0.0, deadline - loop.time()),
+                "; ".join(f"{d}: {results[d].detail[:70]}" for d in retry),
+            )
             await asyncio.sleep(self.VERIFY_INTERVAL)
             pending = retry
 

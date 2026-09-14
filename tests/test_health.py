@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 
+import httpx
 import pytest
+import respx
 from test_certificates import make_cert
 
 from edgekit.services import health
@@ -246,6 +248,66 @@ class TestPublicAssessment:
         assert health._issuer_name(ORIGIN_ISSUER) == "CloudFlare, Inc."
 
 
+DOH_CLOUDFLARE = "https://cloudflare-dns.com/dns-query"
+DOH_GOOGLE = "https://dns.google/resolve"
+
+
+class TestPublicResolution:
+    """A server's resolver caches "no such name" for 30 minutes; browsers do not use it."""
+
+    @respx.mock
+    def test_public_dns_answers_with_its_addresses(self):
+        route = respx.get(DOH_CLOUDFLARE).mock(
+            return_value=httpx.Response(200, json={"Status": 0, "Answer": [
+                {"type": 5, "data": "edge.example."},
+                {"type": 1, "data": "188.114.97.3"},
+                {"type": 1, "data": "188.114.96.3"},
+            ]})
+        )
+
+        assert health.resolve_public("edgekit.blockey.ir") == (
+            ["188.114.96.3", "188.114.97.3"], ""
+        )
+        assert route.calls[0].request.url.params["name"] == "edgekit.blockey.ir"
+
+    @respx.mock
+    def test_a_name_public_dns_does_not_know_is_reported_as_such(self):
+        respx.get(DOH_CLOUDFLARE).mock(return_value=httpx.Response(200, json={"Status": 3}))
+
+        assert health.resolve_public("gone.blockey.ir") == ([], "does not exist in public DNS")
+
+    @respx.mock
+    def test_a_blocked_resolver_falls_through_to_the_next(self):
+        respx.get(DOH_CLOUDFLARE).mock(side_effect=httpx.ConnectError("blocked"))
+        respx.get(DOH_GOOGLE).mock(
+            return_value=httpx.Response(200, json={"Status": 0, "Answer": [
+                {"type": 1, "data": "195.177.255.61"},
+            ]})
+        )
+
+        assert health.resolve_public("yekja.blockey.ir") == (["195.177.255.61"], "")
+
+    @respx.mock
+    def test_no_reachable_public_resolver_leaves_it_to_the_server(self):
+        respx.get(DOH_CLOUDFLARE).mock(side_effect=httpx.ConnectError("blocked"))
+        respx.get(DOH_GOOGLE).mock(side_effect=httpx.ConnectError("blocked"))
+
+        assert health.resolve_public("edgekit.blockey.ir") == (None, "")
+
+    def test_the_servers_resolver_is_not_asked_when_public_dns_answered(self, monkeypatch):
+        def must_not_run(domain, port):
+            raise AssertionError("the local resolver's cached answer must not decide this")
+
+        monkeypatch.setattr(health, "_resolve_locally", must_not_run)
+
+        probe = health.probe_public_https(
+            "gone.example.com", resolve=lambda domain: ([], "does not exist in public DNS")
+        )
+
+        assert probe.addresses == []
+        assert probe.error == "does not exist in public DNS"
+
+
 class TestLocalTlsProbe:
     async def test_a_handshake_without_a_response_is_an_upstream_warning(self, monkeypatch):
         """An offline peer made doctor report TLS failures that were nothing of the sort."""
@@ -338,7 +400,9 @@ def tls_server(tmp_path):
 def test_an_origin_certificate_is_recognised_on_the_wire(tls_server):
     port = tls_server("CloudFlare Origin SSL Certificate Authority")
 
-    probe = health.probe_public_https("localhost", port=port, timeout=3)
+    probe = health.probe_public_https(
+        "localhost", port=port, timeout=3, resolve=lambda domain: (["127.0.0.1"], "")
+    )
 
     assert probe.trusted is False
     assert probe.origin_certificate

@@ -8,6 +8,12 @@ The single source of truth for the number itself is `src/edgekit/__init__.py`
 
 ## [Unreleased]
 
+- The HTTPS check resolves hostnames through public DNS (DNS-over-HTTPS to Cloudflare, then
+  Google) and connects to that address, instead of asking the server's own resolver. That
+  resolver caches "no such name" for the zone's SOA minimum — 30 minutes on Cloudflare — so a
+  record created seconds earlier failed setup with "Name or service not known" while the rest
+  of the internet already resolved it. The server's resolver is used only when no public one
+  can be reached. Each wait now says what it is still seeing and when it gives up.
 - `edgekit update`, `edgekit provision` and `edgekit ssl mode` ask for the Cloudflare API token
   (and the SSL mode) when an existing install has none, instead of failing the run and
   leaving the operator to find the command. Without a terminal — the panel's update job — the

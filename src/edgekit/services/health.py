@@ -12,6 +12,7 @@ import logging
 import re
 import socket
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from types import SimpleNamespace
@@ -685,13 +686,13 @@ def _peer_issuer(tls: ssl.SSLSocket) -> str:
         return ""
 
 
-def _served_issuer(domain: str, port: int, timeout: float) -> str:
-    """The issuer of whatever certificate ``domain`` presents, trusted or not."""
+def _served_issuer(address: str, domain: str, port: int, timeout: float) -> str:
+    """The issuer of whatever certificate ``address`` presents for ``domain``, trusted or not."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     try:
-        with socket.create_connection((domain, port), timeout=timeout) as sock:
+        with socket.create_connection((address, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=domain) as tls:
                 return _peer_issuer(tls)
     except OSError:
@@ -706,21 +707,76 @@ def _issuer_name(issuer: str) -> str:
     return issuer or "an unknown issuer"
 
 
-def probe_public_https(
-    domain: str, port: int = 443, timeout: float = PUBLIC_TIMEOUT
-) -> PublicProbe:
-    """Connect the way a browser does: public DNS, and a certificate that must verify."""
-    probe = PublicProbe(domain)
+#: Asked before this server's own resolver. A resolver caches "no such name" for the zone's
+#: SOA minimum — 30 minutes on Cloudflare — so a record created a moment ago can stay invisible
+#: to this server long after the rest of the internet sees it. What browsers get is the point.
+PUBLIC_RESOLVERS = (
+    ("https://cloudflare-dns.com/dns-query", {"accept": "application/dns-json"}),
+    ("https://dns.google/resolve", {}),
+)
+_DNS_NOERROR = 0
+_DNS_NXDOMAIN = 3
+_DNS_TYPE_A = 1
+
+
+def resolve_public(domain: str, timeout: float = PROBE_TIMEOUT) -> tuple[list[str] | None, str]:
+    """``domain``'s A records as public DNS answers them, over DNS-over-HTTPS.
+
+    Returns ``(addresses, error)``. ``addresses`` is None when no public resolver could be
+    reached — the caller then falls back to this server's resolver — and an empty list when
+    public DNS has no address for the name.
+    """
+    for url, headers in PUBLIC_RESOLVERS:
+        try:
+            response = httpx.get(
+                url, params={"name": domain, "type": "A"}, headers=headers, timeout=timeout
+            )
+            answer = response.json()
+        except (httpx.HTTPError, ValueError):
+            continue
+        if answer.get("Status") == _DNS_NXDOMAIN:
+            return [], "does not exist in public DNS"
+        if answer.get("Status") != _DNS_NOERROR:
+            continue
+        addresses = sorted(
+            {r["data"] for r in answer.get("Answer") or [] if r.get("type") == _DNS_TYPE_A}
+        )
+        return addresses, "" if addresses else "has no A record in public DNS"
+    return None, ""
+
+
+def _resolve_locally(domain: str, port: int) -> tuple[list[str], str]:
     try:
         infos = socket.getaddrinfo(domain, port, socket.AF_INET, socket.SOCK_STREAM)
     except OSError as exc:
-        probe.error = f"does not resolve: {exc}"
+        return [], f"does not resolve on this server: {exc}"
+    return sorted({info[4][0] for info in infos}), ""
+
+
+def probe_public_https(
+    domain: str,
+    port: int = 443,
+    timeout: float = PUBLIC_TIMEOUT,
+    resolve: Callable[[str], tuple[list[str] | None, str]] = resolve_public,
+) -> PublicProbe:
+    """Connect the way a browser does: public DNS, and a certificate that must verify.
+
+    The connection goes to the address public DNS returned, with ``domain`` as SNI, so nothing
+    after resolution depends on this server's resolver either.
+    """
+    probe = PublicProbe(domain)
+    addresses, error = resolve(domain)
+    if addresses is None:
+        addresses, error = _resolve_locally(domain, port)
+    probe.addresses = addresses
+    if not addresses:
+        probe.error = error
         return probe
-    probe.addresses = sorted({info[4][0] for info in infos})
+    address = addresses[0]
 
     ctx = ssl.create_default_context(cafile=certifi.where())
     try:
-        with socket.create_connection((domain, port), timeout=timeout) as sock:
+        with socket.create_connection((address, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=domain) as tls:
                 probe.trusted = True
                 probe.issuer = _peer_issuer(tls)
@@ -728,7 +784,7 @@ def probe_public_https(
     except ssl.SSLCertVerificationError as exc:
         probe.trusted = False
         probe.error = exc.verify_message or str(exc)
-        probe.issuer = _served_issuer(domain, port, timeout)
+        probe.issuer = _served_issuer(address, domain, port, timeout)
     except OSError as exc:
         probe.error = str(exc)[:200]
     return probe
