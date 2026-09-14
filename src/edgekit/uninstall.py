@@ -108,7 +108,9 @@ class Uninstaller:
         except SkipStep as skip:
             result = StepResult(key, title, StepStatus.SKIPPED, str(skip))
         except Exception as exc:  # noqa: BLE001 - reported, and the next step still runs
-            log.exception("uninstall step %s failed", key)
+            log.error(
+                "uninstall step %s failed: %s", key, exc, exc_info=True, extra={"console": False}
+            )
             result = StepResult(key, title, StepStatus.FAILED, str(exc))
         else:
             result = StepResult(key, title, StepStatus.DONE, str(outcome or ""))

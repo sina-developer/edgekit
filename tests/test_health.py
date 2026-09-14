@@ -154,6 +154,23 @@ class TestPublicAssessment:
         assert "edgekit ssl mode direct" in check.remedy
         assert retry, "a proxy toggle applied moments ago explains this, so it is worth waiting"
 
+    def test_without_a_token_the_advice_does_not_promise_edgekit_can_fix_dns(self, config):
+        config.cloudflare.api_token = ""
+        config.cloudflare.enabled = False
+        probe = self._probe(addresses=["203.0.113.10"], trusted=False, issuer=ORIGIN_ISSUER)
+
+        check, _ = health.assess_public(probe, config)
+
+        assert "edgekit cloudflare token --zone example.com" in check.remedy
+        assert "stored token" not in check.remedy
+
+    def test_with_a_token_the_advice_is_to_provision(self, config):
+        probe = self._probe(addresses=["203.0.113.10"], trusted=False, issuer=ORIGIN_ISSUER)
+
+        check, _ = health.assess_public(probe, config)
+
+        assert "stored token" in check.remedy
+
     def test_the_origin_certificate_in_direct_mode_is_not_a_dns_wait(self, config):
         config.tls.mode = "direct"
         probe = self._probe(addresses=["203.0.113.10"], trusted=False, issuer=ORIGIN_ISSUER)

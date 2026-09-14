@@ -479,6 +479,15 @@ def _ensure_acme_email(config: Config, *, non_interactive: bool, fresh: bool) ->
     )
 
 
+def configure_cloudflare(config: Config, *, ask_mode: bool = True) -> None:
+    """Add the token, and choose a mode, on an install that predates both being required."""
+    _collect_cloudflare_token(config, non_interactive=False)
+    if ask_mode:
+        _choose_ssl_mode(config, non_interactive=False)
+    if not config.dns_proxied:
+        _ensure_acme_email(config, non_interactive=False, fresh=False)
+
+
 def _read_pem(path_text: str) -> str:
     path = Path(path_text).expanduser()
     if not path.exists():

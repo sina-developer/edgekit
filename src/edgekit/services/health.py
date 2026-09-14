@@ -749,6 +749,16 @@ def assess_public(probe: PublicProbe, config: Config) -> tuple[Check, bool]:
         "If Cloudflare cannot complete TLS with this server, switch modes instead: "
         "`edgekit ssl mode direct` serves a Let's Encrypt certificate that works with DNS only."
     )
+    cf = config.cloudflare
+    wanted = "Proxied (orange cloud)" if proxied else "DNS only (grey cloud)"
+    if cf.enabled and cf.api_token:
+        fix_dns = f"`edgekit provision` sets the record to {wanted} with the stored token."
+    else:
+        fix_dns = (
+            "No Cloudflare API token is stored, so edgekit cannot change the record. Store "
+            f"one with `edgekit cloudflare token --zone {cf.zone_name or '<zone>'}` and run "
+            f"`edgekit provision`, or set it to {wanted} in the Cloudflare dashboard."
+        )
 
     def check(level: Level, detail: str, remedy: str = "") -> Check:
         return Check(key, title, level, detail, remedy)
@@ -774,8 +784,7 @@ def assess_public(probe: PublicProbe, config: Config) -> tuple[Check, bool]:
                 Level.FAIL,
                 "DNS only: browsers reach this server directly and are shown the Cloudflare "
                 "Origin certificate, which only Cloudflare's proxy trusts",
-                "Set the record to Proxied (orange cloud) — `edgekit provision` does it with "
-                f"the stored Cloudflare token. {to_direct}",
+                f"{fix_dns} {to_direct}",
             ), points_here
         if probe.origin_certificate:
             return check(
@@ -797,15 +806,13 @@ def assess_public(probe: PublicProbe, config: Config) -> tuple[Check, bool]:
             Level.WARN,
             f"certificate from {issuer} is trusted, but DNS points straight at this server "
             "instead of through Cloudflare",
-            "Proxied mode expects the record Proxied: `edgekit provision` sets it. Resolvers "
-            "can keep the old answer for five minutes.",
+            f"{fix_dns} Resolvers can keep the old answer for five minutes.",
         ), True
     if not proxied and public_ip and not points_here:
         return check(
             Level.WARN,
             f"still answered through Cloudflare ({', '.join(probe.addresses)})",
-            "Direct mode expects DNS only: `edgekit provision` sets it. Resolvers can keep "
-            "the old answer for five minutes.",
+            f"{fix_dns} Resolvers can keep the old answer for five minutes.",
         ), True
     if probe.status == 525:
         return check(

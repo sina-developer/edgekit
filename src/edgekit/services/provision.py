@@ -27,10 +27,11 @@ from ..paths import NPM_DIR, ensure_dirs
 from ..rendering import render
 from ..system import dockerx, firewall, packages, sysctl
 from ..system import wireguard as wg
-from ..system.shell import is_root
+from ..system.shell import CommandError, is_root
 from . import certificates, health
-from .hosts import HostService
-from .npm import NPMClient
+from .cloudflare import CloudflareError
+from .hosts import HostError, HostService
+from .npm import NPMClient, NPMError
 from .peers import PeerService
 
 log = logging.getLogger("edgekit.provision")
@@ -76,6 +77,18 @@ class SkipStep(Exception):
     """Raised inside a step to record it as skipped rather than failed."""
 
 
+#: Failures whose message already tells the operator what is wrong and what to do. Their
+#: tracebacks belong in the log file, not on screen under a step line that says it all.
+_EXPECTED_FAILURES = (
+    ProvisionError,
+    certificates.CertificateError,
+    CloudflareError,
+    CommandError,
+    HostError,
+    NPMError,
+)
+
+
 #: Steps whose failure makes everything after them meaningless.
 _FATAL_STEPS = {"preflight", "wireguard_keys", "wireguard_up"}
 
@@ -110,6 +123,9 @@ class Provisioner:
         self.skip_cloudflare = skip_cloudflare
         self.on_event = on_event
         self.report = ProvisionReport()
+        #: Whether this run pushed DNS to Cloudflare. Only then can waiting for resolvers
+        #: change what the HTTPS check sees; otherwise its first answer is the answer.
+        self.dns_applied = False
 
     # ---------------------------------------------------------------- runner
 
@@ -130,6 +146,9 @@ class Provisioner:
                 outcome = await outcome
         except SkipStep as skip:
             result = StepResult(key, title, StepStatus.SKIPPED, str(skip))
+        except _EXPECTED_FAILURES as exc:
+            log.error("step %s failed: %s", key, exc, exc_info=True, extra={"console": False})
+            result = StepResult(key, title, StepStatus.FAILED, str(exc))
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator verbatim
             log.exception("step %s failed", key)
             result = StepResult(key, title, StepStatus.FAILED, str(exc))
@@ -401,6 +420,7 @@ class Provisioner:
         detail = f"{', '.join(names)} -> {ip} ({label})"
         if changed:
             detail += f"; switched to {label}: {', '.join(changed)}"
+        self.dns_applied = True
         return detail
 
     async def step_cloudflare_ssl(self) -> str:
@@ -571,7 +591,7 @@ class Provisioner:
             for probe in probes:
                 check, worth_retrying = health.assess_public(probe, self.config)
                 results[probe.domain] = check
-                if worth_retrying and check.level is not health.Level.OK:
+                if worth_retrying and self.dns_applied and check.level is not health.Level.OK:
                     retry.append(probe.domain)
             if not retry or loop.time() + self.VERIFY_INTERVAL > deadline:
                 break
@@ -581,9 +601,16 @@ class Provisioner:
 
         failures = [c for c in results.values() if c.level is health.Level.FAIL]
         if failures:
-            raise ProvisionError(
-                "\n".join(f"{c.title}: {c.detail}\n  {c.remedy}" for c in failures)
-            )
+            # Hosts failing the same way share one remedy; repeating it per host buries the
+            # hosts themselves.
+            by_remedy: dict[str, list[health.Check]] = {}
+            for check in failures:
+                by_remedy.setdefault(check.remedy, []).append(check)
+            lines: list[str] = []
+            for remedy, checks in by_remedy.items():
+                lines += [f"{c.title.removeprefix('Public ')}: {c.detail}" for c in checks]
+                lines.append(f"  -> {remedy}")
+            raise ProvisionError("\n".join(lines))
         trusted = [d for d, c in results.items() if c.level is health.Level.OK]
         detail = f"trusted on {', '.join(trusted)}" if trusted else "no host answered cleanly"
         warnings = [c for c in results.values() if c.level is health.Level.WARN]

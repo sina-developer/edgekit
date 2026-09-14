@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
+import logging
+
 import pytest
 
 from edgekit.services import health
@@ -54,6 +57,27 @@ class TestStepRunner:
 
         result = await Provisioner(config, on_event=listener)._step("k", "T", lambda: "ok")
         assert result.status is StepStatus.DONE
+
+    async def test_an_expected_failure_keeps_its_traceback_off_the_console(self, config, caplog):
+        """A missing token is a message, not a crash — the step line already says it."""
+        def missing_token():
+            raise ProvisionError("no API token is stored")
+
+        with caplog.at_level(logging.ERROR, logger="edgekit.provision"):
+            await Provisioner(config)._step("k", "T", missing_token)
+
+        record = caplog.records[-1]
+        assert record.console is False
+        assert record.exc_info, "the traceback still goes to the log file"
+
+    async def test_a_bug_still_shows_its_traceback(self, config, caplog):
+        def bug():
+            raise KeyError("npm_host_id")
+
+        with caplog.at_level(logging.ERROR, logger="edgekit.provision"):
+            await Provisioner(config)._step("k", "T", bug)
+
+        assert getattr(caplog.records[-1], "console", True) is True
 
     async def test_events_are_emitted_for_running_then_terminal(self, config):
         seen = []
@@ -154,11 +178,13 @@ def cloudflare(monkeypatch):
 
 class TestSslModeSteps:
     async def test_proxied_mode_proxies_every_record_pointing_here(self, config, cloudflare):
-        detail = await Provisioner(config).step_cloudflare_dns()
+        provisioner = Provisioner(config)
+        detail = await provisioner.step_cloudflare_dns()
 
         assert cloudflare.upserts == [("example.com", True), ("*.example.com", True)]
         assert cloudflare.reconciled == [True]
         assert "files.example.com" in detail
+        assert provisioner.dns_applied, "the HTTPS check may wait for this change to propagate"
 
     async def test_direct_mode_takes_records_out_of_the_proxy(self, config, cloudflare):
         config.tls.mode = "direct"
@@ -261,10 +287,44 @@ class TestVerifyHttps:
         monkeypatch.setattr(
             health, "probe_public_https", lambda domain: answers.pop(0) if answers else None
         )
+        provisioner = Provisioner(config)
+        provisioner.dns_applied = True
 
-        detail = await Provisioner(config).step_verify_https()
+        detail = await provisioner.step_verify_https()
 
         assert "trusted on edgekit.example.com" in detail
+
+    async def test_without_a_dns_change_this_run_it_does_not_wait(self, config, monkeypatch):
+        """Nothing touched DNS, so asking again cannot change the answer — fail at once."""
+        monkeypatch.setattr(Provisioner, "VERIFY_WINDOW", 60.0)
+        probed: list[str] = []
+        monkeypatch.setattr(
+            health, "probe_public_https", lambda domain: probed.append(domain) or ORIGIN_SHOWN
+        )
+
+        with pytest.raises(ProvisionError):
+            await Provisioner(config).step_verify_https()
+
+        assert probed == ["edgekit.example.com"]
+
+    async def test_hosts_failing_the_same_way_share_one_remedy(self, config, monkeypatch):
+        from edgekit.db import session_scope
+        from edgekit.models import ProxyHost
+
+        with session_scope() as session:
+            session.add(ProxyHost(domain="yekja.example.com", forward_host="10.50.0.2",
+                                  forward_port=80, scheme="http"))
+        monkeypatch.setattr(
+            health, "probe_public_https",
+            lambda domain: dataclasses.replace(ORIGIN_SHOWN, domain=domain),
+        )
+
+        with pytest.raises(ProvisionError) as caught:
+            await Provisioner(config).step_verify_https()
+
+        message = str(caught.value)
+        assert "edgekit.example.com" in message and "yekja.example.com" in message
+        assert message.count("edgekit ssl mode direct") == 1
 
     async def test_a_slow_service_does_not_fail_setup(self, config, monkeypatch):
         slow = _probe(addresses=["104.21.8.1"], trusted=True, status=None)

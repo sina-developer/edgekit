@@ -64,11 +64,22 @@ fw_app = typer.Typer(
 app.add_typer(fw_app, name="firewall")
 
 
+def _for_console(record: logging.LogRecord) -> bool:
+    """Records logged with ``extra={"console": False}`` go to the log file only.
+
+    Used for failures a step line has already reported in full: a traceback under it adds
+    nothing but a wall of text between the operator and the fix.
+    """
+    return getattr(record, "console", True)
+
+
 def setup_logging(verbose: bool = False) -> None:
     ensure_dirs()
-    handlers: list[logging.Handler] = [
-        RichHandler(console=console, show_path=False, rich_tracebacks=True, show_time=False)
-    ]
+    console_handler = RichHandler(
+        console=console, show_path=False, rich_tracebacks=True, show_time=False
+    )
+    console_handler.addFilter(_for_console)
+    handlers: list[logging.Handler] = [console_handler]
     try:
         file_handler = logging.FileHandler(LOG_FILE)
         file_handler.setFormatter(
@@ -214,6 +225,30 @@ def _print_step(step) -> None:
         console.print(f"  [red]✗[/red] {step.title}\n    [red]{step.detail}[/red]")
 
 
+def _offer_cloudflare_token(config: Config, *, ask_mode: bool = True) -> None:
+    """Installs from before the token was required have none: ask, rather than fail the run.
+
+    Only at a terminal. The panel's update job has nobody to answer, and provisioning then
+    names the command to run instead.
+    """
+    cf = config.cloudflare
+    if not cf.zone_name or (cf.enabled and cf.api_token) or not sys.stdin.isatty():
+        return
+    console.print(
+        f"\n[bold]edgekit now manages Cloudflare DNS and the SSL mode for {cf.zone_name}.[/bold]\n"
+        "  Keeping them in step with the certificate is what stops browsers being shown one\n"
+        "  they reject, and it needs a Cloudflare API token."
+    )
+    if not typer.confirm("Add the token now?", default=True):
+        return
+
+    from .wizard import configure_cloudflare
+
+    configure_cloudflare(config, ask_mode=ask_mode)
+    config.save()
+    console.print()
+
+
 def _run_provisioner(config: Config, only: tuple[str, ...] | None = None, **flags) -> object:
     console.print("[bold]Provisioning[/bold]")
     provisioner = Provisioner(config, on_event=_print_step, **flags)
@@ -338,6 +373,8 @@ def provision(
     """Re-run provisioning. Safe at any time — every step checks before acting."""
     require_root()
     config = require_configured()
+    if not skip_cloudflare:
+        _offer_cloudflare_token(config)
     report = _run_provisioner(
         config,
         skip_packages=skip_packages,
@@ -399,6 +436,7 @@ def update(
     if skip_provision:
         raise typer.Exit(0)
 
+    _offer_cloudflare_token(config)
     report = _run_provisioner(config)
     raise typer.Exit(0 if report.ok else 2)
 
@@ -1014,6 +1052,7 @@ def ssl_mode(
         raise typer.Exit(1)
     config.tls.mode = mode
     config.save()
+    _offer_cloudflare_token(config, ask_mode=False)
     report = _run_provisioner(config, only=TLS_STEPS)
     raise typer.Exit(0 if report.ok else 2)
 

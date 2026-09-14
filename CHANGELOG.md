@@ -8,6 +8,16 @@ The single source of truth for the number itself is `src/edgekit/__init__.py`
 
 ## [Unreleased]
 
+- `edgekit update`, `edgekit provision` and `edgekit ssl mode` ask for the Cloudflare API token
+  (and the SSL mode) when an existing install has none, instead of failing the run and
+  leaving the operator to find the command. Without a terminal — the panel's update job — the
+  failure names the command.
+- Failures with a message of their own (no token, a certificate NPM refused, a Cloudflare
+  error) print as the step line only; their tracebacks go to the log file.
+- The HTTPS check waits for DNS only when that run changed DNS. With nothing to wait for, it
+  used to spend two minutes printing "waiting for DNS to settle" before failing anyway.
+- Its advice no longer promises a fix with "the stored token" when no token is stored, and
+  hosts failing the same way share one line of advice instead of repeating it.
 - Setup no longer finishes on a certificate browsers reject. The Cloudflare Origin certificate
   is trusted only by Cloudflare's proxy, and nothing checked that visitors actually went
   through it: with the DNS records left DNS only, browsers were handed that certificate and a
