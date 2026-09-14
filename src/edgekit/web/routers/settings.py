@@ -6,11 +6,12 @@ import logging
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ...config import Config
+from ... import __version__, jobs
+from ...config import TLS_MODES, Config
 from ...models import AuditLog, ProxyHost, User
 from ...services import certificates
 from ...services.cloudflare import CloudflareClient, CloudflareError
@@ -104,8 +105,7 @@ async def update_cloudflare(
     zone_name: str = Form(""),
     api_token: str = Form(""),
     origin_ca_key: str = Form(""),
-    proxied: bool = Form(False),
-    ssl_mode: str = Form("strict"),
+    tls_mode: str = Form(""),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
     config: Config = Depends(get_config),
@@ -113,8 +113,10 @@ async def update_cloudflare(
     cf = config.cloudflare
     cf.enabled = enabled
     cf.zone_name = zone_name.strip()
-    cf.proxied = proxied
-    cf.ssl_mode = ssl_mode
+    # Proxy status and the zone's SSL mode are not settings of their own any more: both follow
+    # from the mode, because any other combination serves a certificate someone rejects.
+    if tls_mode in TLS_MODES:
+        config.tls.mode = tls_mode
     # Blank means "leave the stored secret alone" — the form never echoes secrets back.
     if api_token.strip():
         cf.api_token = api_token.strip()
@@ -126,13 +128,16 @@ async def update_cloudflare(
             async with CloudflareClient(cf.api_token, origin_ca_key=cf.origin_ca_key) as client:
                 await client.verify_token()
                 cf.zone_id = await client.get_zone_id(cf.zone_name)
+                await client.require_zone_permissions(cf.zone_id)
         except CloudflareError as exc:
-            return _redirect(error=str(exc)[:300])
+            return _redirect(error=_as_query(exc))
 
     config.save()
     db.add(AuditLog(actor=user.username, action="settings.cloudflare", target=cf.zone_name))
     reload_config()
-    return _redirect(message="Cloudflare+settings+saved")
+    return _redirect(
+        message="Cloudflare+settings+saved.+Re-provision+to+apply+the+SSL+mode+to+DNS+and+NPM."
+    )
 
 
 @router.post("/npm", dependencies=[Depends(verify_csrf)])
@@ -253,3 +258,66 @@ async def reprovision(
         names = ", ".join(f.title for f in report.failures)
         return _redirect(error=f"Provision+finished+with+failures:+{names}")
     return _redirect(message="Provision+completed+successfully")
+
+
+@router.get("/update")
+async def update_page(
+    request: Request,
+    error: str | None = None,
+    user: User = Depends(current_user),
+    config: Config = Depends(get_config),
+):
+    return templates.TemplateResponse(
+        request,
+        "update.html",
+        {
+            "user": user,
+            "config": config,
+            "error": error,
+            "job": jobs.state(jobs.UPDATE),
+            "version": __version__,
+        },
+    )
+
+
+@router.post("/update", dependencies=[Depends(verify_csrf)])
+async def start_update(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Start `edgekit update` in its own unit: it restarts the panel that is serving this."""
+    try:
+        jobs.launch(jobs.UPDATE, ["update"])
+    except jobs.JobError as exc:
+        return RedirectResponse(f"/settings/update?error={_as_query(exc)}", status_code=303)
+    log.info("%s started an update from %s", user.username, __version__)
+    db.add(AuditLog(actor=user.username, action="edgekit.update", target=__version__))
+    return RedirectResponse("/settings/update", status_code=303)
+
+
+REMOVING_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Removing edgekit</title></head>
+<body><main>
+<h1>edgekit is being removed</h1>
+<p>This panel stops in a moment and will not come back. Follow the rest over SSH with
+<code>journalctl -u edgekit-uninstall -f</code>.</p>
+</main></body></html>
+"""
+
+
+@router.post("/uninstall", dependencies=[Depends(verify_csrf)])
+async def start_uninstall(
+    confirm: str = Form(""),
+    keep_dns: bool = Form(False),
+    user: User = Depends(current_user),
+):
+    if confirm.strip().lower() != "remove":
+        return _redirect(error="Type+remove+in+the+box+to+confirm+removing+edgekit")
+    args = ["uninstall", "--yes", *(["--keep-dns"] if keep_dns else [])]
+    try:
+        jobs.launch(jobs.UNINSTALL, args)
+    except jobs.JobError as exc:
+        return _redirect(error=_as_query(exc))
+    # No audit entry: the database it would go into is one of the things being deleted.
+    log.warning("%s started removing edgekit", user.username)
+    return HTMLResponse(REMOVING_PAGE)

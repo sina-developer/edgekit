@@ -8,6 +8,31 @@ The single source of truth for the number itself is `src/edgekit/__init__.py`
 
 ## [Unreleased]
 
+- Setup no longer finishes on a certificate browsers reject. The Cloudflare Origin certificate
+  is trusted only by Cloudflare's proxy, and nothing checked that visitors actually went
+  through it: with the DNS records left DNS only, browsers were handed that certificate and a
+  "Not secure" page while setup reported complete. Setup now requires a Cloudflare API token
+  and makes the records' proxy status, the zone's SSL mode and the certificate agree, instead
+  of printing a checklist to do by hand.
+- Two SSL modes. `proxied`: Cloudflare proxy, Origin certificate, Full (strict). `direct`: DNS
+  only, with a Let's Encrypt wildcard that Nginx Proxy Manager issues through a Cloudflare DNS
+  challenge and renews itself — the way out when Cloudflare cannot complete TLS with the
+  server (525). `edgekit ssl mode <mode>` switches and re-applies. `cloudflare.proxied` and
+  `cloudflare.ssl_mode` are gone: every other combination serves a certificate someone rejects.
+- Provisioning sets every A record pointing at the server, hand-made ones included, to the
+  mode's proxy status, and ends by connecting to each hostname as a browser would — failing if
+  the certificate would be rejected, after waiting out a DNS change it just made.
+  `edgekit ssl verify` runs that check on its own.
+- `edgekit doctor` reads DNS proxy status and the SSL mode from Cloudflare, recognises the
+  Origin certificate being shown to browsers, and no longer reports an unresponsive upstream —
+  an offline peer — as a TLS failure that "produces a Cloudflare 525".
+- `edgekit uninstall` (and **Remove edgekit** in the panel) removes everything edgekit created:
+  the panel, Nginx Proxy Manager with every host, certificate and login, the WireGuard
+  interface and keys, firewall rules and units, settings, credentials, the DNS records it
+  created (`--keep-dns` to leave them), and edgekit itself. Docker, WireGuard packages and
+  ufw's SSH rule stay. Every step runs even if one before it fails.
+- **Update edgekit** in the panel runs `edgekit update` as its own systemd unit, so the panel
+  restart it performs cannot cut it short, and shows its log live.
 - A missing wheel no longer reads as a network failure. `ResolutionImpossible` and "no
   matching distributions available for your environment" are deterministic — the index has
   no build of that package for this interpreter — so the installer stops retrying them

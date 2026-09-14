@@ -23,7 +23,7 @@ from rich.table import Table
 from sqlalchemy import select
 
 from . import __version__, service_unit
-from .config import Config, load_config
+from .config import TLS_MODES, Config, load_config
 from .db import init_db, session_scope
 from .models import ProxyHost, User
 from .paths import CONFIG_FILE, LOG_FILE, ensure_dirs
@@ -31,7 +31,7 @@ from .security import check_password_strength, generate_password, hash_password
 from .services import certificates, health
 from .services.hosts import SETTING_CERT_EXPIRY, SETTING_CERT_ID, HostService, get_setting
 from .services.peers import PeerError, PeerService
-from .services.provision import Provisioner, StepStatus
+from .services.provision import TLS_STEPS, Provisioner, StepStatus
 from .system import firewall
 from .system import wireguard as wg
 from .system.shell import CommandError, is_root
@@ -49,6 +49,8 @@ cert_app = typer.Typer(help="Manage the origin certificate.", no_args_is_help=Tr
 user_app = typer.Typer(help="Manage panel accounts.", no_args_is_help=True)
 cf_app = typer.Typer(help="Manage the Cloudflare integration.", no_args_is_help=True)
 npm_app = typer.Typer(help="Manage Nginx Proxy Manager credentials.", no_args_is_help=True)
+ssl_app = typer.Typer(help="Choose and verify how visitors reach this edge.", no_args_is_help=True)
+app.add_typer(ssl_app, name="ssl")
 app.add_typer(peer_app, name="peer")
 app.add_typer(host_app, name="host")
 app.add_typer(cert_app, name="cert")
@@ -160,7 +162,8 @@ def setup(
 
     existing = load_config()
     result = run_wizard(existing if existing.configured else None,
-                        non_interactive=non_interactive)
+                        non_interactive=non_interactive,
+                        require_cloudflare=not skip_cloudflare)
     config = result.config
     config.save()
 
@@ -197,23 +200,24 @@ def setup(
     raise typer.Exit(0 if report.ok else 2)
 
 
-def _run_provisioner(config: Config, **flags) -> object:
-    def on_event(step) -> None:
-        # Newline (not \r) so package/apt sub-logs under a long step stay readable.
-        if step.status is StepStatus.RUNNING:
-            console.print(f"  [dim]…[/dim] {step.title}")
-        elif step.status is StepStatus.DONE:
-            console.print(f"  [green]✓[/green] {step.title}"
-                          + (f" [dim]— {step.detail}[/dim]" if step.detail else ""))
-        elif step.status is StepStatus.SKIPPED:
-            console.print(f"  [dim]•[/dim] [dim]{step.title} — skipped "
-                          f"({step.detail})[/dim]")
-        else:
-            console.print(f"  [red]✗[/red] {step.title}\n    [red]{step.detail}[/red]")
+def _print_step(step) -> None:
+    # Newline (not \r) so package/apt sub-logs under a long step stay readable.
+    if step.status is StepStatus.RUNNING:
+        console.print(f"  [dim]…[/dim] {step.title}")
+    elif step.status is StepStatus.DONE:
+        console.print(f"  [green]✓[/green] {step.title}"
+                      + (f" [dim]— {step.detail}[/dim]" if step.detail else ""))
+    elif step.status is StepStatus.SKIPPED:
+        console.print(f"  [dim]•[/dim] [dim]{step.title} — skipped "
+                      f"({step.detail})[/dim]")
+    else:
+        console.print(f"  [red]✗[/red] {step.title}\n    [red]{step.detail}[/red]")
 
+
+def _run_provisioner(config: Config, only: tuple[str, ...] | None = None, **flags) -> object:
     console.print("[bold]Provisioning[/bold]")
-    provisioner = Provisioner(config, on_event=on_event, **flags)
-    return asyncio.run(provisioner.run())
+    provisioner = Provisioner(config, on_event=_print_step, **flags)
+    return asyncio.run(provisioner.run(only))
 
 
 def _panel_access_help(config: Config) -> str:
@@ -313,25 +317,13 @@ def _print_setup_summary(config: Config, result, ok: bool) -> None:
     console.print(_panel_access_help(config))
     _print_firewall_ports(config)
 
-    outstanding = []
     zone = config.cloudflare.zone_name
-    # Only list what edgekit did not already do: with the API enabled these steps ran.
-    api_handled_dns = config.cloudflare.enabled and config.cloudflare.zone_id
-    if zone and not api_handled_dns:
-        outstanding.append(
-            f"DNS: A records for [bold]{zone}[/bold] and [bold]*.{zone}[/bold] -> "
-            f"{config.server.public_ip}, proxied"
+    if zone and not config.cloudflare.enabled:
+        console.print(
+            "\n[yellow]No Cloudflare API token is stored, so nothing keeps the DNS records and "
+            "SSL mode matched to the certificate.[/yellow]\n"
+            f"  [bold]sudo edgekit cloudflare token --zone {zone}[/bold]"
         )
-        outstanding.append("SSL/TLS mode set to [bold]Full (strict)[/bold]")
-    if not config.tls.present:
-        outstanding.append(
-            "Origin certificate not installed — "
-            "[bold]edgekit cert install --cert FILE --key FILE[/bold]"
-        )
-    if outstanding:
-        console.print("\n[bold]Still to do in the Cloudflare dashboard:[/bold]")
-        for item in outstanding:
-            console.print(f"  • {item}")
 
     if not ok:
         console.print("\n[yellow]Run `edgekit doctor` to see what still needs attention.[/yellow]")
@@ -409,6 +401,48 @@ def update(
 
     report = _run_provisioner(config)
     raise typer.Exit(0 if report.ok else 2)
+
+
+@app.command()
+def uninstall(
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+    keep_dns: Annotated[
+        bool,
+        typer.Option("--keep-dns", help="Leave the DNS records edgekit created in Cloudflare."),
+    ] = False,
+) -> None:
+    """Remove edgekit completely: panel, NPM with its hosts, WireGuard, rules and settings."""
+    require_root()
+    config = load_config()
+
+    from .uninstall import Uninstaller, describe
+
+    console.print("[bold red]This removes edgekit from this server:[/bold red]")
+    for item in describe(config, keep_dns=keep_dns):
+        console.print(f"  • {item}")
+    console.print(
+        "\n[dim]Kept: the Docker and WireGuard packages, ufw with its SSH rule, and DNS "
+        "records you created yourself. This cannot be undone.[/dim]"
+    )
+    if not yes:
+        answer = typer.prompt("Type 'remove' to confirm", default="", show_default=False)
+        if answer.strip().lower() != "remove":
+            console.print("Cancelled; nothing was changed.")
+            raise typer.Exit(1)
+
+    console.print("\n[bold]Removing edgekit[/bold]")
+    results = asyncio.run(Uninstaller(config, keep_dns=keep_dns, on_event=_print_step).run())
+    failed = [r for r in results if r.status is StepStatus.FAILED]
+    if failed:
+        console.print(
+            f"\n[yellow]Finished, but {len(failed)} step(s) failed — what is listed above "
+            "under them is still on this server.[/yellow]"
+        )
+        raise typer.Exit(2)
+    console.print("\n[green]✓[/green] edgekit has been removed.")
+
+
+app.command("remove", hidden=True, help="Alias for uninstall.")(uninstall)
 
 
 @fw_app.command("setup")
@@ -546,7 +580,13 @@ def status() -> None:
     table.add_row("Proxy hosts", str(len(hosts)))
     table.add_row(
         "Cloudflare",
-        config.cloudflare.zone_name if config.cloudflare.enabled else "disabled",
+        config.cloudflare.zone_name if config.cloudflare.enabled else "no API token",
+    )
+    table.add_row(
+        "SSL mode",
+        "proxied (Cloudflare proxy + Origin certificate)"
+        if config.dns_proxied
+        else "direct (DNS only + Let's Encrypt)",
     )
     table.add_row("Certificate", f"expires {cert_expiry[:10]}" if cert_expiry else "none")
     console.print(Panel(table, title="edgekit", border_style="blue"))
@@ -940,15 +980,51 @@ def cert_install(
 
 @cert_app.command("status")
 def cert_status() -> None:
-    """Show the installed origin certificate."""
-    require_configured()
+    """Show the installed certificate."""
+    config = require_configured()
+    label = "Origin certificate" if config.dns_proxied else "Let's Encrypt certificate"
     with session_scope() as session:
         cert_id = get_setting(session, SETTING_CERT_ID)
         expiry = get_setting(session, SETTING_CERT_EXPIRY)
     if not cert_id:
-        console.print("[yellow]No origin certificate installed.[/yellow]")
+        console.print(f"[yellow]No {label.lower()} installed ({config.tls.mode} mode).[/yellow]")
         raise typer.Exit(1)
-    console.print(f"NPM certificate id {cert_id}, expires {expiry[:10] or 'unknown'}")
+    console.print(
+        f"{label} ({config.tls.mode} mode): NPM id {cert_id}, expires {expiry[:10] or 'unknown'}"
+    )
+
+
+# ---------------------------------------------------------------------- ssl
+
+
+@ssl_app.command("mode")
+def ssl_mode(
+    mode: Annotated[str, typer.Argument(help="proxied or direct")],
+) -> None:
+    """Switch how visitors reach this edge, then apply and verify it.
+
+    proxied: Cloudflare proxy in front, Cloudflare Origin certificate, SSL mode Full (strict).
+    direct:  DNS only, Let's Encrypt wildcard issued by NPM through a Cloudflare DNS challenge.
+    """
+    require_root()
+    config = require_configured()
+    mode = mode.strip().lower()
+    if mode not in TLS_MODES:
+        console.print(f"[red]Mode must be one of: {', '.join(TLS_MODES)}[/red]")
+        raise typer.Exit(1)
+    config.tls.mode = mode
+    config.save()
+    report = _run_provisioner(config, only=TLS_STEPS)
+    raise typer.Exit(0 if report.ok else 2)
+
+
+@ssl_app.command("verify")
+def ssl_verify() -> None:
+    """Connect to every hostname the way a browser does and report what it is shown."""
+    require_root()
+    config = require_configured()
+    report = _run_provisioner(config, only=("verify_https",))
+    raise typer.Exit(0 if report.ok else 2)
 
 
 # ---------------------------------------------------------------------- cloudflare

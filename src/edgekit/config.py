@@ -98,33 +98,41 @@ class CloudflareConfig(_Section):
     origin_ca_key: str = ""
     zone_name: str = ""
     zone_id: str = ""
-    #: Whether A records are created behind Cloudflare's proxy (orange cloud).
-    proxied: bool = True
-    manage_ssl_mode: bool = True
-    ssl_mode: str = "strict"
     origin_cert_validity_days: int = 5475  # 15 years, Cloudflare's maximum
 
-    @field_validator("ssl_mode")
-    @classmethod
-    def _valid_mode(cls, value: str) -> str:
-        allowed = {"off", "flexible", "full", "strict"}
-        if value not in allowed:
-            raise ValueError(f"ssl_mode must be one of {sorted(allowed)}")
-        return value
+
+#: How visitors reach this edge. The certificate NPM serves is only trusted in one of them:
+#:   proxied — DNS proxied (orange cloud), Cloudflare Origin certificate, SSL mode Full (strict).
+#:             Browsers see Cloudflare's certificate; only Cloudflare ever sees the origin's.
+#:   direct  — DNS only (grey cloud), Let's Encrypt wildcard issued by NPM over a Cloudflare
+#:             DNS challenge. Browsers see the origin's certificate, so it must be public.
+#: Mixing them — DNS only in front of an Origin certificate — serves browsers a certificate
+#: only Cloudflare trusts, which is why the proxy status and SSL mode are no longer separate
+#: settings: both follow from the mode.
+TLS_MODES = ("proxied", "direct")
 
 
 class TLSConfig(_Section):
-    """An operator-supplied origin certificate.
+    """The TLS mode, plus an operator-supplied origin certificate for proxied mode.
 
-    Held here so that `edgekit provision` can reinstall it into a rebuilt Nginx Proxy
-    Manager without asking again. The certificate is public; only the key is a secret.
+    The certificate is held here so that `edgekit provision` can reinstall it into a rebuilt
+    Nginx Proxy Manager without asking again. The certificate is public; only the key is a
+    secret.
     """
 
     SECRET_FIELDS: ClassVar[tuple[str, ...]] = ("certificate_key",)
 
+    mode: str = "proxied"
     certificate: str = ""
     certificate_key: str = ""
     name: str = ""
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, value: str) -> str:
+        if value not in TLS_MODES:
+            raise ValueError(f"tls.mode must be one of {', '.join(TLS_MODES)}")
+        return value
 
     @property
     def present(self) -> bool:
@@ -174,6 +182,11 @@ class Config(BaseModel):
         if not zone or not label:
             return None
         return f"{label}.{zone}"
+
+    @property
+    def dns_proxied(self) -> bool:
+        """Whether this edge's DNS records belong behind Cloudflare's proxy."""
+        return self.tls.mode == "proxied"
 
     # ---------------------------------------------------------------- persistence
 

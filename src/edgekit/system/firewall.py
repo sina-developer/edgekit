@@ -245,19 +245,30 @@ def apply_rules() -> None:
     systemctl("enable", "edgekit-firewall.service")
 
 
+def _rules(
+    *, docker_subnet: str, wg_subnet: str, wg_if: str, docker_if: str
+) -> tuple[tuple[str, str, list[str]], ...]:
+    """The script's three rules as ``(table, chain, match)`` — kept in step with SCRIPT_TEMPLATE."""
+    return (
+        ("filter", "FORWARD", ["-i", docker_if, "-o", wg_if, "-d", wg_subnet, "-j", "ACCEPT"]),
+        ("filter", "FORWARD", ["-i", wg_if, "-o", docker_if, "-s", wg_subnet,
+                               "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED",
+                               "-j", "ACCEPT"]),
+        ("nat", "POSTROUTING", ["-s", docker_subnet, "-d", wg_subnet, "-o", wg_if,
+                                "-j", "MASQUERADE"]),
+    )
+
+
 def rules_present(
     *, docker_subnet: str, wg_subnet: str, wg_if: str, docker_if: str = "docker0"
 ) -> bool:
     """Check the three rules the tunnel depends on, without modifying anything."""
-    checks = (
-        ["-t", "filter", "-C", "FORWARD", "-i", docker_if, "-o", wg_if, "-d", wg_subnet,
-         "-j", "ACCEPT"],
-        ["-t", "filter", "-C", "FORWARD", "-i", wg_if, "-o", docker_if, "-s", wg_subnet,
-         "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-        ["-t", "nat", "-C", "POSTROUTING", "-s", docker_subnet, "-d", wg_subnet,
-         "-o", wg_if, "-j", "MASQUERADE"],
+    rules = _rules(
+        docker_subnet=docker_subnet, wg_subnet=wg_subnet, wg_if=wg_if, docker_if=docker_if
     )
-    return all(run(["iptables", *check]).ok for check in checks)
+    return all(
+        run(["iptables", "-t", table, "-C", chain, *match]).ok for table, chain, match in rules
+    )
 
 
 def open_host_ports(*, wg_port: int, http_port: int, https_port: int) -> list[str]:
@@ -362,6 +373,62 @@ def _panel_rule_sources(status: str, bind: str, port: int) -> list[str]:
         if "/" in source:
             sources.append(source)
     return sources
+
+
+def remove_edgekit_rules(config: Config) -> list[str]:
+    """Undo write_rules, apply_rules, open_host_ports and allow_docker_to_panel.
+
+    ufw itself, its SSH rule and its forward policy stay: taking those away can lock the
+    operator out of the server they are cleaning up.
+    """
+    removed: list[str] = []
+    wg_if, wg_subnet = config.wireguard.interface, config.wireguard.subnet
+
+    if has("iptables"):
+        bridge = detect_proxy_bridge(config)
+        rules = _rules(
+            docker_subnet=bridge.subnet, wg_subnet=wg_subnet, wg_if=wg_if,
+            docker_if=bridge.interface,
+        )
+        deleted = 0
+        for table, chain, match in rules:
+            # The script appends only when absent, but earlier releases could duplicate.
+            while run(["iptables", "-t", table, "-C", chain, *match]).ok:
+                if not run(["iptables", "-t", table, "-D", chain, *match]).ok:
+                    break
+                deleted += 1
+        if deleted:
+            removed.append(f"{deleted} iptables rule(s)")
+
+    if FIREWALL_UNIT.exists():
+        systemctl("disable", "--now", "edgekit-firewall.service")
+    for path in (FIREWALL_UNIT, FIREWALL_SCRIPT, DOCKER_AFTER_UFW_DROPIN):
+        if path.exists():
+            path.unlink()
+            removed.append(str(path))
+            try:
+                path.parent.rmdir()  # only when nothing else lives there
+            except OSError:
+                pass
+    if removed:
+        systemctl("daemon-reload")
+
+    if has("ufw") and "Status: active" in run(["ufw", "status"]).stdout:
+        bind, port = (config.panel.bind or "").strip(), config.panel.port
+        for subnet in _panel_rule_sources(run(["ufw", "status"]).stdout, bind, port):
+            run(["ufw", "delete", "allow", "from", subnet, "to", bind, "port", str(port),
+                 "proto", "tcp"])
+        for spec in (
+            f"{config.wireguard.listen_port}/udp",
+            f"{config.npm.http_port}/tcp",
+            f"{config.npm.https_port}/tcp",
+        ):
+            run(["ufw", "delete", "allow", spec])
+        run(["ufw", "reload"])
+        # ufw reload drops Docker's own NAT rules; other containers need them back.
+        restore_container_networking()
+        removed.append("ufw rules for WireGuard, HTTP, HTTPS and the panel")
+    return removed
 
 
 @dataclass(frozen=True)

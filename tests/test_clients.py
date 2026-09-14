@@ -422,6 +422,104 @@ async def test_stale_dns_record_is_updated():
 
 
 @respx.mock
+async def test_records_pointing_here_get_the_modes_proxy_status():
+    """A DNS-only record in front of an Origin certificate is what browsers reject."""
+    respx.get(f"{CF_BASE}/zones/z1/dns_records").mock(
+        return_value=httpx.Response(
+            200,
+            json=cf_ok([
+                {"id": "r1", "name": "example.com", "type": "A",
+                 "content": "203.0.113.10", "proxied": False},
+                {"id": "r2", "name": "files.example.com", "type": "A",
+                 "content": "203.0.113.10", "proxied": True},
+                {"id": "r3", "name": "elsewhere.example.com", "type": "A",
+                 "content": "198.51.100.7", "proxied": False},
+            ]),
+        )
+    )
+    wrong = respx.patch(f"{CF_BASE}/zones/z1/dns_records/r1").mock(
+        return_value=httpx.Response(200, json=cf_ok({"id": "r1"}))
+    )
+    right = respx.patch(f"{CF_BASE}/zones/z1/dns_records/r2")
+    other_server = respx.patch(f"{CF_BASE}/zones/z1/dns_records/r3")
+
+    async with CloudflareClient("token") as client:
+        changed = await client.reconcile_proxy_status("z1", "203.0.113.10", proxied=True)
+
+    assert changed == ["example.com"]
+    assert json.loads(wrong.calls[0].request.read()) == {"proxied": True}
+    assert not right.called
+    assert not other_server.called, "records for another server are not this edge's to change"
+
+
+@respx.mock
+async def test_only_records_edgekit_created_count_as_its_own():
+    """Removal deletes these, so a hand-made record must never match."""
+    respx.get(f"{CF_BASE}/zones/z1/dns_records").mock(
+        return_value=httpx.Response(
+            200,
+            json=cf_ok([
+                {"id": "r1", "name": "example.com", "comment": "Managed by edgekit"},
+                {"id": "r2", "name": "files.example.com", "comment": None},
+                {"id": "r3", "name": "mail.example.com", "comment": "added by hand"},
+            ]),
+        )
+    )
+
+    async with CloudflareClient("token") as client:
+        assert [r["id"] for r in await client.managed_records("z1")] == ["r1"]
+
+
+@respx.mock
+async def test_letsencrypt_retries_without_legacy_fields_when_npm_refuses_them():
+    respx.post(f"{NPM_BASE}/tokens").mock(return_value=httpx.Response(200, json={"token": "t"}))
+    create = respx.post(f"{NPM_BASE}/nginx/certificates").mock(
+        side_effect=[
+            httpx.Response(
+                400, json={"error": {"message": "data/meta must NOT have additional properties"}}
+            ),
+            httpx.Response(201, json={"id": 9, "expires_on": "2026-12-13 10:00:00"}),
+        ]
+    )
+
+    async with NPMClient(NPM_BASE, "ops@blockey.ir", "pw") as client:
+        result = await client.create_letsencrypt_certificate(
+            "Let's Encrypt - example.com",
+            ["*.example.com", "example.com"],
+            dns_provider="cloudflare",
+            dns_credentials="dns_cloudflare_api_token=abc",
+            email="ops@blockey.ir",
+        )
+
+    assert result["id"] == 9
+    legacy, current = (json.loads(call.request.read()) for call in create.calls)
+    assert legacy["meta"]["letsencrypt_email"] == "ops@blockey.ir"
+    assert legacy["meta"]["letsencrypt_agree"] is True
+    assert "letsencrypt_email" not in current["meta"]
+    assert current["provider"] == "letsencrypt"
+    assert current["meta"]["dns_challenge"] is True
+    assert current["meta"]["dns_provider_credentials"] == "dns_cloudflare_api_token=abc"
+
+
+@respx.mock
+async def test_a_failed_issuance_is_not_retried_as_a_schema_mismatch():
+    respx.post(f"{NPM_BASE}/tokens").mock(return_value=httpx.Response(200, json={"token": "t"}))
+    create = respx.post(f"{NPM_BASE}/nginx/certificates").mock(
+        return_value=httpx.Response(500, json={"error": {"message": "certbot failed"}})
+    )
+
+    async with NPMClient(NPM_BASE, "ops@blockey.ir", "pw") as client:
+        with pytest.raises(NPMError) as caught:
+            await client.create_letsencrypt_certificate(
+                "LE", ["*.example.com", "example.com"], dns_provider="cloudflare",
+                dns_credentials="x", email="ops@blockey.ir",
+            )
+
+    assert caught.value.status_code == 500
+    assert create.call_count == 1
+
+
+@respx.mock
 async def test_ssl_mode_is_not_rewritten_when_already_correct():
     respx.get(f"{CF_BASE}/zones/z1/settings/ssl").mock(
         return_value=httpx.Response(200, json=cf_ok({"value": "strict"}))

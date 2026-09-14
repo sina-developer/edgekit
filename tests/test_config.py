@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from edgekit.config import Config, WireGuardConfig
+from edgekit.config import Config, TLSConfig, WireGuardConfig
 from edgekit.crypto import decrypt, encrypt, is_encrypted
 
 
@@ -63,6 +63,31 @@ def test_public_panel_domain_uses_subdomain_and_zone(config):
     assert config.public_panel_domain == "panel.example.com"
     config.cloudflare.zone_name = ""
     assert config.public_panel_domain is None
+
+
+def test_the_tls_mode_is_validated():
+    with pytest.raises(ValueError):
+        TLSConfig(mode="flexible")
+
+
+def test_the_proxy_status_follows_the_tls_mode(config):
+    assert config.dns_proxied is True
+    config.tls.mode = "direct"
+    assert config.dns_proxied is False
+
+
+def test_a_config_written_before_tls_modes_still_loads(tmp_path):
+    """Old installs carry cloudflare.proxied and ssl_mode; they must not break loading."""
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "cloudflare:\n  zone_name: example.com\n  proxied: false\n"
+        "  manage_ssl_mode: true\n  ssl_mode: flexible\n"
+    )
+
+    loaded = Config.load(path)
+
+    assert loaded.tls.mode == "proxied"
+    assert loaded.cloudflare.zone_name == "example.com"
 
 
 def test_encrypt_decrypt_are_inverse():

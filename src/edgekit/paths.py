@@ -35,6 +35,13 @@ NPM_DIR = _p("opt", "nginx-proxy-manager")
 ORIGIN_CERT_FILE = _p("root", "origin.pem")
 ORIGIN_KEY_FILE = _p("root", "origin.key")
 
+#: The installer's virtualenv and the checkout `edgekit update` refreshes, and the symlink
+#: that puts `edgekit` on PATH.
+PROGRAM_DIR = (
+    Path(os.environ["EDGEKIT_PREFIX"]) if os.environ.get("EDGEKIT_PREFIX") else _p("opt", "edgekit")
+)
+PROGRAM_LINK = _p("usr", "local", "bin", "edgekit")
+
 FIREWALL_SCRIPT = _p("usr", "local", "lib", "edgekit", "firewall.sh")
 SYSCTL_FILE = _p("etc", "sysctl.d", "99-edgekit.conf")
 

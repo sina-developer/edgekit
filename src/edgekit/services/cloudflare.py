@@ -25,6 +25,10 @@ log = logging.getLogger("edgekit.cloudflare")
 
 API_BASE = "https://api.cloudflare.com/client/v4"
 
+#: Stamped on every record edgekit creates, so removal can tell its records from the
+#: operator's own. Records edgekit merely found already correct keep their own comment.
+MANAGED_COMMENT = "Managed by edgekit"
+
 
 class CloudflareError(RuntimeError):
     """A Cloudflare API call failed. Carries the API's own error list when present."""
@@ -259,7 +263,7 @@ class CloudflareClient:
             "content": ip,
             "proxied": proxied,
             "ttl": 1 if proxied else ttl,
-            "comment": "Managed by edgekit",
+            "comment": MANAGED_COMMENT,
         }
         for record in await self.list_dns_records(zone_id, name=name):
             if record["type"] == "A":
@@ -276,6 +280,45 @@ class CloudflareClient:
 
         log.info("creating DNS A record %s -> %s", name, ip)
         return await self._request("POST", f"/zones/{zone_id}/dns_records", json=payload)
+
+    async def managed_records(self, zone_id: str) -> list[dict]:
+        """Every record edgekit created in the zone, whatever its type."""
+        records = await self._request(
+            "GET", f"/zones/{zone_id}/dns_records", params={"per_page": 1000}
+        )
+        return [r for r in records or [] if r.get("comment") == MANAGED_COMMENT]
+
+    async def list_a_records(self, zone_id: str) -> list[dict]:
+        return (
+            await self._request(
+                "GET", f"/zones/{zone_id}/dns_records", params={"type": "A", "per_page": 1000}
+            )
+            or []
+        )
+
+    async def reconcile_proxy_status(self, zone_id: str, ip: str, *, proxied: bool) -> list[str]:
+        """Give every A record pointing at ``ip`` the proxy status ``proxied``.
+
+        Not just the records edgekit created: a hostname added by hand in the dashboard with
+        the wrong cloud breaks TLS exactly as badly. DNS only in front of an Origin
+        certificate hands browsers a certificate only Cloudflare trusts. Returns the names
+        that were changed.
+        """
+        changed: list[str] = []
+        for record in await self.list_a_records(zone_id):
+            if record.get("content") != ip or bool(record.get("proxied")) == proxied:
+                continue
+            if proxied and record.get("proxiable") is False:
+                log.warning("DNS record %s cannot be proxied; leaving it", record.get("name"))
+                continue
+            log.info("setting DNS record %s proxied=%s", record.get("name"), proxied)
+            await self._request(
+                "PATCH",
+                f"/zones/{zone_id}/dns_records/{record['id']}",
+                json={"proxied": proxied},
+            )
+            changed.append(record.get("name", record["id"]))
+        return changed
 
     async def delete_dns_record(self, zone_id: str, record_id: str) -> None:
         await self._request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")

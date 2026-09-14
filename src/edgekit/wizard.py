@@ -8,6 +8,7 @@ single-server setup.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import os
 import re
@@ -21,7 +22,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
-from .config import Config
+from .config import TLS_MODES, Config
 from .paths import ORIGIN_CERT_FILE, ORIGIN_KEY_FILE
 from .security import generate_password
 from .services.provision import detect_public_ip
@@ -157,7 +158,12 @@ def _validate_username(value: str) -> str | None:
 # ---------------------------------------------------------------------- the interview
 
 
-def run_wizard(existing: Config | None = None, *, non_interactive: bool = False) -> WizardResult:
+def run_wizard(
+    existing: Config | None = None,
+    *,
+    non_interactive: bool = False,
+    require_cloudflare: bool = True,
+) -> WizardResult:
     config = existing or Config()
 
     if not non_interactive:
@@ -252,9 +258,14 @@ def run_wizard(existing: Config | None = None, *, non_interactive: bool = False)
         validator=_validate_domain,
         non_interactive=non_interactive,
     )
-    if not non_interactive:
-        _print_cloudflare_checklist(config)
-    _collect_certificate(config, non_interactive=non_interactive)
+    _collect_cloudflare_token(
+        config, non_interactive=non_interactive, required=require_cloudflare
+    )
+    _choose_ssl_mode(config, non_interactive=non_interactive)
+    if config.dns_proxied:
+        _collect_certificate(config, non_interactive=non_interactive)
+    else:
+        _ensure_acme_email(config, non_interactive=non_interactive, fresh=existing is None)
 
     # -- panel ----------------------------------------------------------------
     _section("Management panel")
@@ -325,44 +336,146 @@ def run_wizard(existing: Config | None = None, *, non_interactive: bool = False)
     )
 
 
-def _print_cloudflare_checklist(config: Config) -> None:
-    """The three one-time dashboard actions, spelled out with this server's real values.
-
-    These used to be done over the API. They are one-time clicks, so asking the operator to
-    do them beats maintaining credentials with enough scope to do them automatically.
-    """
-    zone = config.cloudflare.zone_name
-    ip = config.server.public_ip
-
+def _print_token_help(zone: str) -> None:
     console.print(
         Panel(
-            f"""Do these three things in the Cloudflare dashboard for [bold]{zone}[/bold].
-Each is one-time — new subdomains later need nothing but a proxy host in edgekit.
+            f"""edgekit keeps Cloudflare in step with the certificate it installs: DNS records
+proxied or DNS only, the SSL/TLS mode, and in direct mode the Let's Encrypt DNS challenge.
+Browsers are shown a certificate they reject the moment those disagree — for example a
+DNS-only record in front of a Cloudflare Origin certificate — so this is required.
 
-[bold]1. DNS[/bold]  (DNS -> Records)  — add two proxied A records:
+Create one at [bold]dash.cloudflare.com/profile/api-tokens[/bold] -> Create Token -> Custom
+token, with Zone Resources including [bold]{zone}[/bold]:
 
-     Type   Name   Content          Proxy
-     A      @      {ip:<15}  Proxied
-     A      *      {ip:<15}  Proxied
-
-   The wildcard covers every subdomain you will ever add.
-
-[bold]2. SSL/TLS[/bold]  (SSL/TLS -> Overview) — set the mode to [bold]Full (strict)[/bold].
-   Not Flexible: Flexible leaves the Cloudflare-to-server hop unencrypted.
-
-[bold]3. Origin certificate[/bold]  (SSL/TLS -> Origin Server -> Create Certificate)
-   Accept the defaults and set the hostnames to:
-
-     *.{zone}
-     {zone}
-
-   Cloudflare then shows two boxes, [bold]Origin Certificate[/bold] and [bold]Private Key[/bold].
-   The private key is shown once only. Setup will ask you to paste both next; they are
-   saved to {ORIGIN_CERT_FILE} and {ORIGIN_KEY_FILE}. One certificate serves every
-   subdomain, for 15 years.""",
-            title="Cloudflare setup",
+  Zone / Zone / Read
+  Zone / DNS / Edit
+  Zone / Zone Settings / Edit
+  Zone / SSL and Certificates / Edit   [dim](optional: lets edgekit issue the origin
+                                        certificate instead of you pasting it)[/dim]""",
+            title="Cloudflare API token",
             border_style="blue",
         )
+    )
+
+
+async def _verify_cloudflare(token: str, config: Config) -> str:
+    """Prove the token can do everything provisioning will ask of it. Returns the zone id."""
+    from .services.cloudflare import CloudflareClient
+
+    async with CloudflareClient(token, origin_ca_key=config.cloudflare.origin_ca_key) as client:
+        await client.verify_token()
+        zone_id = await client.get_zone_id(config.cloudflare.zone_name)
+        await client.require_zone_permissions(zone_id)
+    return zone_id
+
+
+def _collect_cloudflare_token(
+    config: Config, *, non_interactive: bool, required: bool = True
+) -> None:
+    """Collect and verify the Cloudflare API token before anything depends on it."""
+    import httpx
+
+    from .services.cloudflare import CloudflareError
+
+    cf = config.cloudflare
+    cf.origin_ca_key = env("CF_ORIGIN_CA_KEY") or cf.origin_ca_key
+    preset = env("CF_TOKEN")
+    token = preset or cf.api_token
+    if not token:
+        if not required:
+            return
+        if non_interactive:
+            raise SystemExit(
+                "EDGEKIT_CF_TOKEN is required: edgekit sets DNS proxy status, the SSL mode "
+                "and the certificate through the Cloudflare API."
+            )
+        _print_token_help(cf.zone_name)
+
+    while True:
+        if not token:
+            token = Prompt.ask("  Cloudflare API token", password=True).strip()
+        try:
+            zone_id = asyncio.run(_verify_cloudflare(token, config))
+        except (CloudflareError, httpx.HTTPError) as exc:
+            if preset or non_interactive:
+                raise SystemExit(f"The Cloudflare API token was rejected: {exc}") from exc
+            console.print(f"  [red]{exc}[/red]")
+            token = ""
+            continue
+        cf.api_token, cf.zone_id, cf.enabled = token, zone_id, True
+        console.print(f"  [green]✓[/green] token can manage {cf.zone_name}")
+        return
+
+
+def _choose_ssl_mode(config: Config, *, non_interactive: bool) -> None:
+    preset = env("SSL_MODE").lower()
+    if preset:
+        if preset not in TLS_MODES:
+            raise SystemExit(f"EDGEKIT_SSL_MODE must be one of: {', '.join(TLS_MODES)}")
+        config.tls.mode = preset
+        return
+    if non_interactive:
+        return
+
+    zone = config.cloudflare.zone_name
+    console.print(
+        Panel(
+            f"""[bold]proxied[/bold]  Visitors -> Cloudflare (orange cloud) -> this server.
+  Browsers see Cloudflare's certificate. A Cloudflare Origin certificate secures the hop
+  to this server under Full (strict), and this server's IP stays hidden. Needs Cloudflare
+  to be able to reach this server on port 443.
+
+[bold]direct[/bold]   Visitors -> this server (DNS only, grey cloud).
+  Nginx Proxy Manager obtains a Let's Encrypt certificate for *.{zone} through a
+  Cloudflare DNS challenge and renews it itself. Choose this when Cloudflare cannot
+  complete TLS with this server — a 525 in proxied mode.
+
+Either way edgekit sets the DNS records, the SSL/TLS mode and the certificate to match.""",
+            title="SSL mode",
+            border_style="blue",
+        )
+    )
+    config.tls.mode = Prompt.ask("SSL mode", choices=list(TLS_MODES), default=config.tls.mode)
+
+
+def _validate_acme_email(value: str) -> str | None:
+    from .services.certificates import is_placeholder_email
+
+    error = _validate_email(value)
+    if error:
+        return error
+    if is_placeholder_email(value):
+        return (
+            "Let's Encrypt refuses placeholder addresses. Use a real mailbox — it receives "
+            "expiry notices."
+        )
+    return None
+
+
+def _ensure_acme_email(config: Config, *, non_interactive: bool, fresh: bool) -> None:
+    """Direct mode registers the Let's Encrypt account under the NPM admin email."""
+    email = config.npm.admin_email
+    if _validate_acme_email(email) is None:
+        return
+    if not fresh:
+        # NPM already has an admin account under this address; changing edgekit's copy here
+        # would lock it out of NPM. Provisioning names the fix.
+        console.print(
+            f"  [yellow]! Let's Encrypt will refuse {email}. Change the admin email inside "
+            "NPM, then run `edgekit npm password --email <address>`.[/yellow]"
+        )
+        return
+    if non_interactive:
+        raise SystemExit(
+            "Direct mode registers the Let's Encrypt account under the NPM admin email, which "
+            "cannot be a placeholder: set EDGEKIT_NPM_EMAIL to a real address."
+        )
+    console.print(
+        f"  Let's Encrypt registers the certificate under the NPM admin email, and refuses "
+        f"{email}."
+    )
+    config.npm.admin_email = _ask(
+        "Admin email for Nginx Proxy Manager", validator=_validate_acme_email
     )
 
 
@@ -592,9 +705,19 @@ def _summary(config: Config, username: str) -> None:
     table.add_row("NPM admin", config.npm.admin_email)
     table.add_row("Domain", config.cloudflare.zone_name or "not set")
     table.add_row(
-        "Origin certificate",
-        "supplied" if config.tls.present else "[yellow]none yet[/yellow]",
+        "Cloudflare API",
+        "token verified" if config.cloudflare.enabled else "[yellow]not configured[/yellow]",
     )
+    if config.dns_proxied:
+        table.add_row("SSL mode", "proxied — Cloudflare proxy, Origin certificate, Full (strict)")
+        table.add_row(
+            "Origin certificate",
+            "supplied"
+            if config.tls.present
+            else "[yellow]none — issued through the API if the token allows[/yellow]",
+        )
+    else:
+        table.add_row("SSL mode", "direct — DNS only, Let's Encrypt wildcard")
     if config.public_panel_domain:
         table.add_row("Panel URL", f"https://{config.public_panel_domain}")
     table.add_row("Panel", f"{username}@{config.panel.bind}:{config.panel.port}")

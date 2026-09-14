@@ -43,6 +43,10 @@ WRITABLE_HOST_FIELDS = (
 class NPMError(RuntimeError):
     """An NPM API call failed."""
 
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class NPMAuthError(NPMError):
     """Credentials were rejected."""
@@ -139,7 +143,8 @@ class NPMClient:
 
         if response.status_code >= 400:
             raise NPMError(
-                f"NPM {method} {path} failed ({response.status_code}): {response.text[:500]}"
+                f"NPM {method} {path} failed ({response.status_code}): {response.text[:500]}",
+                response.status_code,
             )
         if not response.content:
             return None
@@ -393,7 +398,7 @@ class NPMClient:
             old_id = int(old["id"])
             if old_id == cert_id:
                 continue
-            await self._repoint_hosts(old_id, cert_id)
+            await self.repoint_hosts(old_id, cert_id)
 
         for old in superseded:
             old_id = int(old["id"])
@@ -416,7 +421,68 @@ class NPMClient:
             if int(host.get("certificate_id") or 0) == int(cert_id)
         ]
 
-    async def _repoint_hosts(self, old_id: int, new_id: int) -> None:
+    #: DNS-01 issuance is synchronous inside NPM: it installs the certbot DNS plugin, publishes
+    #: the TXT record, waits out propagation and talks to Let's Encrypt before answering.
+    LETSENCRYPT_TIMEOUT = 600.0
+
+    async def find_letsencrypt_certificate(self, domains: list[str]) -> dict[str, Any] | None:
+        """The newest Let's Encrypt certificate covering exactly ``domains``, if any."""
+        wanted = {d.lower() for d in domains}
+        matches = [
+            c
+            for c in await self.list_certificates()
+            if c.get("provider") == "letsencrypt"
+            and {d.lower() for d in c.get("domain_names") or []} == wanted
+        ]
+        return max(matches, key=lambda c: str(c.get("expires_on") or ""), default=None)
+
+    async def create_letsencrypt_certificate(
+        self,
+        nice_name: str,
+        domains: list[str],
+        *,
+        dns_provider: str,
+        dns_credentials: str,
+        email: str,
+        propagation_seconds: int = 30,
+    ) -> dict[str, Any]:
+        """Have NPM obtain a Let's Encrypt certificate through a DNS challenge.
+
+        NPM renews it on its own from then on. Builds disagree on the request: older ones read
+        the account email and terms agreement from ``meta``, newer ones take the email from
+        the logged-in user and reject any ``meta`` key they do not know. The legacy shape is
+        sent first because a schema rejection is a fast 400 with no side effects, whereas a
+        missing email on an old build only fails once certbot is already running.
+        """
+        meta = {
+            "dns_challenge": True,
+            "dns_provider": dns_provider,
+            "dns_provider_credentials": dns_credentials,
+            "propagation_seconds": propagation_seconds,
+        }
+        payload = {
+            "provider": "letsencrypt",
+            "nice_name": nice_name,
+            "domain_names": domains,
+            "meta": meta,
+        }
+        legacy = {
+            **payload,
+            "meta": {**meta, "letsencrypt_email": email, "letsencrypt_agree": True},
+        }
+        try:
+            return await self._request(
+                "POST", "/nginx/certificates", json=legacy, timeout=self.LETSENCRYPT_TIMEOUT
+            )
+        except NPMError as exc:
+            if exc.status_code != 400:
+                raise
+            log.info("NPM refused the legacy certificate request; retrying without it: %s", exc)
+        return await self._request(
+            "POST", "/nginx/certificates", json=payload, timeout=self.LETSENCRYPT_TIMEOUT
+        )
+
+    async def repoint_hosts(self, old_id: int, new_id: int) -> None:
         """Move every host off ``old_id``. One failure must not abandon the rest."""
         failures: list[str] = []
         for host in await self._hosts_using(old_id):

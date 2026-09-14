@@ -145,6 +145,63 @@ def test_collect_certificate_skips_paste_when_keys_exist_and_renew_is_declined(
     assert any("renew" in q.lower() for q in questions)
 
 
+def test_setup_requires_a_cloudflare_token_unattended(config, monkeypatch):
+    from edgekit.wizard import _collect_cloudflare_token
+
+    monkeypatch.setattr("edgekit.wizard.env", lambda *_a, **_k: "")
+    config.cloudflare.api_token = ""
+
+    with pytest.raises(SystemExit, match="EDGEKIT_CF_TOKEN"):
+        _collect_cloudflare_token(config, non_interactive=True)
+
+
+def test_a_rejected_token_is_asked_for_again(config, monkeypatch):
+    from edgekit.services.cloudflare import CloudflareError
+    from edgekit.wizard import _collect_cloudflare_token
+
+    monkeypatch.setattr("edgekit.wizard.env", lambda *_a, **_k: "")
+    monkeypatch.setattr("edgekit.wizard._print_token_help", lambda zone: None)
+    config.cloudflare.api_token = ""
+    config.cloudflare.enabled = False
+    typed = iter(["wrong", "right"])
+    monkeypatch.setattr("edgekit.wizard.Prompt.ask", lambda *a, **k: next(typed))
+
+    async def verify(token, cfg):
+        if token != "right":
+            raise CloudflareError("Invalid API Token")
+        return "zone-9"
+
+    monkeypatch.setattr("edgekit.wizard._verify_cloudflare", verify)
+
+    _collect_cloudflare_token(config, non_interactive=False)
+
+    assert config.cloudflare.api_token == "right"
+    assert config.cloudflare.zone_id == "zone-9"
+    assert config.cloudflare.enabled is True
+
+
+def test_the_ssl_mode_can_come_from_the_environment(config, monkeypatch):
+    from edgekit.wizard import _choose_ssl_mode
+
+    monkeypatch.setattr(
+        "edgekit.wizard.env", lambda key, default="": "direct" if key == "SSL_MODE" else ""
+    )
+
+    _choose_ssl_mode(config, non_interactive=True)
+
+    assert config.tls.mode == "direct"
+
+
+def test_direct_mode_refuses_a_placeholder_email_unattended(config, monkeypatch):
+    from edgekit.wizard import _ensure_acme_email
+
+    monkeypatch.setattr("edgekit.wizard.env", lambda *_a, **_k: "")
+    config.npm.admin_email = "admin@example.com"
+
+    with pytest.raises(SystemExit, match="EDGEKIT_NPM_EMAIL"):
+        _ensure_acme_email(config, non_interactive=True, fresh=True)
+
+
 def test_collect_certificate_asks_for_new_keys_when_renew_is_accepted(
     tmp_path, monkeypatch, config
 ):

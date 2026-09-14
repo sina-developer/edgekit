@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from edgekit.services import health
 from edgekit.services.health import Level
 from edgekit.services.provision import (
     Provisioner,
@@ -102,16 +103,176 @@ class TestFlags:
         with pytest.raises(SkipStep):
             await provisioner.step_cloudflare_zone()
 
-    async def test_cloudflare_steps_skip_when_the_integration_is_off(self, config):
+    async def test_a_zone_without_the_cloudflare_api_is_an_error_not_a_skip(self, config):
+        """Nothing else keeps DNS and the SSL mode matched to the certificate."""
         config.cloudflare.enabled = False
-        provisioner = Provisioner(config)
-        with pytest.raises(SkipStep):
-            await provisioner.step_cloudflare_zone()
+        with pytest.raises(ProvisionError, match="edgekit cloudflare token"):
+            await Provisioner(config).step_cloudflare_zone()
+
+    async def test_no_domain_at_all_is_a_skip(self, config):
+        config.cloudflare.enabled = False
+        config.cloudflare.zone_name = ""
+        with pytest.raises(SkipStep, match="no domain"):
+            await Provisioner(config).step_cloudflare_zone()
 
     async def test_an_enabled_zone_without_a_token_is_an_error_not_a_skip(self, config):
         config.cloudflare.api_token = ""
         with pytest.raises(ProvisionError, match="no API token"):
             await Provisioner(config).step_cloudflare_zone()
+
+
+class FakeCloudflare:
+    def __init__(self) -> None:
+        self.upserts: list[tuple[str, bool]] = []
+        self.reconciled: list[bool] = []
+        self.ssl_modes: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def upsert_a_record(self, zone_id, name, ip, *, proxied=True):
+        self.upserts.append((name, proxied))
+
+    async def reconcile_proxy_status(self, zone_id, ip, *, proxied):
+        self.reconciled.append(proxied)
+        return ["files.example.com"]
+
+    async def set_ssl_mode(self, zone_id, mode):
+        self.ssl_modes.append(mode)
+        return mode
+
+
+@pytest.fixture
+def cloudflare(monkeypatch):
+    fake = FakeCloudflare()
+    monkeypatch.setattr("edgekit.services.cloudflare.CloudflareClient", lambda *a, **k: fake)
+    return fake
+
+
+class TestSslModeSteps:
+    async def test_proxied_mode_proxies_every_record_pointing_here(self, config, cloudflare):
+        detail = await Provisioner(config).step_cloudflare_dns()
+
+        assert cloudflare.upserts == [("example.com", True), ("*.example.com", True)]
+        assert cloudflare.reconciled == [True]
+        assert "files.example.com" in detail
+
+    async def test_direct_mode_takes_records_out_of_the_proxy(self, config, cloudflare):
+        config.tls.mode = "direct"
+
+        await Provisioner(config).step_cloudflare_dns()
+
+        assert {proxied for _, proxied in cloudflare.upserts} == {False}
+        assert cloudflare.reconciled == [False]
+
+    async def test_proxied_mode_forces_full_strict(self, config, cloudflare):
+        await Provisioner(config).step_cloudflare_ssl()
+        assert cloudflare.ssl_modes == ["strict"]
+
+    async def test_direct_mode_leaves_the_zone_ssl_mode_alone(self, config, cloudflare):
+        config.tls.mode = "direct"
+        with pytest.raises(SkipStep, match="direct"):
+            await Provisioner(config).step_cloudflare_ssl()
+        assert cloudflare.ssl_modes == []
+
+    async def test_direct_mode_issues_lets_encrypt_not_the_origin_certificate(
+        self, config, clean_db, monkeypatch
+    ):
+        config.tls.mode = "direct"
+        calls = []
+
+        async def install_letsencrypt(session, cfg, **kwargs):
+            calls.append(cfg.tls.mode)
+            return {"status": "issued", "certificate_id": "12", "expires": "",
+                    "hostnames": "*.example.com, example.com"}
+
+        monkeypatch.setattr(
+            "edgekit.services.certificates.install_letsencrypt", install_letsencrypt
+        )
+
+        detail = await Provisioner(config).step_certificate()
+
+        assert calls == ["direct"]
+        assert "NPM id 12" in detail
+
+    async def test_only_the_requested_steps_run(self, config, monkeypatch):
+        ran = []
+        for key in ("step_preflight", "step_verify_https", "step_persist"):
+            monkeypatch.setattr(Provisioner, key, lambda self, key=key: ran.append(key))
+        monkeypatch.setattr("edgekit.services.provision.session_scope", _NullScope)
+
+        await Provisioner(config).run(only=("verify_https", "persist"))
+
+        assert ran == ["step_verify_https", "step_persist"]
+
+
+class _NullScope:
+    def __enter__(self):
+        return type("S", (), {"add": lambda self, _row: None})()
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _probe(**fields):
+    return health.PublicProbe("edgekit.example.com", **fields)
+
+
+ORIGIN_SHOWN = _probe(
+    addresses=["203.0.113.10"],
+    trusted=False,
+    issuer="OU=CloudFlare Origin SSL Certificate Authority,O=CloudFlare\\, Inc.",
+    error="unable to get local issuer certificate",
+)
+CLOUDFLARE_SHOWN = _probe(
+    addresses=["104.21.8.1"], trusted=True, issuer="C=US,O=Google Trust Services", status=303
+)
+
+
+class TestVerifyHttps:
+    """The step that would have caught the reported bug: setup ended on a certificate browsers
+    reject, and called it complete."""
+
+    @pytest.fixture(autouse=True)
+    def panel_host(self, clean_db):
+        from edgekit.db import session_scope
+        from edgekit.models import ProxyHost
+
+        with session_scope() as session:
+            session.add(ProxyHost(domain="edgekit.example.com", forward_host="10.50.0.1",
+                                  forward_port=8088, scheme="http"))
+
+    @pytest.fixture(autouse=True)
+    def quick(self, monkeypatch):
+        monkeypatch.setattr(Provisioner, "VERIFY_INTERVAL", 0.0)
+        monkeypatch.setattr(Provisioner, "VERIFY_WINDOW", 0.2)
+
+    async def test_an_origin_certificate_shown_to_browsers_fails_setup(self, config, monkeypatch):
+        monkeypatch.setattr(health, "probe_public_https", lambda domain: ORIGIN_SHOWN)
+
+        with pytest.raises(ProvisionError, match="only Cloudflare's proxy trusts"):
+            await Provisioner(config).step_verify_https()
+
+    async def test_it_waits_for_a_proxy_change_to_reach_resolvers(self, config, monkeypatch):
+        answers = [ORIGIN_SHOWN, CLOUDFLARE_SHOWN]
+        monkeypatch.setattr(
+            health, "probe_public_https", lambda domain: answers.pop(0) if answers else None
+        )
+
+        detail = await Provisioner(config).step_verify_https()
+
+        assert "trusted on edgekit.example.com" in detail
+
+    async def test_a_slow_service_does_not_fail_setup(self, config, monkeypatch):
+        slow = _probe(addresses=["104.21.8.1"], trusted=True, status=None)
+        monkeypatch.setattr(health, "probe_public_https", lambda domain: slow)
+
+        detail = await Provisioner(config).step_verify_https()
+
+        assert "no HTTP response" in detail
 
 
 class TestPublishPanel:

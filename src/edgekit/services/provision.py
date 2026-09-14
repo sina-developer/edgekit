@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 import socket
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -28,7 +28,7 @@ from ..rendering import render
 from ..system import dockerx, firewall, packages, sysctl
 from ..system import wireguard as wg
 from ..system.shell import is_root
-from . import certificates
+from . import certificates, health
 from .hosts import HostService
 from .npm import NPMClient
 from .peers import PeerService
@@ -79,6 +79,18 @@ class SkipStep(Exception):
 #: Steps whose failure makes everything after them meaningless.
 _FATAL_STEPS = {"preflight", "wireguard_keys", "wireguard_up"}
 
+#: The steps that decide what browsers get over HTTPS — all `edgekit ssl mode` needs to rerun.
+TLS_STEPS = (
+    "cloudflare_zone",
+    "cloudflare_dns",
+    "cloudflare_ssl",
+    "origin_cert",
+    "attach_cert",
+    "panel_host",
+    "verify_https",
+    "persist",
+)
+
 
 class Provisioner:
     """Runs the full setup. Construct with a validated :class:`Config` and call :meth:`run`."""
@@ -128,7 +140,14 @@ class Provisioner:
         self._emit(result)
         return result
 
-    async def run(self) -> ProvisionReport:
+    async def run(self, only: Iterable[str] | None = None) -> ProvisionReport:
+        """Run every step, or just the keys in ``only``, in the usual order."""
+        wanted = set(only) if only is not None else None
+        certificate_title = (
+            "Install origin certificate"
+            if self.config.dns_proxied
+            else "Issue Let's Encrypt certificate"
+        )
         steps: list[tuple[str, str, Callable[[], Any]]] = [
             ("preflight", "Preflight checks", self.step_preflight),
             ("packages", "Install base packages", self.step_base_packages),
@@ -144,12 +163,16 @@ class Provisioner:
             ("cloudflare_zone", "Verify Cloudflare zone", self.step_cloudflare_zone),
             ("cloudflare_dns", "Publish DNS records", self.step_cloudflare_dns),
             ("cloudflare_ssl", "Set SSL mode to Full (strict)", self.step_cloudflare_ssl),
-            ("origin_cert", "Install origin certificate", self.step_origin_certificate),
+            ("origin_cert", certificate_title, self.step_certificate),
+            ("attach_cert", "Attach certificate to proxy hosts", self.step_attach_certificate),
             ("panel_host", "Publish panel at edgekit.<zone>", self.step_publish_panel),
+            ("verify_https", "Verify HTTPS as browsers see it", self.step_verify_https),
             ("persist", "Save configuration", self.step_persist),
         ]
 
         for key, title, fn in steps:
+            if wanted is not None and key not in wanted:
+                continue
             result = await self._step(key, title, fn)
             if result.status is StepStatus.FAILED and key in _FATAL_STEPS:
                 log.error("aborting: %s is required and failed", key)
@@ -332,10 +355,18 @@ class Provisioner:
 
     async def step_cloudflare_zone(self) -> str:
         cf = self.config.cloudflare
-        if self.skip_cloudflare or not cf.enabled:
-            raise SkipStep("Cloudflare integration disabled")
-        if not cf.api_token:
-            raise ProvisionError("Cloudflare is enabled but no API token is configured")
+        if self.skip_cloudflare:
+            raise SkipStep("--skip-cloudflare")
+        if not cf.zone_name:
+            raise SkipStep("no domain configured")
+        if not (cf.enabled and cf.api_token):
+            # Not a skip: without the API, nothing keeps DNS proxy status and the SSL mode in
+            # step with the certificate, and the mismatch is a certificate browsers reject.
+            raise ProvisionError(
+                "Cloudflare is not configured: no API token is stored. edgekit sets DNS proxy "
+                "status and the SSL mode to match the certificate it installs. Store one with "
+                f"`edgekit cloudflare token --zone {cf.zone_name}`."
+            )
 
         from .cloudflare import CloudflareClient
 
@@ -358,33 +389,61 @@ class Provisioner:
         from .cloudflare import CloudflareClient
 
         ip = self.config.server.public_ip
+        proxied = self.config.dns_proxied
         names = [cf.zone_name, f"*.{cf.zone_name}"]
         async with CloudflareClient(cf.api_token, origin_ca_key=cf.origin_ca_key) as client:
             for name in names:
-                await client.upsert_a_record(cf.zone_id, name, ip, proxied=cf.proxied)
-        return f"{', '.join(names)} -> {ip}" + (" (proxied)" if cf.proxied else "")
+                await client.upsert_a_record(cf.zone_id, name, ip, proxied=proxied)
+            # Every other record pointing here too — including ones added by hand, which is
+            # how a DNS-only hostname ends up serving the Origin certificate to browsers.
+            changed = await client.reconcile_proxy_status(cf.zone_id, ip, proxied=proxied)
+        label = "proxied" if proxied else "DNS only"
+        detail = f"{', '.join(names)} -> {ip} ({label})"
+        if changed:
+            detail += f"; switched to {label}: {', '.join(changed)}"
+        return detail
 
     async def step_cloudflare_ssl(self) -> str:
         cf = self.config.cloudflare
-        if self.skip_cloudflare or not (cf.enabled and cf.zone_id and cf.manage_ssl_mode):
-            raise SkipStep("SSL mode management disabled")
+        if self.skip_cloudflare or not (cf.enabled and cf.zone_id):
+            raise SkipStep("Cloudflare integration disabled")
+        if not self.config.dns_proxied:
+            raise SkipStep("direct mode — visitors do not pass through Cloudflare's TLS")
 
         from .cloudflare import CloudflareClient
 
         async with CloudflareClient(cf.api_token, origin_ca_key=cf.origin_ca_key) as client:
-            mode = await client.set_ssl_mode(cf.zone_id, cf.ssl_mode)
+            mode = await client.set_ssl_mode(cf.zone_id, "strict")
         return f"SSL mode = {mode}"
 
-    async def step_origin_certificate(self) -> str:
+    async def step_certificate(self) -> str:
+        """Install the certificate the TLS mode calls for."""
+        if self.skip_docker:
+            raise SkipStep("--skip-docker")
+        if self.config.dns_proxied:
+            return await self._install_origin_certificate()
+        return await self._install_letsencrypt()
+
+    async def _install_letsencrypt(self) -> str:
+        if self.skip_cloudflare:
+            raise ProvisionError(
+                "direct mode issues its certificate through a Cloudflare DNS challenge, so it "
+                "cannot run with --skip-cloudflare"
+            )
+        with session_scope() as session:
+            outcome = await certificates.install_letsencrypt(session, self.config)
+        return (
+            f"{outcome['status']} {outcome['hostnames']} as NPM id {outcome['certificate_id']}"
+            + (f", expires {outcome['expires'][:10]}" if outcome["expires"] else "")
+        )
+
+    async def _install_origin_certificate(self) -> str:
         """Install the origin certificate into NPM.
 
         Prefers the certificate the operator supplied, which is the normal path — creating
         one in the Cloudflare dashboard is a single one-time action. Falls back to issuing
         via the API only when that automation has been explicitly enabled.
         """
-        if self.skip_docker:
-            raise SkipStep("--skip-docker")
-
         tls = self.config.tls
         if tls.present:
             # The stored pair is validated on the way in, but config.yaml can be edited by
@@ -470,6 +529,69 @@ class Provisioner:
                 actor="provision",
             )
             return f"{host.domain} -> {host.forward_host}:{host.forward_port}"
+
+    async def step_attach_certificate(self) -> str:
+        if self.skip_docker or not self.config.npm.enabled:
+            raise SkipStep("NPM disabled")
+        with session_scope() as session:
+            service = HostService(session, self.config)
+            if service.certificate_id() is None:
+                raise SkipStep("no certificate installed")
+            moved = await service.attach_certificate()
+        return f"moved {', '.join(moved)}" if moved else "every proxy host already uses it"
+
+    #: How long to wait out a DNS change applied moments ago. Cloudflare's own resolvers see a
+    #: proxy toggle within seconds; others hold the old answer for its TTL.
+    VERIFY_WINDOW = 120.0
+    VERIFY_INTERVAL = 10.0
+
+    async def step_verify_https(self) -> str:
+        """Connect to every hostname as a browser would, and fail on what a browser rejects.
+
+        Everything before this checks a component. This checks the outcome — the certificate a
+        visitor is actually shown — which is the only thing that proves DNS, the SSL mode and
+        the certificate agree with each other.
+        """
+        if self.skip_docker or not self.config.npm.enabled:
+            raise SkipStep("NPM disabled")
+        with session_scope() as session:
+            domains = sorted({h.domain for h in session.scalars(select(ProxyHost))})
+        if not domains:
+            raise SkipStep("no proxy hosts to check")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.VERIFY_WINDOW
+        pending = domains
+        results: dict[str, health.Check] = {}
+        while True:
+            probes = await asyncio.gather(
+                *(asyncio.to_thread(health.probe_public_https, domain) for domain in pending)
+            )
+            retry: list[str] = []
+            for probe in probes:
+                check, worth_retrying = health.assess_public(probe, self.config)
+                results[probe.domain] = check
+                if worth_retrying and check.level is not health.Level.OK:
+                    retry.append(probe.domain)
+            if not retry or loop.time() + self.VERIFY_INTERVAL > deadline:
+                break
+            log.info("waiting for DNS to settle on %s", ", ".join(retry))
+            await asyncio.sleep(self.VERIFY_INTERVAL)
+            pending = retry
+
+        failures = [c for c in results.values() if c.level is health.Level.FAIL]
+        if failures:
+            raise ProvisionError(
+                "\n".join(f"{c.title}: {c.detail}\n  {c.remedy}" for c in failures)
+            )
+        trusted = [d for d, c in results.items() if c.level is health.Level.OK]
+        detail = f"trusted on {', '.join(trusted)}" if trusted else "no host answered cleanly"
+        warnings = [c for c in results.values() if c.level is health.Level.WARN]
+        if warnings:
+            detail += "; " + "; ".join(
+                f"{c.title.removeprefix('Public ')}: {c.detail}" for c in warnings
+            )
+        return detail
 
     def step_persist(self) -> str:
         self.config.save()

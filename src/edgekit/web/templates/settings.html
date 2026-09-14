@@ -180,7 +180,7 @@
         </div>
       </form>
 
-      {% if config.cloudflare.enabled and config.cloudflare.zone_id %}
+      {% if config.cloudflare.enabled and config.cloudflare.zone_id and config.dns_proxied %}
       <div class="card-body">
         <form method="post" action="/settings/certificate/issue" class="inline"
               data-confirm="A new certificate is issued from the Cloudflare API and replaces the one currently installed."
@@ -198,11 +198,10 @@
     <div class="card" id="cloudflare">
       <div class="card-head">
         <div>
-          <h2>Cloudflare API <span class="pill outline" style="margin-left:6px">Optional</span></h2>
+          <h2>Cloudflare and SSL mode</h2>
           <p class="card-desc">
-            Not required. DNS records, the SSL/TLS mode and the origin certificate are
-            one-time dashboard actions. Enable this only if you want a DNS record created
-            per proxy host automatically.
+            edgekit keeps DNS proxy status, the SSL/TLS mode and the certificate in step.
+            When they disagree, browsers are shown a certificate they reject.
           </p>
         </div>
         <span class="pill {{ 'ok' if config.cloudflare.enabled else '' }}">
@@ -215,9 +214,8 @@
         <div class="flash">
           {% include "icons/info.svg" %}
           <div>
-            Currently off. The wildcard record
-            <code>*.{{ config.cloudflare.zone_name or 'example.com' }}</code> already covers
-            every hostname, which is why this stays optional.
+            No API token is stored, so nothing keeps the DNS records and SSL mode matched to
+            the certificate. Add one below, then re-provision.
           </div>
         </div>
       </div>
@@ -234,14 +232,15 @@
           {% if config.cloudflare.zone_id %}<small class="mono">zone id {{ config.cloudflare.zone_id }}</small>{% endif %}
         </label>
         <label>SSL mode
-          <select name="ssl_mode">
-            {% for mode in ['strict', 'full', 'flexible', 'off'] %}
-            <option value="{{ mode }}" {{ 'selected' if config.cloudflare.ssl_mode == mode }}>
-              {{ 'Full (strict)' if mode == 'strict' else mode|title }}
+          <select name="tls_mode">
+            <option value="proxied" {{ 'selected' if config.tls.mode == 'proxied' }}>
+              Proxied — Cloudflare proxy, Origin certificate
             </option>
-            {% endfor %}
+            <option value="direct" {{ 'selected' if config.tls.mode == 'direct' }}>
+              Direct — DNS only, Let's Encrypt
+            </option>
           </select>
-          <small>Full (strict) is the only mode that actually verifies the origin.</small>
+          <small>Re-provisioning applies it: records, SSL/TLS mode and certificate together.</small>
         </label>
         <label>API token
           <input type="password" name="api_token" autocomplete="off"
@@ -252,10 +251,6 @@
           <input type="password" name="origin_ca_key" autocomplete="off"
                  placeholder="{{ '•••••• stored' if config.cloudflare.origin_ca_key else 'not set' }}">
           <small>Only needed if the token cannot issue origin certificates.</small>
-        </label>
-        <label class="check" style="grid-column:1/-1">
-          <input type="checkbox" name="proxied" value="true" {{ 'checked' if config.cloudflare.proxied }}>
-          <span>Proxy records through Cloudflare (orange cloud)</span>
         </label>
         <div class="actions"><button class="primary" type="submit">Save and verify</button></div>
       </form>
@@ -342,6 +337,46 @@
             </p>
           </div>
           <a class="button" href="/settings/password">Change password</a>
+        </div>
+        <div class="rule"></div>
+        <div class="danger-row">
+          <div>
+            <strong>Update edgekit</strong>
+            <p class="sub" style="margin-top:4px">
+              Fetch the latest release, reinstall and re-provision. Settings are kept.
+            </p>
+          </div>
+          <a class="button" href="/settings/update">Update…</a>
+        </div>
+        <div class="rule"></div>
+        <div class="danger-row">
+          <div>
+            <strong>Remove edgekit</strong>
+            <p class="sub" style="margin-top:4px">
+              Deletes the panel, Nginx Proxy Manager with every proxy host and certificate,
+              the WireGuard tunnel and its keys, edgekit's firewall rules, and all settings
+              and credentials{% if config.cloudflare.api_token %}, plus the DNS records
+              edgekit created{% endif %}. The Docker and WireGuard packages stay. This cannot
+              be undone. Type <span class="mono">remove</span> to enable it.
+            </p>
+          </div>
+          <form method="post" action="/settings/uninstall" class="inline"
+                data-confirm="Everything edgekit set up on this server is deleted, including every proxy host, peer key and credential. This cannot be undone."
+                data-confirm-title="Remove edgekit?"
+                data-confirm-action="Remove edgekit"
+                data-confirm-danger>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <input type="text" name="confirm" required autocomplete="off" spellcheck="false"
+                   pattern="[Rr][Ee][Mm][Oo][Vv][Ee]" placeholder="remove"
+                   aria-label="Type remove to confirm" style="width:8em">
+            {% if config.cloudflare.api_token %}
+            <label class="check">
+              <input type="checkbox" name="keep_dns" value="true">
+              <span>Keep DNS records</span>
+            </label>
+            {% endif %}
+            <button class="danger" type="submit">Remove edgekit</button>
+          </form>
         </div>
       </div>
     </div>

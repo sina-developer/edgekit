@@ -128,6 +128,206 @@ class TestCertificateChecks:
         assert _by_key(checks, "cert_coverage").level is Level.OK
 
 
+ORIGIN_ISSUER = (
+    "ST=California,L=San Francisco,OU=CloudFlare Origin SSL Certificate Authority,"
+    "O=CloudFlare\\, Inc.,C=US"
+)
+
+
+class TestPublicAssessment:
+    """What a browser is shown, judged against the mode. The first case is the reported bug."""
+
+    def _probe(self, **fields):
+        return health.PublicProbe("edgekit.example.com", **fields)
+
+    def test_a_dns_only_record_in_front_of_an_origin_certificate_fails(self, config):
+        probe = self._probe(
+            addresses=["203.0.113.10"], trusted=False, issuer=ORIGIN_ISSUER,
+            error="unable to get local issuer certificate",
+        )
+
+        check, retry = health.assess_public(probe, config)
+
+        assert check.level is Level.FAIL
+        assert "only Cloudflare's proxy trusts" in check.detail
+        assert "Proxied" in check.remedy
+        assert "edgekit ssl mode direct" in check.remedy
+        assert retry, "a proxy toggle applied moments ago explains this, so it is worth waiting"
+
+    def test_the_origin_certificate_in_direct_mode_is_not_a_dns_wait(self, config):
+        config.tls.mode = "direct"
+        probe = self._probe(addresses=["203.0.113.10"], trusted=False, issuer=ORIGIN_ISSUER)
+
+        check, retry = health.assess_public(probe, config)
+
+        assert check.level is Level.FAIL
+        assert "edgekit provision" in check.remedy
+        assert not retry
+
+    def test_proxied_and_trusted_passes(self, config):
+        probe = self._probe(
+            addresses=["104.21.8.1"], trusted=True, issuer="C=US,O=Google Trust Services,CN=WE1",
+            status=200,
+        )
+
+        check, retry = health.assess_public(probe, config)
+
+        assert check.level is Level.OK
+        assert "Google Trust Services" in check.detail
+        assert not retry
+
+    def test_direct_mode_on_the_origin_passes(self, config):
+        config.tls.mode = "direct"
+        probe = self._probe(
+            addresses=["203.0.113.10"], trusted=True, issuer="C=US,O=Let's Encrypt,CN=R11",
+            status=303,
+        )
+
+        assert health.assess_public(probe, config)[0].level is Level.OK
+
+    def test_direct_mode_still_behind_cloudflare_waits_for_dns(self, config):
+        config.tls.mode = "direct"
+        probe = self._probe(addresses=["104.21.8.1"], trusted=True, status=200)
+
+        check, retry = health.assess_public(probe, config)
+
+        assert check.level is Level.WARN
+        assert retry
+
+    def test_a_525_names_direct_mode_as_the_way_out(self, config):
+        probe = self._probe(addresses=["104.21.8.1"], trusted=True, status=525)
+
+        check, _ = health.assess_public(probe, config)
+
+        assert check.level is Level.FAIL
+        assert "edgekit ssl mode direct" in check.remedy
+
+    def test_a_slow_upstream_is_not_reported_as_a_tls_problem(self, config):
+        probe = self._probe(addresses=["104.21.8.1"], trusted=True, status=None)
+
+        check, retry = health.assess_public(probe, config)
+
+        assert check.level is Level.WARN
+        assert "TLS is fine" in check.remedy
+        assert not retry
+
+    def test_a_name_that_does_not_resolve_fails(self, config):
+        check, retry = health.assess_public(self._probe(error="does not resolve"), config)
+
+        assert check.level is Level.FAIL
+        assert retry
+
+    def test_an_unreachable_name_is_a_warning_not_a_verdict(self, config):
+        probe = self._probe(addresses=["203.0.113.10"], error="timed out")
+
+        check, retry = health.assess_public(probe, config)
+
+        assert check.level is Level.WARN
+        assert not retry
+
+    def test_the_issuer_is_named_the_way_people_recognise_it(self):
+        assert health._issuer_name(ORIGIN_ISSUER) == "CloudFlare, Inc."
+
+
+class TestLocalTlsProbe:
+    async def test_a_handshake_without_a_response_is_an_upstream_warning(self, monkeypatch):
+        """An offline peer made doctor report TLS failures that were nothing of the sort."""
+        monkeypatch.setattr(health, "_https_sni", lambda address, domain, port: None)
+
+        check = await health._probe_local_proxy("yekja.example.com", 443)
+
+        assert check.level is Level.WARN
+        assert "Not a certificate problem" in check.remedy
+
+
+@pytest.fixture
+def tls_server(tmp_path):
+    """A local TLS server presenting a certificate from an issuer of the test's choosing."""
+    import socket
+    import ssl
+    import threading
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    servers = []
+
+    def start(organizational_unit: str) -> int:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, organizational_unit),
+            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+        ])
+        now = dt.datetime.now(dt.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - dt.timedelta(days=1))
+            .not_valid_after(now + dt.timedelta(days=30))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), False)
+            .sign(key, hashes.SHA256())
+        )
+        cert_file, key_file = tmp_path / "cert.pem", tmp_path / "key.pem"
+        cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        key_file.write_bytes(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+        )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert_file, key_file)
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(5)
+        listener.settimeout(0.2)
+        stop = threading.Event()
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    return
+                conn.settimeout(2)
+                try:
+                    with ctx.wrap_socket(conn, server_side=True) as tls:
+                        tls.recv(1024)
+                        tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                except OSError:
+                    conn.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        servers.append((stop, listener, thread))
+        return listener.getsockname()[1]
+
+    yield start
+    for stop, listener, thread in servers:
+        stop.set()
+        thread.join(2)
+        listener.close()
+
+
+def test_an_origin_certificate_is_recognised_on_the_wire(tls_server):
+    port = tls_server("CloudFlare Origin SSL Certificate Authority")
+
+    probe = health.probe_public_https("localhost", port=port, timeout=3)
+
+    assert probe.trusted is False
+    assert probe.origin_certificate
+    assert "127.0.0.1" in probe.addresses
+
+
 class _NoopNPM:
     async def __aenter__(self):
         return self

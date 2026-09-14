@@ -153,6 +153,9 @@ class FakeNPMClient:
         self.uploads: list[tuple[str, str]] = []
         self.stored: list[int] = list(existing_ids or [])
         self.next_id = 10
+        self.repointed: list[tuple[int, int]] = []
+        self.letsencrypt: list[dict] = []
+        self.requested: list[dict] = []
 
     async def __aenter__(self):
         return self
@@ -168,6 +171,27 @@ class FakeNPMClient:
         self.uploads.append((nice_name, certificate_pem))
         self.stored.append(self.next_id)
         return self.next_id
+
+    async def repoint_hosts(self, old_id: int, new_id: int) -> None:
+        self.repointed.append((old_id, new_id))
+
+    async def find_letsencrypt_certificate(self, domains):
+        matches = [c for c in self.letsencrypt if set(c["domain_names"]) == set(domains)]
+        return matches[-1] if matches else None
+
+    async def create_letsencrypt_certificate(self, nice_name, domains, **kwargs) -> dict:
+        self.next_id += 1
+        expires = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=90)
+        record = {
+            "id": self.next_id,
+            "nice_name": nice_name,
+            "domain_names": domains,
+            "expires_on": expires.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.requested.append({**record, **kwargs})
+        self.letsencrypt.append(record)
+        self.stored.append(self.next_id)
+        return record
 
 
 @pytest.fixture
@@ -239,6 +263,125 @@ class TestIdempotentInstall:
 
         assert outcome["status"] == "installed"
         assert len(npm.uploads) == 2
+
+
+def _npm_time(days: int) -> str:
+    when = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=days)
+    return when.strftime("%Y-%m-%d %H:%M:%S")
+
+
+class TestLetsEncrypt:
+    """Direct mode: browsers connect to the origin, so its certificate must be publicly trusted."""
+
+    @pytest.fixture(autouse=True)
+    def real_mailbox(self, config):
+        config.npm.admin_email = "ops@blockey.ir"
+
+    async def test_a_wildcard_is_issued_through_the_cloudflare_dns_challenge(
+        self, db_session, config, npm
+    ):
+        from edgekit.services.certificates import install_letsencrypt
+
+        outcome = await install_letsencrypt(db_session, config)
+
+        assert outcome["status"] == "issued"
+        request = npm.requested[0]
+        assert request["domain_names"] == ["*.example.com", "example.com"]
+        assert request["dns_provider"] == "cloudflare"
+        assert request["dns_credentials"] == "dns_cloudflare_api_token=cf-token"
+        assert request["email"] == "ops@blockey.ir"
+
+    async def test_a_certificate_npm_already_holds_is_reused(self, db_session, config, npm):
+        from edgekit.services.certificates import install_letsencrypt
+
+        npm.letsencrypt.append(
+            {"id": 5, "domain_names": ["example.com", "*.example.com"], "expires_on": _npm_time(80)}
+        )
+
+        outcome = await install_letsencrypt(db_session, config)
+
+        assert outcome == {**outcome, "status": "unchanged", "certificate_id": "5"}
+        assert npm.requested == []
+
+    async def test_one_npm_failed_to_renew_is_replaced(self, db_session, config, npm):
+        from edgekit.services.certificates import install_letsencrypt
+
+        npm.letsencrypt.append(
+            {"id": 5, "domain_names": ["*.example.com", "example.com"], "expires_on": _npm_time(5)}
+        )
+
+        assert (await install_letsencrypt(db_session, config))["status"] == "issued"
+
+    async def test_hosts_move_off_the_origin_certificate(
+        self, db_session, config, npm, wildcard_pair
+    ):
+        """NPM hosts edgekit did not create are still on the old certificate after a switch."""
+        from edgekit.services.certificates import install_letsencrypt, install_manual_certificate
+
+        origin = await install_manual_certificate(db_session, config, *wildcard_pair)
+        issued = await install_letsencrypt(db_session, config)
+
+        assert npm.repointed == [
+            (int(origin["certificate_id"]), int(issued["certificate_id"]))
+        ]
+
+    async def test_switching_back_reinstalls_the_origin_certificate(
+        self, db_session, config, npm, wildcard_pair
+    ):
+        """The origin certificate's fingerprint must not make it look installed after a switch."""
+        from edgekit.services.certificates import install_letsencrypt, install_manual_certificate
+
+        await install_manual_certificate(db_session, config, *wildcard_pair)
+        await install_letsencrypt(db_session, config)
+
+        back = await install_manual_certificate(db_session, config, *wildcard_pair)
+
+        assert back["status"] == "installed"
+        assert len(npm.uploads) == 2
+
+    async def test_a_placeholder_npm_email_is_refused_before_asking_npm(
+        self, db_session, config, npm
+    ):
+        from edgekit.services.certificates import install_letsencrypt
+
+        config.npm.admin_email = "admin@example.com"
+
+        with pytest.raises(CertificateError, match="npm password --email"):
+            await install_letsencrypt(db_session, config)
+        assert npm.requested == []
+
+
+@pytest.mark.parametrize(
+    "email,placeholder",
+    [
+        ("admin@example.com", True),
+        ("root@localhost", True),
+        ("me@server.local", True),
+        ("ops@blockey.ir", False),
+        ("someone@gmail.com", False),
+    ],
+)
+def test_placeholder_emails_are_recognised(email, placeholder):
+    from edgekit.services.certificates import is_placeholder_email
+
+    assert is_placeholder_email(email) is placeholder
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["2026-12-13 10:00:00", "2026-12-13T10:00:00Z", "2026-12-13T10:00:00+00:00"],
+)
+def test_npm_timestamps_parse_as_utc(raw):
+    from edgekit.services.certificates import parse_npm_timestamp
+
+    assert parse_npm_timestamp(raw) == dt.datetime(2026, 12, 13, 10, tzinfo=dt.timezone.utc)
+
+
+def test_an_unparseable_npm_timestamp_is_none():
+    from edgekit.services.certificates import parse_npm_timestamp
+
+    assert parse_npm_timestamp("soon") is None
+    assert parse_npm_timestamp(None) is None
 
 
 class TestValidatePair:

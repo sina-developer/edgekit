@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Update — edgekit{% endblock %}
+{# While the job runs, reload to follow the log. The panel itself restarts part way through,
+   so a reload may briefly fail — the next one picks up where it left off. #}
+{% block head %}{% if job.running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block crumb %}
+<a class="dim" href="/settings">Settings</a> {% include "icons/chevron-right.svg" %}
+Update
+{% endblock %}
+
+{% block topbar_actions %}
+<a class="ghost icon button" href="/settings/update" title="Refresh" aria-label="Refresh">
+  {% include "icons/refresh.svg" %}
+</a>
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Update edgekit</h1>
+    <p class="lede">
+      Running <span class="mono">{{ version }}</span>. Updating fetches the latest edgekit,
+      reinstalls it, restarts the panel and re-runs the provisioner. Settings, peers, hosts
+      and certificates are kept.
+    </p>
+  </div>
+</div>
+
+<section class="card">
+  <div class="card-head">
+    <div>
+      <h2>Status</h2>
+      <p class="card-desc">
+        {% if job.running %}
+        Updating. This page refreshes every few seconds; the panel restarts part way
+        through, so it may be unavailable for a moment.
+        {% elif job.exit_code == 0 %}
+        The last update finished successfully.
+        {% elif job.exit_code is not none %}
+        The last update failed (exit {{ job.exit_code }}). The log below says why.
+        {% else %}
+        No update has been started from the panel yet.
+        {% endif %}
+      </p>
+    </div>
+    <span class="pill {{ 'warn' if job.running else ('ok' if job.exit_code == 0 else '') }}">
+      {% if job.running %}Running{% elif job.exit_code == 0 %}Succeeded{% elif job.exit_code is not none %}Failed{% else %}Idle{% endif %}
+    </span>
+  </div>
+  <div class="card-body danger-zone">
+    <div class="danger-row">
+      <div>
+        <strong>Update now</strong>
+        <p class="sub" style="margin-top:4px">
+          The same as <span class="mono">sudo edgekit update</span> over SSH.
+        </p>
+      </div>
+      <form method="post" action="/settings/update"
+            data-confirm="edgekit fetches the latest release, reinstalls itself and re-runs the provisioner. The panel restarts during the update."
+            data-confirm-title="Update edgekit?"
+            data-confirm-action="Update">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <button class="primary" type="submit" {{ 'disabled' if job.running }}>
+          {% include "icons/refresh.svg" %} Update
+        </button>
+      </form>
+    </div>
+  </div>
+</section>
+
+{% if job.output %}
+<section class="card">
+  <div class="log-head">
+    {% include "icons/terminal.svg" %}
+    <span class="mono">edgekit update</span>
+    <span class="muted small" style="margin-left:auto">{{ 'live' if job.running else 'last run' }}</span>
+  </div>
+  <div class="card-body" style="padding-top:16px">
+    <pre id="update-log" class="code scroll">{{ job.output }}</pre>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

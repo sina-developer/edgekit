@@ -18,17 +18,64 @@ from .hosts import (
     SETTING_CERT_EXPIRY,
     SETTING_CERT_FINGERPRINT,
     SETTING_CERT_ID,
+    SETTING_CERT_KIND,
     SETTING_CERT_NAME,
     get_setting,
     set_setting,
 )
-from .npm import NPMClient
+from .npm import NPMClient, NPMError
 
 log = logging.getLogger("edgekit.certificates")
+
+KIND_ORIGIN = "origin"
+KIND_LETSENCRYPT = "letsencrypt"
+
+#: Let's Encrypt certificates last 90 days and NPM renews them with 30 left, so one inside
+#: that window is one NPM has failed to renew — issuing afresh is the useful response.
+LETSENCRYPT_REISSUE_DAYS = 30
+
+_PLACEHOLDER_EMAIL_DOMAINS = ("example.com", "example.net", "example.org")
+_PLACEHOLDER_EMAIL_SUFFIXES = (".example", ".test", ".invalid", ".localhost", ".local")
 
 
 class CertificateError(RuntimeError):
     pass
+
+
+def is_placeholder_email(email: str) -> bool:
+    """Addresses Let's Encrypt refuses to register an account under — NPM's default among them."""
+    domain = (email or "").rpartition("@")[2].strip().lower()
+    return (
+        "." not in domain
+        or domain in _PLACEHOLDER_EMAIL_DOMAINS
+        or domain.endswith(_PLACEHOLDER_EMAIL_SUFFIXES)
+    )
+
+
+def parse_npm_timestamp(value: object) -> dt.datetime | None:
+    """NPM reports times as ``2026-12-01 10:00:00`` (UTC) or ISO 8601, depending on the build."""
+    if not value:
+        return None
+    text = str(value).strip().replace(" ", "T", 1).replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _recorded_kind(session: Session) -> str:
+    return get_setting(session, SETTING_CERT_KIND) or KIND_ORIGIN
+
+
+async def _move_hosts(npm: NPMClient, previous_id: str, new_id: int | str) -> None:
+    """Move NPM's hosts off the certificate edgekit recorded before — its own and any others.
+
+    Uploads only sweep records carrying the same label, so a switch between modes, whose
+    certificates are named differently, would otherwise leave hosts on the old kind.
+    """
+    if previous_id.isdigit() and int(previous_id) != int(new_id):
+        await npm.repoint_hosts(int(previous_id), int(new_id))
 
 
 @dataclass(slots=True)
@@ -191,9 +238,10 @@ async def issue_and_install(
 
     name = certificate_name(cf_config.zone_name)
     hostnames = certificate_hostnames(cf_config.zone_name)
+    previous_id = get_setting(session, SETTING_CERT_ID)
 
-    if not force:
-        existing_id = get_setting(session, SETTING_CERT_ID)
+    if not force and _recorded_kind(session) == KIND_ORIGIN:
+        existing_id = previous_id
         expiry_raw = get_setting(session, SETTING_CERT_EXPIRY)
         if existing_id and expiry_raw:
             try:
@@ -222,9 +270,10 @@ async def issue_and_install(
         cert_id = await npm.upload_custom_certificate(
             name, cert.certificate_pem, cert.private_key_pem
         )
+        await _move_hosts(npm, previous_id, cert_id)
 
     expires = certificate_expiry(cert.certificate_pem)
-    _record(session, cert_id, name, expires, cert.certificate_pem)
+    _record(session, cert_id, name, expires, certificate_pem=cert.certificate_pem, kind=KIND_ORIGIN)
     session.add(
         AuditLog(
             actor=actor,
@@ -248,12 +297,22 @@ def _record(
     cert_id: int | str,
     name: str,
     expires: dt.datetime | None,
-    certificate_pem: str,
+    *,
+    certificate_pem: str | None,
+    kind: str,
 ) -> None:
     set_setting(session, SETTING_CERT_ID, str(cert_id))
     set_setting(session, SETTING_CERT_NAME, name)
     set_setting(session, SETTING_CERT_EXPIRY, expires.isoformat() if expires else "")
-    set_setting(session, SETTING_CERT_FINGERPRINT, certificate_fingerprint(certificate_pem))
+    # NPM holds a Let's Encrypt certificate itself and replaces it on renewal, so there is no
+    # fixed PEM to fingerprint — and a stale fingerprint would make a later switch back to
+    # proxied mode believe the origin certificate was still installed.
+    set_setting(
+        session,
+        SETTING_CERT_FINGERPRINT,
+        certificate_fingerprint(certificate_pem) if certificate_pem else "",
+    )
+    set_setting(session, SETTING_CERT_KIND, kind)
 
 
 async def _already_installed(
@@ -268,7 +327,7 @@ async def _already_installed(
     """
     recorded_id = get_setting(session, SETTING_CERT_ID)
     recorded_print = get_setting(session, SETTING_CERT_FINGERPRINT)
-    if not (recorded_id and recorded_print):
+    if not (recorded_id and recorded_print) or _recorded_kind(session) != KIND_ORIGIN:
         return None
     if recorded_print != certificate_fingerprint(certificate_pem):
         return None
@@ -295,6 +354,7 @@ async def install_manual_certificate(
     """
     name = name or certificate_name(config.cloudflare.zone_name or config.server.hostname)
     expires = certificate_expiry(certificate_pem)
+    previous_id = get_setting(session, SETTING_CERT_ID)
     npm_config = config.npm
     async with NPMClient(
         npm_config.api_base, npm_config.admin_email, npm_config.admin_password
@@ -309,11 +369,94 @@ async def install_manual_certificate(
                     "expires": expires.isoformat() if expires else "",
                 }
         cert_id = await npm.upload_custom_certificate(name, certificate_pem, key_pem)
+        await _move_hosts(npm, previous_id, cert_id)
 
-    _record(session, cert_id, name, expires, certificate_pem)
+    _record(session, cert_id, name, expires, certificate_pem=certificate_pem, kind=KIND_ORIGIN)
     session.add(AuditLog(actor=actor, action="certificate.install", target=name))
     return {
         "status": "installed",
         "certificate_id": str(cert_id),
         "expires": expires.isoformat() if expires else "",
+    }
+
+
+def letsencrypt_name(zone_name: str) -> str:
+    return f"Let's Encrypt - {zone_name}"
+
+
+async def install_letsencrypt(
+    session: Session, config: Config, *, actor: str = "system", force: bool = False
+) -> dict[str, str]:
+    """Have NPM issue, and from then on renew, a Let's Encrypt wildcard for direct mode.
+
+    In direct mode browsers connect to this server themselves, so the certificate has to
+    chain to a public CA. The challenge goes through Cloudflare DNS: that is the only way to
+    get a wildcard, and it does not need Let's Encrypt to reach this server on port 80.
+    Idempotent: a certificate NPM already holds for these names is reused.
+    """
+    cf = config.cloudflare
+    if not (cf.api_token and cf.zone_name):
+        raise CertificateError(
+            "Direct mode issues a Let's Encrypt certificate through a Cloudflare DNS challenge, "
+            "which needs the Cloudflare API token: `edgekit cloudflare token --zone <zone>`."
+        )
+    npm_config = config.npm
+    if is_placeholder_email(npm_config.admin_email):
+        raise CertificateError(
+            "Let's Encrypt registers the certificate under the Nginx Proxy Manager admin email, "
+            f"and refuses {npm_config.admin_email or 'an empty address'}. Change the admin "
+            "account's email inside NPM (Users -> Edit), then store it with "
+            "`edgekit npm password --email <address>`."
+        )
+
+    hostnames = certificate_hostnames(cf.zone_name)
+    name = letsencrypt_name(cf.zone_name)
+    previous_id = get_setting(session, SETTING_CERT_ID)
+    now = dt.datetime.now(dt.timezone.utc)
+
+    async with NPMClient(
+        npm_config.api_base, npm_config.admin_email, npm_config.admin_password
+    ) as npm:
+        existing = None if force else await npm.find_letsencrypt_certificate(hostnames)
+        expires = parse_npm_timestamp(existing.get("expires_on")) if existing else None
+        if existing and (
+            expires is None or expires - now > dt.timedelta(days=LETSENCRYPT_REISSUE_DAYS)
+        ):
+            cert_id, status = int(existing["id"]), "unchanged"
+        else:
+            try:
+                created = await npm.create_letsencrypt_certificate(
+                    name,
+                    hostnames,
+                    dns_provider="cloudflare",
+                    dns_credentials=f"dns_cloudflare_api_token={cf.api_token}",
+                    email=npm_config.admin_email,
+                )
+            except NPMError as exc:
+                raise CertificateError(
+                    "Nginx Proxy Manager could not obtain the Let's Encrypt certificate. To do "
+                    "it, the container installs certbot-dns-cloudflare from PyPI, writes a TXT "
+                    "record through the Cloudflare API, and calls acme-v02.api.letsencrypt.org "
+                    "— a filtered network can block any of the three. See "
+                    f"`docker logs {npm_config.container_name} --tail 200`.\n{exc}"
+                ) from exc
+            cert_id, status = int(created["id"]), "issued"
+            expires = parse_npm_timestamp(created.get("expires_on"))
+        await _move_hosts(npm, previous_id, cert_id)
+
+    _record(session, cert_id, name, expires, certificate_pem=None, kind=KIND_LETSENCRYPT)
+    if status != "unchanged":
+        session.add(
+            AuditLog(
+                actor=actor,
+                action="certificate.letsencrypt",
+                target=name,
+                detail=f"hostnames={', '.join(hostnames)} npm_id={cert_id}",
+            )
+        )
+    return {
+        "status": status,
+        "certificate_id": str(cert_id),
+        "expires": expires.isoformat() if expires else "",
+        "hostnames": ", ".join(hostnames),
     }

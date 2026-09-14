@@ -34,6 +34,9 @@ SETTING_CERT_EXPIRY = "npm_certificate_expiry"
 #: "new certificate" and skip the upload. NPM has no update-in-place, so every upload means
 #: a new record, re-pointed hosts, and a deleted old one — churn worth avoiding.
 SETTING_CERT_FINGERPRINT = "npm_certificate_fingerprint"
+#: "origin" or "letsencrypt" — which mode the installed certificate was installed for, so a
+#: mode switch is never mistaken for "already installed". Empty on older installs: origin.
+SETTING_CERT_KIND = "npm_certificate_kind"
 
 
 class HostError(RuntimeError):
@@ -253,7 +256,7 @@ class HostService:
                             self.config.cloudflare.zone_id,
                             host.domain,
                             self.config.server.public_ip,
-                            proxied=self.config.cloudflare.proxied,
+                            proxied=self.config.dns_proxied,
                         )
                         host.cloudflare_record_id = record.get("id")
                     except CloudflareError as exc:
@@ -317,6 +320,28 @@ class HostService:
             f"nginx rejected the configuration for {domain}; the previous configuration was "
             f"restored.\n{output}"
         )
+
+    async def attach_certificate(self) -> list[str]:
+        """Re-push every host not yet serving the current certificate. Returns their domains.
+
+        A mode switch replaces the certificate, and a host left on the old one keeps serving
+        a certificate that is wrong for the new mode.
+        """
+        current = self.certificate_id()
+        moved: list[str] = []
+        failures: list[str] = []
+        for host in self.list():
+            if host.npm_host_id and host.npm_certificate_id == current:
+                continue
+            try:
+                await self._push(host, manage_dns=False)
+            except (HostError, NPMError) as exc:
+                failures.append(f"{host.domain}: {exc}")
+                continue
+            moved.append(host.domain)
+        if failures:
+            raise HostError("Could not attach the certificate to: " + "; ".join(failures))
+        return moved
 
     async def resync_all(self) -> dict[str, str]:
         """Re-push every host. Used after a certificate rotation or an NPM data loss."""

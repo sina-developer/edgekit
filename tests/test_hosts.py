@@ -43,6 +43,7 @@ class FakeNPM:
 class FakeCloudflare:
     def __init__(self, *, fail: bool = False) -> None:
         self.records: list[tuple[str, str]] = []
+        self.proxied: list[bool] = []
         self.deleted: list[str] = []
         self.fail = fail
 
@@ -58,6 +59,7 @@ class FakeCloudflare:
 
             raise CloudflareError("zone is not editable")
         self.records.append((name, ip))
+        self.proxied.append(proxied)
         return {"id": f"rec-{len(self.records)}"}
 
     async def delete_dns_record(self, zone_id, record_id):
@@ -195,6 +197,27 @@ class TestLifecycle:
 
         assert outcomes == {"a.example.com": "ok", "b.example.com": "ok"}
         assert len(service.fake_npm.upserted) == 2
+
+    async def test_direct_mode_publishes_dns_only_records(self, service, config):
+        """A proxied record in direct mode would put Cloudflare back in front of visitors."""
+        config.tls.mode = "direct"
+        await service.create(domain="a.example.com", forward_port=80, forward_host="10.50.0.2")
+        assert service.fake_cf.proxied == [False]
+
+    async def test_attaching_the_certificate_moves_only_hosts_on_another_one(
+        self, service, db_session
+    ):
+        await service.create(domain="a.example.com", forward_port=80, forward_host="10.50.0.2")
+        b = await service.create(domain="b.example.com", forward_port=81,
+                                 forward_host="10.50.0.3")
+        set_setting(db_session, "npm_certificate_id", "12")
+        b.npm_certificate_id = 12
+        service.fake_npm.upserted.clear()
+
+        moved = await service.attach_certificate()
+
+        assert moved == ["a.example.com"]
+        assert [spec.certificate_id for spec in service.fake_npm.upserted] == [12]
 
     async def test_repointing_a_peer_updates_its_hosts(self, service, db_session, config):
         peer = PeerService(db_session, config).create("pi")

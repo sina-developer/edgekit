@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from edgekit import __version__, jobs
 from edgekit.db import session_scope
 from edgekit.models import User
 from edgekit.security import hash_password
@@ -204,6 +205,97 @@ class TestDiagnosticsPage:
         assert "Running checks" in response.text
         assert 'data-diagnostics-src="/api/health"' in response.text
         assert "Every required check passed" not in response.text
+
+
+class TestUpdateAndRemoval:
+    @pytest.fixture
+    def launched(self, monkeypatch):
+        calls: list[tuple[str, list[str]]] = []
+        monkeypatch.setattr("edgekit.jobs.launch", lambda job, args: calls.append((job, args)))
+        return calls
+
+    def _state(self, monkeypatch, **fields):
+        state = jobs.JobState(**{"running": False, "exit_code": None, "output": "", **fields})
+        monkeypatch.setattr("edgekit.jobs.state", lambda job, lines=400: state)
+
+    def test_the_update_page_shows_the_running_version(self, auth_client, monkeypatch):
+        self._state(monkeypatch)
+
+        response = auth_client.get("/settings/update")
+
+        assert response.status_code == 200
+        assert __version__ in response.text
+        assert "Idle" in response.text
+        assert 'http-equiv="refresh"' not in response.text
+
+    def test_a_running_update_follows_its_log(self, auth_client, monkeypatch):
+        self._state(monkeypatch, running=True, output="Fetching https://github.com/…")
+
+        response = auth_client.get("/settings/update")
+
+        assert 'http-equiv="refresh"' in response.text
+        assert "Fetching https://github.com/…" in response.text
+
+    def test_a_failed_update_says_so(self, auth_client, monkeypatch):
+        self._state(monkeypatch, exit_code=1, output="pip could not install")
+
+        response = auth_client.get("/settings/update")
+
+        assert "Failed" in response.text
+        assert "exit 1" in response.text
+
+    def test_starting_an_update_launches_the_job(self, auth_client, launched):
+        response = auth_client.post(
+            "/settings/update", data={"csrf_token": _csrf_for(auth_client)}
+        )
+
+        assert response.status_code == 303
+        assert response.headers["location"] == "/settings/update"
+        assert launched == [("update", ["update"])]
+
+    def test_an_update_without_a_csrf_token_is_refused(self, auth_client, launched):
+        response = auth_client.post("/settings/update", data={})
+
+        assert response.status_code == 403
+        assert launched == []
+
+    def test_a_launch_failure_reaches_the_operator(self, auth_client, monkeypatch):
+        def unavailable(job, args):
+            raise jobs.JobError("systemd-run is not available")
+
+        monkeypatch.setattr("edgekit.jobs.launch", unavailable)
+
+        response = auth_client.post(
+            "/settings/update", data={"csrf_token": _csrf_for(auth_client)}
+        )
+
+        assert "systemd-run" in response.headers["location"]
+
+    def test_the_settings_page_offers_update_and_removal(self, auth_client):
+        response = auth_client.get("/settings")
+
+        assert 'href="/settings/update"' in response.text
+        assert 'action="/settings/uninstall"' in response.text
+
+    def test_removal_requires_typing_remove(self, auth_client, launched):
+        response = auth_client.post(
+            "/settings/uninstall",
+            data={"csrf_token": _csrf_for(auth_client), "confirm": "yes"},
+        )
+
+        assert response.status_code == 303
+        assert "error=" in response.headers["location"]
+        assert launched == []
+
+    def test_confirmed_removal_starts_outside_the_panel(self, auth_client, launched):
+        response = auth_client.post(
+            "/settings/uninstall",
+            data={"csrf_token": _csrf_for(auth_client), "confirm": "Remove", "keep_dns": "true"},
+        )
+
+        assert response.status_code == 200
+        assert "being removed" in response.text
+        assert launched == [("uninstall", ["uninstall", "--yes", "--keep-dns"])]
 
 
 def _csrf_for(client: TestClient) -> str:

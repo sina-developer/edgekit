@@ -53,6 +53,8 @@ interaction at all:
 sudo EDGEKIT_PUBLIC_IP=52.56.216.78 \
      EDGEKIT_WG_SUBNET=10.50.0.0/24 \
      EDGEKIT_ZONE=blockey.ir \
+     EDGEKIT_CF_TOKEN='cloudflare-api-token' \
+     EDGEKIT_SSL_MODE=proxied \
      EDGEKIT_CERT_PATH=/root/origin.pem \
      EDGEKIT_KEY_PATH=/root/origin.key \
      EDGEKIT_PANEL_PASSWORD='a-long-password' \
@@ -66,7 +68,10 @@ sudo EDGEKIT_PUBLIC_IP=52.56.216.78 \
 | `EDGEKIT_NPM_EMAIL` / `EDGEKIT_NPM_PASSWORD` | Nginx Proxy Manager admin account |
 | `EDGEKIT_NPM_HTTP_PORT` / `EDGEKIT_NPM_HTTPS_PORT` / `EDGEKIT_NPM_ADMIN_PORT` | Proxy ports |
 | `EDGEKIT_ZONE` | Your root domain, e.g. `example.com` |
-| `EDGEKIT_CERT_PATH` / `EDGEKIT_KEY_PATH` | Origin certificate and key to install |
+| `EDGEKIT_CF_TOKEN` | Cloudflare API token — required, see [SSL](#ssl-proxied-or-direct) |
+| `EDGEKIT_CF_ORIGIN_CA_KEY` | Optional Origin CA Key, for issuing the origin certificate via the API |
+| `EDGEKIT_SSL_MODE` | `proxied` (default) or `direct` |
+| `EDGEKIT_CERT_PATH` / `EDGEKIT_KEY_PATH` | Origin certificate and key to install (proxied mode) |
 | `EDGEKIT_PANEL_USER` / `EDGEKIT_PANEL_PASSWORD` / `EDGEKIT_PANEL_PORT` | Panel account |
 | `EDGEKIT_PANEL_BIND` | Panel listen address (default: WireGuard hub IP) |
 | `EDGEKIT_PANEL_SUBDOMAIN` | Public panel hostname label (default: `edgekit`) |
@@ -118,79 +123,88 @@ sudo EDGEKIT_PYTHON=python3.12 ./install.sh
 The same variables apply to `edgekit setup` and `edgekit update`, which install WireGuard,
 Docker, and Python packages the same way.
 
-### Cloudflare: three one-time clicks
+### SSL: proxied or direct
 
-edgekit does not need Cloudflare API credentials. These are one-time dashboard actions, and
-setup prints this checklist with your real IP filled in.
+Setup asks for a Cloudflare API token and an SSL mode, then makes three things agree: the DNS
+records' proxy status, the zone's SSL/TLS mode, and the certificate on this server. They have
+to — the certificate a browser is shown depends on all three, and one out of step is enough
+for a "Not secure" page. A DNS-only record in front of a Cloudflare Origin certificate, for
+example, hands browsers a certificate that only Cloudflare's proxy trusts.
 
-**1. DNS** (DNS → Records) — two proxied A records:
+| | `proxied` (default) | `direct` |
+|---|---|---|
+| Visitors connect to | Cloudflare (orange cloud) | this server (DNS only, grey cloud) |
+| Certificate on this server | Cloudflare Origin CA, `*.zone` + `zone` | Let's Encrypt, `*.zone` + `zone` |
+| Cloudflare SSL/TLS mode | Full (strict), set by edgekit | not in the path |
+| Renewal | none needed for 15 years | NPM renews it automatically |
+| Choose it when | Cloudflare can reach this server on 443 | Cloudflare answers **525**: its connection to this server is blocked or reset |
 
-| Type | Name | Content | Proxy |
-|---|---|---|---|
-| A | `@` | your server IP | Proxied |
-| A | `*` | your server IP | Proxied |
+Every A record pointing at this server — hand-made ones included — gets the proxy status the
+mode calls for. Provisioning then connects to every hostname the way a browser does and
+**fails if a browser would reject the certificate it is shown**, waiting out a DNS change it
+has only just made. Switch modes at any time; this re-applies DNS, SSL mode and certificate,
+then verifies:
 
-The wildcard covers every subdomain you will ever add.
+```bash
+sudo edgekit ssl mode direct
+sudo edgekit ssl verify
+```
 
-**2. SSL/TLS** (SSL/TLS → Overview) — set the mode to **Full (strict)**. Not Flexible:
-Flexible leaves the Cloudflare-to-server hop unencrypted.
+**The token** — dash.cloudflare.com/profile/api-tokens → Create Token → Custom token, with Zone
+Resources including your zone — needs **Zone:Read**, **DNS:Edit** and **Zone Settings:Edit**.
+Add **SSL and Certificates:Edit** if you want edgekit to issue the origin certificate itself;
+Cloudflare's Origin CA endpoint is user-scoped, so an account-owned token cannot do that part
+(paste the certificate instead, or pass `--origin-ca-key`). `edgekit cloudflare verify` prints
+a per-permission tick list.
 
-**3. Origin certificate** (SSL/TLS → Origin Server → Create Certificate) — accept the
-defaults, set the hostnames to `*.yourdomain` and `yourdomain`. Cloudflare shows an **Origin
-Certificate** and a **Private Key**; the key is shown once only. Interactive setup asks you
-to paste both and writes them to `/root/origin.pem` and `/root/origin.key`. Or install later:
+**Proxied mode's certificate** — paste it during setup, or create it under SSL/TLS → Origin
+Server → Create Certificate with the hostnames `*.yourdomain` and `yourdomain` and install it:
 
 ```bash
 sudo edgekit cert install --cert /root/origin.pem --key /root/origin.key
 ```
 
-One certificate serves every subdomain for 15 years. edgekit checks that the key matches the
-certificate, that it has not expired, and that it covers the hostnames this edge serves before
-installing — a mismatched pair otherwise shows up much later as a Cloudflare 525. Installing
-the certificate that is already installed is a no-op: NPM cannot update one in place, so a
-re-upload would rewrite every proxy host's SSL configuration for nothing.
+edgekit checks that the key matches the certificate, that it has not expired, and that it
+covers the hostnames this edge serves before installing — a mismatched pair otherwise shows up
+much later as a Cloudflare 525. Installing the certificate that is already installed is a
+no-op: NPM cannot update one in place, so a re-upload would rewrite every proxy host's SSL
+configuration for nothing.
 
-After that, adding a service needs no Cloudflare work at all: the wildcard DNS record and the
+**Direct mode's certificate** is issued by Nginx Proxy Manager through a Cloudflare DNS
+challenge, so Let's Encrypt never needs to reach this server on port 80. Let's Encrypt
+registers it under the NPM admin email, which therefore has to be a real address rather than
+`admin@example.com`. The NPM container installs `certbot-dns-cloudflare` from PyPI and calls
+`acme-v02.api.letsencrypt.org`; both must be reachable from this server.
+
+Either way, adding a service later needs no Cloudflare work: the wildcard record and the
 wildcard certificate already cover it.
 
-### Diagnosing a 525 or 526
+### Diagnosing TLS
 
 `edgekit doctor` walks the TLS path one layer at a time, in the order the request travels, so
-a failure names the layer that broke instead of leaving four symptoms to correlate:
+a failure names the layer that broke instead of leaving symptoms to correlate:
 
 | Check | What it proves |
 |---|---|
+| `cf_dns_proxy`, `cf_ssl_mode` | DNS records and the zone's SSL mode match the mode, read from the Cloudflare API |
 | `origin_cert`, `cert_expiry`, `cert_coverage` | a certificate is installed, still valid, and names every host you serve |
 | `nginx_config` | `nginx -t` inside the NPM container — a vhost it refuses cannot complete a handshake |
 | `local_tls_<host>` | TLS to `127.0.0.1:443` with the vhost as SNI |
 | `origin_tls_<host>` | the same TLS to your public IP — the hop Cloudflare makes |
-| `public_<host>` | the full path through Cloudflare |
+| `public_<host>` | what a browser is shown: where DNS points and whether the certificate verifies |
 
-Read it as: local TLS good but origin TLS bad means port 443 is not reaching the host — a
-cloud-firewall problem, not a certificate one. Both good but Cloudflare reporting **525**
-means the handshake failed with Cloudflare specifically; **526** means the handshake worked
-and Cloudflare would not accept the certificate (expired, wrong hostname, or a CA it does not
-trust under Full (strict)).
+Read it as:
 
-<details>
-<summary>Optional: automating DNS through the Cloudflare API</summary>
-
-If you would rather have edgekit create a DNS record per proxy host, enable the API under
-Settings → Cloudflare API, or:
-
-```bash
-sudo edgekit cloudflare token --zone example.com
-```
-
-The token needs **Zone:Read**, **DNS:Edit** and **Zone Settings:Edit**, with Zone Resources
-including the zone. `edgekit cloudflare verify` prints a per-permission tick list.
-
-Note that Cloudflare's Origin CA endpoint is **user-scoped**: an account-owned token (created
-from `dash.cloudflare.com/<account-id>/api-tokens`) can manage DNS but cannot issue
-certificates. Pass `--origin-ca-key` if you want that automated too. This is exactly the
-complexity the manual path avoids.
-
-</details>
+- **Public check shows the Cloudflare Origin certificate** — browsers are bypassing Cloudflare:
+  a DNS-only record in proxied mode. `edgekit provision` proxies it.
+- **Local TLS good, origin TLS bad** — port 443 is not reaching the host: a cloud-firewall
+  problem, not a certificate one.
+- **Both good but Cloudflare answers 525** — Cloudflare's own connection to this server fails.
+  If nothing on the server explains it, `edgekit ssl mode direct` takes that hop out.
+- **526** — the handshake worked and Cloudflare would not accept the certificate (expired,
+  wrong hostname, or a CA it does not trust under Full (strict)).
+- **Handshake ok, no HTTP response** — TLS is fine; the service behind the host is down or
+  slow (an offline peer looks exactly like this).
 
 ### The one thing edgekit cannot do for you
 
@@ -320,6 +334,42 @@ sudo edgekit update --skip-provision                   # package + restart only
 
 `edgekit provision` remains the repair tool. It is safe to run repeatedly and will re-do
 only the steps that are not already in the desired state.
+
+---
+
+### From the panel
+
+**Settings → Maintenance → Update edgekit** (or **Update edgekit** on the overview) runs the same
+`edgekit update` without SSH. It runs as a transient systemd unit, `edgekit-update`, rather
+than inside the panel: the update restarts the panel, and would otherwise be killed along
+with it. The page follows the log live and reports whether the run succeeded.
+
+---
+
+## Removing edgekit
+
+```bash
+sudo edgekit uninstall            # asks you to type "remove"
+sudo edgekit uninstall --keep-dns # leave the DNS records edgekit created in Cloudflare
+```
+
+Or **Settings → Maintenance → Remove edgekit** in the panel. Removal deletes everything edgekit
+created on this server:
+
+- the panel service and every panel account
+- Nginx Proxy Manager — containers, image, and `/opt/nginx-proxy-manager` with every proxy
+  host, certificate and login in it
+- the WireGuard interface, its `wg0.conf` and keys (every peer is disconnected)
+- edgekit's iptables rules, ufw openings, systemd units and sysctl drop-in
+- `/etc/edgekit`, `/var/lib/edgekit`, `/var/log/edgekit`, `/root/origin.pem` and
+  `/root/origin.key` — settings, credentials and records
+- the DNS records edgekit created in Cloudflare (those tagged *Managed by edgekit*; records
+  you added yourself are kept), unless `--keep-dns`
+- edgekit itself: `/opt/edgekit` and `/usr/local/bin/edgekit`
+
+It keeps the Docker and WireGuard packages, which other software may use, and ufw with its SSH
+rule, so removal cannot lock you out. Every step is attempted even if an earlier one fails,
+and the output lists what, if anything, was left behind.
 
 ---
 
