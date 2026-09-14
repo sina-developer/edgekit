@@ -40,6 +40,11 @@ WRITABLE_HOST_FIELDS = (
 )
 
 
+#: DNS-01 issuance is synchronous inside NPM: it installs the certbot DNS plugin, publishes the
+#: TXT record, waits out propagation and talks to Let's Encrypt before answering.
+LETSENCRYPT_TIMEOUT = 600.0
+
+
 class NPMError(RuntimeError):
     """An NPM API call failed."""
 
@@ -421,9 +426,7 @@ class NPMClient:
             if int(host.get("certificate_id") or 0) == int(cert_id)
         ]
 
-    #: DNS-01 issuance is synchronous inside NPM: it installs the certbot DNS plugin, publishes
-    #: the TXT record, waits out propagation and talks to Let's Encrypt before answering.
-    LETSENCRYPT_TIMEOUT = 600.0
+    LETSENCRYPT_TIMEOUT = LETSENCRYPT_TIMEOUT
 
     async def find_letsencrypt_certificate(self, domains: list[str]) -> dict[str, Any] | None:
         """The newest Let's Encrypt certificate covering exactly ``domains``, if any."""
@@ -477,7 +480,10 @@ class NPMClient:
         except NPMError as exc:
             if exc.status_code != 400:
                 raise
-            log.info("NPM refused the legacy certificate request; retrying without it: %s", exc)
+            # Expected on current NPM builds, which reject the old fields outright.
+            log.debug(
+                "NPM rejects the legacy certificate request; sending the current one: %s", exc
+            )
         return await self._request(
             "POST", "/nginx/certificates", json=payload, timeout=self.LETSENCRYPT_TIMEOUT
         )

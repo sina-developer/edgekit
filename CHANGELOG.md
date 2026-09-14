@@ -8,6 +8,14 @@ The single source of truth for the number itself is `src/edgekit/__init__.py`
 
 ## [Unreleased]
 
+- Issuing the Let's Encrypt certificate no longer looks hung. NPM answers only once it has
+  installed the certbot Cloudflare plugin, published and propagated the TXT record, and been
+  issued the certificate — minutes on a slow link. Provisioning now reports every 15 seconds
+  how long it has waited and NPM's latest certificate log line. A request that outlasts the
+  10-minute limit fails with a message saying NPM may still finish and a later
+  `edgekit provision` picks the certificate up, instead of an unhandled timeout.
+- NPM rejecting the legacy certificate request shape is expected on current builds and is
+  logged at debug level; it used to print a full error before the retry that succeeds.
 - When Cloudflare answers 525 in proxied mode, setup, `provision`, `update` and `ssl` offer to
   switch to direct mode on the spot. A 525 while TLS on the server passes means the network
   between Cloudflare and the server resets the handshake — measured here at 43 of 45 requests

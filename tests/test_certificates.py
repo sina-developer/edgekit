@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import logging
 
+import httpx
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -156,6 +159,9 @@ class FakeNPMClient:
         self.repointed: list[tuple[int, int]] = []
         self.letsencrypt: list[dict] = []
         self.requested: list[dict] = []
+        #: How long a Let's Encrypt request takes, and what it fails with, if anything.
+        self.issuance_delay = 0.0
+        self.issuance_error: Exception | None = None
 
     async def __aenter__(self):
         return self
@@ -180,6 +186,10 @@ class FakeNPMClient:
         return matches[-1] if matches else None
 
     async def create_letsencrypt_certificate(self, nice_name, domains, **kwargs) -> dict:
+        if self.issuance_delay:
+            await asyncio.sleep(self.issuance_delay)
+        if self.issuance_error:
+            raise self.issuance_error
         self.next_id += 1
         expires = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=90)
         record = {
@@ -339,6 +349,37 @@ class TestLetsEncrypt:
         assert back["status"] == "installed"
         assert len(npm.uploads) == 2
 
+    async def test_a_slow_issuance_reports_progress_instead_of_looking_hung(
+        self, db_session, config, npm, monkeypatch, caplog
+    ):
+        from edgekit.services import certificates
+
+        monkeypatch.setattr(certificates, "LETSENCRYPT_PROGRESS_INTERVAL", 0.01)
+        monkeypatch.setattr(
+            certificates.dockerx,
+            "logs",
+            lambda container, lines=100: (
+                "\x1b[1;34m[SSL]\x1b[0m › ℹ info Installing cloudflare...\n"
+            ),
+        )
+        npm.issuance_delay = 0.05
+
+        with caplog.at_level(logging.INFO, logger="edgekit.certificates"):
+            outcome = await certificates.install_letsencrypt(db_session, config)
+
+        assert outcome["status"] == "issued"
+        progress = [r.getMessage() for r in caplog.records if "still obtaining" in r.getMessage()]
+        assert progress, "minutes of silence read as a hang"
+        assert "[SSL] › ℹ info Installing cloudflare..." in progress[-1]
+
+    async def test_a_timeout_says_npm_may_still_finish(self, db_session, config, npm):
+        from edgekit.services.certificates import install_letsencrypt
+
+        npm.issuance_error = httpx.ReadTimeout("timed out")
+
+        with pytest.raises(CertificateError, match="run `edgekit provision` again"):
+            await install_letsencrypt(db_session, config)
+
     async def test_a_placeholder_npm_email_is_refused_before_asking_npm(
         self, db_session, config, npm
     ):
@@ -375,6 +416,24 @@ def test_npm_timestamps_parse_as_utc(raw):
     from edgekit.services.certificates import parse_npm_timestamp
 
     assert parse_npm_timestamp(raw) == dt.datetime(2026, 12, 13, 10, tzinfo=dt.timezone.utc)
+
+
+def test_the_latest_certificate_line_is_picked_out_of_npm_logs(monkeypatch):
+    from edgekit.services import certificates
+
+    monkeypatch.setattr(
+        certificates.dockerx,
+        "logs",
+        lambda container, lines=100: (
+            "[Nginx] › ℹ info Reloading Nginx\n"
+            "\x1b[32m[SSL]\x1b[0m › ℹ info Requesting LetsEncrypt certificates via Cloudflare\n"
+            "[Global] › ℹ info Backend PID 190 listening\n"
+        ),
+    )
+
+    assert certificates.latest_npm_ssl_line("npm") == (
+        "[SSL] › ℹ info Requesting LetsEncrypt certificates via Cloudflare"
+    )
 
 
 def test_an_unparseable_npm_timestamp_is_none():

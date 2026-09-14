@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
+import re
+import time
+from collections.abc import Awaitable
 from dataclasses import dataclass
+from typing import TypeVar
 
+import httpx
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.oid import NameOID
@@ -13,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from ..config import Config
 from ..models import AuditLog
+from ..system import dockerx
 from .cloudflare import CloudflareClient, certificate_expiry
 from .hosts import (
     SETTING_CERT_EXPIRY,
@@ -23,7 +30,7 @@ from .hosts import (
     get_setting,
     set_setting,
 )
-from .npm import NPMClient, NPMError
+from .npm import LETSENCRYPT_TIMEOUT, NPMClient, NPMError
 
 log = logging.getLogger("edgekit.certificates")
 
@@ -40,6 +47,42 @@ _PLACEHOLDER_EMAIL_SUFFIXES = (".example", ".test", ".invalid", ".localhost", ".
 
 class CertificateError(RuntimeError):
     pass
+
+
+T = TypeVar("T")
+
+#: How often to report on a Let's Encrypt request NPM is still working through. NPM answers
+#: only when it is done — plugin installed, TXT record published and propagated, certificate
+#: issued — which takes minutes on a slow link and looks exactly like a hang without this.
+LETSENCRYPT_PROGRESS_INTERVAL = 15.0
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_NPM_SSL_LINE = re.compile(r"ssl|certbot|certificate|letsencrypt|cloudflare|pip", re.IGNORECASE)
+
+
+def latest_npm_ssl_line(container: str) -> str:
+    """The most recent certificate-related line in NPM's log, for progress reports."""
+    lines = (_ANSI.sub("", line).strip() for line in dockerx.logs(container, 60).splitlines())
+    relevant = [line for line in lines if line and _NPM_SSL_LINE.search(line)]
+    return relevant[-1][:160] if relevant else ""
+
+
+async def _reporting_progress(request: Awaitable[T], container: str) -> T:
+    """Await ``request``, logging how long NPM has been at it and what its log last said."""
+    task = asyncio.ensure_future(request)
+    started = time.monotonic()
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=LETSENCRYPT_PROGRESS_INTERVAL)
+        if done:
+            return task.result()
+        latest = await asyncio.to_thread(latest_npm_ssl_line, container)
+        log.info(
+            "still obtaining the Let's Encrypt certificate (%ds): NPM installs the Cloudflare "
+            "DNS plugin, publishes a TXT record, waits for it to propagate, then asks Let's "
+            "Encrypt%s",
+            time.monotonic() - started,
+            f" — NPM: {latest}" if latest else "",
+        )
 
 
 def is_placeholder_email(email: str) -> bool:
@@ -425,14 +468,25 @@ async def install_letsencrypt(
             cert_id, status = int(existing["id"]), "unchanged"
         else:
             try:
-                created = await npm.create_letsencrypt_certificate(
-                    name,
-                    hostnames,
-                    dns_provider="cloudflare",
-                    dns_credentials=f"dns_cloudflare_api_token={cf.api_token}",
-                    email=npm_config.admin_email,
+                created = await _reporting_progress(
+                    npm.create_letsencrypt_certificate(
+                        name,
+                        hostnames,
+                        dns_provider="cloudflare",
+                        dns_credentials=f"dns_cloudflare_api_token={cf.api_token}",
+                        email=npm_config.admin_email,
+                    ),
+                    npm_config.container_name,
                 )
-            except NPMError as exc:
+            except httpx.TimeoutException as exc:
+                raise CertificateError(
+                    "Nginx Proxy Manager did not finish obtaining the Let's Encrypt certificate "
+                    f"within {int(LETSENCRYPT_TIMEOUT // 60)} minutes. It may still "
+                    "succeed on its own: run `edgekit provision` again in a few minutes, and it "
+                    "reuses a certificate NPM obtained in the meantime. What NPM is doing: "
+                    f"`docker logs {npm_config.container_name} --tail 200`."
+                ) from exc
+            except (NPMError, httpx.HTTPError) as exc:
                 raise CertificateError(
                     "Nginx Proxy Manager could not obtain the Let's Encrypt certificate. To do "
                     "it, the container installs certbot-dns-cloudflare from PyPI, writes a TXT "
