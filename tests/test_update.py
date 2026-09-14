@@ -156,6 +156,7 @@ def test_update_resume_reprovisions_and_skips_the_wizard(monkeypatch, config):
 
     class Report:
         ok = True
+        cloudflare_525 = False
 
     monkeypatch.setattr(
         "edgekit.cli._run_provisioner",

@@ -230,6 +230,20 @@ class TestPublicAssessment:
         assert "TLS is fine" in check.remedy
         assert not retry
 
+    def test_a_server_that_cannot_look_the_name_up_is_not_a_missing_record(self, config):
+        """The reported run: public DNS unreachable, the local resolver blind to the name."""
+        probe = self._probe(
+            resolved_by="server",
+            error="does not resolve on this server: [Errno -2] Name or service not known",
+        )
+
+        check, retry = health.assess_public(probe, config)
+
+        assert check.level is Level.WARN
+        assert "curl -sI https://edgekit.example.com" in check.remedy
+        assert "No A record" not in check.remedy
+        assert not retry, "waiting cannot make this server see public DNS"
+
     def test_a_name_that_does_not_resolve_fails(self, config):
         check, retry = health.assess_public(self._probe(error="does not resolve"), config)
 
@@ -248,16 +262,21 @@ class TestPublicAssessment:
         assert health._issuer_name(ORIGIN_ISSUER) == "CloudFlare, Inc."
 
 
-DOH_CLOUDFLARE = "https://cloudflare-dns.com/dns-query"
-DOH_GOOGLE = "https://dns.google/resolve"
+RESOLVER_URLS = [url for url, _ in health.PUBLIC_RESOLVERS]
 
 
 class TestPublicResolution:
-    """A server's resolver caches "no such name" for 30 minutes; browsers do not use it."""
+    """A server's resolver caches "no such name" for 30 minutes, and on some networks cannot
+    see proxied names at all. Browsers do not use it."""
+
+    def test_resolvers_are_also_reached_by_ip_address(self):
+        """Networks that filter the resolvers' hostnames often still pass their addresses."""
+        assert RESOLVER_URLS[0].startswith("https://1.1.1.1/")
+        assert any(url.startswith("https://8.8.8.8/") for url in RESOLVER_URLS)
 
     @respx.mock
     def test_public_dns_answers_with_its_addresses(self):
-        route = respx.get(DOH_CLOUDFLARE).mock(
+        route = respx.get(RESOLVER_URLS[0]).mock(
             return_value=httpx.Response(200, json={"Status": 0, "Answer": [
                 {"type": 5, "data": "edge.example."},
                 {"type": 1, "data": "188.114.97.3"},
@@ -272,14 +291,15 @@ class TestPublicResolution:
 
     @respx.mock
     def test_a_name_public_dns_does_not_know_is_reported_as_such(self):
-        respx.get(DOH_CLOUDFLARE).mock(return_value=httpx.Response(200, json={"Status": 3}))
+        respx.get(RESOLVER_URLS[0]).mock(return_value=httpx.Response(200, json={"Status": 3}))
 
         assert health.resolve_public("gone.blockey.ir") == ([], "does not exist in public DNS")
 
     @respx.mock
-    def test_a_blocked_resolver_falls_through_to_the_next(self):
-        respx.get(DOH_CLOUDFLARE).mock(side_effect=httpx.ConnectError("blocked"))
-        respx.get(DOH_GOOGLE).mock(
+    def test_blocked_resolvers_fall_through_to_the_next(self):
+        for url in RESOLVER_URLS[:-1]:
+            respx.get(url).mock(side_effect=httpx.ConnectError("blocked"))
+        respx.get(RESOLVER_URLS[-1]).mock(
             return_value=httpx.Response(200, json={"Status": 0, "Answer": [
                 {"type": 1, "data": "195.177.255.61"},
             ]})
@@ -289,8 +309,8 @@ class TestPublicResolution:
 
     @respx.mock
     def test_no_reachable_public_resolver_leaves_it_to_the_server(self):
-        respx.get(DOH_CLOUDFLARE).mock(side_effect=httpx.ConnectError("blocked"))
-        respx.get(DOH_GOOGLE).mock(side_effect=httpx.ConnectError("blocked"))
+        for url in RESOLVER_URLS:
+            respx.get(url).mock(side_effect=httpx.ConnectError("blocked"))
 
         assert health.resolve_public("edgekit.blockey.ir") == (None, "")
 

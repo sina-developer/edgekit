@@ -8,6 +8,16 @@ The single source of truth for the number itself is `src/edgekit/__init__.py`
 
 ## [Unreleased]
 
+- When Cloudflare answers 525 in proxied mode, setup, `provision`, `update` and `ssl` offer to
+  switch to direct mode on the spot. A 525 while TLS on the server passes means the network
+  between Cloudflare and the server resets the handshake — measured here at 43 of 45 requests
+  through Cloudflare failing while 50 of 50 straight to the server succeeded — and nothing on
+  the server can change that.
+- A server that cannot see public DNS no longer fails setup with "No A record answers for this
+  name" after two minutes of waiting. When no DNS-over-HTTPS resolver is reachable and the
+  server's own resolver cannot find the name, the check says it could not be done from this
+  server and gives the command to run elsewhere. Public resolvers are now also tried by
+  address (1.1.1.1, 8.8.8.8), for networks that filter their hostnames.
 - The HTTPS check resolves hostnames through public DNS (DNS-over-HTTPS to Cloudflare, then
   Google) and connects to that address, instead of asking the server's own resolver. That
   resolver caches "no such name" for the zone's SOA minimum — 30 minutes on Cloudflare — so a

@@ -56,6 +56,9 @@ class StepResult:
 @dataclass
 class ProvisionReport:
     results: list[StepResult] = field(default_factory=list)
+    #: Set by the HTTPS check when Cloudflare answered 525: its connections to this server
+    #: fail. The CLI offers direct mode, which does not depend on that path.
+    cloudflare_525: bool = False
 
     @property
     def ok(self) -> bool:
@@ -583,6 +586,7 @@ class Provisioner:
         deadline = loop.time() + self.VERIFY_WINDOW
         pending = domains
         results: dict[str, health.Check] = {}
+        seen: dict[str, health.PublicProbe] = {}
         while True:
             probes = await asyncio.gather(
                 *(asyncio.to_thread(health.probe_public_https, domain) for domain in pending)
@@ -591,6 +595,7 @@ class Provisioner:
             for probe in probes:
                 check, worth_retrying = health.assess_public(probe, self.config)
                 results[probe.domain] = check
+                seen[probe.domain] = probe
                 if worth_retrying and self.dns_applied and check.level is not health.Level.OK:
                     retry.append(probe.domain)
             if not retry or loop.time() + self.VERIFY_INTERVAL > deadline:
@@ -604,6 +609,9 @@ class Provisioner:
             await asyncio.sleep(self.VERIFY_INTERVAL)
             pending = retry
 
+        self.report.cloudflare_525 = self.config.dns_proxied and any(
+            probe.status == 525 for probe in seen.values()
+        )
         failures = [c for c in results.values() if c.level is health.Level.FAIL]
         if failures:
             # Hosts failing the same way share one remedy; repeating it per host buries the

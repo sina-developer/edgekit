@@ -326,6 +326,27 @@ class TestVerifyHttps:
         assert "edgekit.example.com" in message and "yekja.example.com" in message
         assert message.count("edgekit ssl mode direct") == 1
 
+    async def test_a_525_is_recorded_so_the_cli_can_offer_direct_mode(self, config, monkeypatch):
+        refused = _probe(addresses=["104.21.8.1"], trusted=True, status=525)
+        monkeypatch.setattr(health, "probe_public_https", lambda domain: refused)
+        provisioner = Provisioner(config)
+
+        with pytest.raises(ProvisionError, match="525"):
+            await provisioner.step_verify_https()
+
+        assert provisioner.report.cloudflare_525 is True
+
+    async def test_a_server_blind_to_public_dns_warns_without_failing(self, config, monkeypatch):
+        blind = _probe(resolved_by="server", error="does not resolve on this server")
+        monkeypatch.setattr(health, "probe_public_https", lambda domain: blind)
+        provisioner = Provisioner(config)
+        provisioner.dns_applied = True
+
+        detail = await provisioner.step_verify_https()
+
+        assert "could not be checked from this server" in detail
+        assert provisioner.report.cloudflare_525 is False
+
     async def test_a_slow_service_does_not_fail_setup(self, config, monkeypatch):
         slow = _probe(addresses=["104.21.8.1"], trusted=True, status=None)
         monkeypatch.setattr(health, "probe_public_https", lambda domain: slow)

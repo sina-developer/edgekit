@@ -76,6 +76,66 @@ def test_declining_changes_nothing(no_token, configured, monkeypatch):
     assert no_token.cloudflare.api_token == ""
 
 
+@pytest.fixture
+def reprovisioned(monkeypatch):
+    from edgekit.services.provision import ProvisionReport
+
+    runs: list[tuple[str, object]] = []
+
+    def run(config, only=None, **flags):
+        runs.append((config.tls.mode, only))
+        return ProvisionReport()
+
+    monkeypatch.setattr(cli, "_run_provisioner", run)
+    monkeypatch.setattr("edgekit.config.Config.save", lambda self, path=None: None)
+    return runs
+
+
+def _report(cloudflare_525: bool):
+    from edgekit.services.provision import ProvisionReport
+
+    return ProvisionReport(cloudflare_525=cloudflare_525)
+
+
+def test_a_525_offers_direct_mode_and_applies_it(config, reprovisioned, monkeypatch):
+    """Cloudflare cannot reach the server; the mode that does not need it is one yes away."""
+    monkeypatch.setattr(sys, "stdin", Stdin(tty=True))
+    monkeypatch.setattr("edgekit.cli.typer.confirm", lambda *a, **k: True)
+
+    report = cli._offer_direct_mode(config, _report(True))
+
+    assert config.tls.mode == "direct"
+    assert reprovisioned == [("direct", cli.TLS_STEPS)]
+    assert report.cloudflare_525 is False
+
+
+def test_declining_direct_mode_changes_nothing(config, reprovisioned, monkeypatch):
+    monkeypatch.setattr(sys, "stdin", Stdin(tty=True))
+    monkeypatch.setattr("edgekit.cli.typer.confirm", lambda *a, **k: False)
+
+    cli._offer_direct_mode(config, _report(True))
+
+    assert config.tls.mode == "proxied"
+    assert reprovisioned == []
+
+
+@pytest.mark.parametrize("tty,cloudflare_525", [(False, True), (True, False)])
+def test_direct_mode_is_only_offered_at_a_terminal_after_a_525(
+    config, reprovisioned, monkeypatch, tty, cloudflare_525
+):
+    monkeypatch.setattr(sys, "stdin", Stdin(tty=tty))
+
+    def must_not_ask(*a, **k):
+        raise AssertionError("nothing to offer")
+
+    monkeypatch.setattr("edgekit.cli.typer.confirm", must_not_ask)
+
+    cli._offer_direct_mode(config, _report(cloudflare_525))
+
+    assert config.tls.mode == "proxied"
+    assert reprovisioned == []
+
+
 def test_records_marked_file_only_stay_off_the_console():
     record = logging.LogRecord("edgekit", logging.ERROR, __file__, 1, "failed", None, None)
     assert cli._for_console(record) is True

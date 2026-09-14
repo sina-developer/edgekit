@@ -185,6 +185,7 @@ def setup(
         skip_docker=skip_docker,
         skip_cloudflare=skip_cloudflare,
     )
+    report = _offer_direct_mode(config, report)
 
     with session_scope() as session:
         existing_user = session.query(User).filter_by(username=result.panel_username).first()
@@ -253,6 +254,30 @@ def _run_provisioner(config: Config, only: tuple[str, ...] | None = None, **flag
     console.print("[bold]Provisioning[/bold]")
     provisioner = Provisioner(config, on_event=_print_step, **flags)
     return asyncio.run(provisioner.run(only))
+
+
+def _offer_direct_mode(config: Config, report):
+    """Cloudflare answered 525: offer the mode that does not route visitors through it.
+
+    TLS on the server can be perfect and still fail here — the network between Cloudflare and
+    the server resets the handshake, and no setting on the server changes that. Only at a
+    terminal: the switch exposes the server's IP, so it is the operator's call.
+    """
+    if not (report.cloudflare_525 and config.dns_proxied and sys.stdin.isatty()):
+        return report
+    console.print(
+        "\n[bold yellow]Cloudflare answers 525: its connections to this server fail."
+        "[/bold yellow]\n"
+        "  When TLS on the server itself passes (`edgekit doctor`), the certificate is not the\n"
+        "  cause — the network between Cloudflare and this server is. Direct mode takes\n"
+        "  Cloudflare out of the path: DNS only, with a Let's Encrypt certificate served from\n"
+        f"  {config.server.public_ip}, so visitors will see that address."
+    )
+    if not typer.confirm("Switch to direct mode now?", default=True):
+        return report
+    config.tls.mode = "direct"
+    config.save()
+    return _run_provisioner(config, only=TLS_STEPS)
 
 
 def _panel_access_help(config: Config) -> str:
@@ -381,6 +406,7 @@ def provision(
         skip_docker=skip_docker,
         skip_cloudflare=skip_cloudflare,
     )
+    report = _offer_direct_mode(config, report)
     raise typer.Exit(0 if report.ok else 2)
 
 
@@ -437,7 +463,7 @@ def update(
         raise typer.Exit(0)
 
     _offer_cloudflare_token(config)
-    report = _run_provisioner(config)
+    report = _offer_direct_mode(config, _run_provisioner(config))
     raise typer.Exit(0 if report.ok else 2)
 
 
@@ -1053,7 +1079,7 @@ def ssl_mode(
     config.tls.mode = mode
     config.save()
     _offer_cloudflare_token(config, ask_mode=False)
-    report = _run_provisioner(config, only=TLS_STEPS)
+    report = _offer_direct_mode(config, _run_provisioner(config, only=TLS_STEPS))
     raise typer.Exit(0 if report.ok else 2)
 
 
@@ -1062,7 +1088,7 @@ def ssl_verify() -> None:
     """Connect to every hostname the way a browser does and report what it is shown."""
     require_root()
     config = require_configured()
-    report = _run_provisioner(config, only=("verify_https",))
+    report = _offer_direct_mode(config, _run_provisioner(config, only=("verify_https",)))
     raise typer.Exit(0 if report.ok else 2)
 
 

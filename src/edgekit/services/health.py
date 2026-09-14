@@ -665,6 +665,9 @@ class PublicProbe:
 
     domain: str
     addresses: list[str] = field(default_factory=list)
+    #: "public" when DNS-over-HTTPS answered; "server" when only this server's resolver could
+    #: be asked — whose answer says nothing reliable about what browsers get.
+    resolved_by: str = "public"
     #: True or False once a certificate was presented; None if TLS never got that far.
     trusted: bool | None = None
     issuer: str = ""
@@ -710,8 +713,13 @@ def _issuer_name(issuer: str) -> str:
 #: Asked before this server's own resolver. A resolver caches "no such name" for the zone's
 #: SOA minimum — 30 minutes on Cloudflare — so a record created a moment ago can stay invisible
 #: to this server long after the rest of the internet sees it. What browsers get is the point.
+#: Addressed by IP as well as by name: networks that filter the resolvers' hostnames in DNS
+#: often still pass 1.1.1.1 and 8.8.8.8, and a resolver that must itself be resolved first
+#: cannot help a server whose resolver is the problem.
 PUBLIC_RESOLVERS = (
+    ("https://1.1.1.1/dns-query", {"accept": "application/dns-json"}),
     ("https://cloudflare-dns.com/dns-query", {"accept": "application/dns-json"}),
+    ("https://8.8.8.8/resolve", {}),
     ("https://dns.google/resolve", {}),
 )
 _DNS_NOERROR = 0
@@ -719,7 +727,7 @@ _DNS_NXDOMAIN = 3
 _DNS_TYPE_A = 1
 
 
-def resolve_public(domain: str, timeout: float = PROBE_TIMEOUT) -> tuple[list[str] | None, str]:
+def resolve_public(domain: str, timeout: float = 3.0) -> tuple[list[str] | None, str]:
     """``domain``'s A records as public DNS answers them, over DNS-over-HTTPS.
 
     Returns ``(addresses, error)``. ``addresses`` is None when no public resolver could be
@@ -729,7 +737,10 @@ def resolve_public(domain: str, timeout: float = PROBE_TIMEOUT) -> tuple[list[st
     for url, headers in PUBLIC_RESOLVERS:
         try:
             response = httpx.get(
-                url, params={"name": domain, "type": "A"}, headers=headers, timeout=timeout
+                url,
+                params={"name": domain, "type": "A"},
+                headers=headers,
+                timeout=httpx.Timeout(timeout, connect=2.0),
             )
             answer = response.json()
         except (httpx.HTTPError, ValueError):
@@ -768,6 +779,7 @@ def probe_public_https(
     addresses, error = resolve(domain)
     if addresses is None:
         addresses, error = _resolve_locally(domain, port)
+        probe.resolved_by = "server"
     probe.addresses = addresses
     if not addresses:
         probe.error = error
@@ -820,6 +832,18 @@ def assess_public(probe: PublicProbe, config: Config) -> tuple[Check, bool]:
         return Check(key, title, level, detail, remedy)
 
     if probe.trusted is None:
+        if not probe.addresses and probe.resolved_by == "server":
+            # Not a missing record: this server simply cannot see public DNS. Some networks
+            # hide proxied names from local resolvers entirely, and waiting changes nothing.
+            return check(
+                Level.WARN,
+                "could not be checked from this server: no public DNS resolver is reachable "
+                f"from here, and its own resolver says {probe.error or 'nothing'}",
+                "This says nothing about what browsers get. Check from another network with "
+                f"`curl -sI https://{probe.domain}` — a 525 there means Cloudflare cannot "
+                "reach this server, and `edgekit ssl mode direct` takes Cloudflare out of the "
+                "path.",
+            ), False
         if not probe.addresses:
             return check(
                 Level.FAIL,
